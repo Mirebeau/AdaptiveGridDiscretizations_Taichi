@@ -1,13 +1,183 @@
 import taichi as ti
+from types import SimpleNamespace
+from numbers import Integral
+
+@ti.func
+def trace(A):
+    """Returns the trace of a square matrix"""
+    ti.static_assert(A.n==A.m)
+    tr = A[0,0]
+    for i in range(1,A.n): tr += A[i,i]
+    return tr
+
+def mk_SellingTypes(ndim,float_t=ti.f32,offset_t=ti.i8):
+    """
+    Generates a collection of types used in Selling decomposition and related methods.
+    """
+    symdim = (ndim*(ndim+1))//2
+    vec_t = ti.lang.matrix.VectorType(ndim,float_t)
+    mat_t = ti.lang.matrix.MatrixType(ndim,ndim,2,float_t)
+    superbase_t = ti.lang.matrix.MatrixType(ndim+1,ndim,2,offset_t)
+    offsets_t = ti.lang.matrix.MatrixType(symdim,ndim,2,offset_t)
+    weights_t = ti.lang.matrix.VectorType(symdim,float_t)
+    cycle_t = ti.lang.matrix.MatrixType(symdim,ndim+1,2,ti.i32)
+
+    return SimpleNamespace(
+        ndim=ndim,float_t=float_t,offset_t=offset_t,
+        symdim=symdim,vec_t=vec_t,mat_t=mat_t,superbase_t=superbase_t,
+        offsets_t=offsets_t,weights_t=weights_t,cycle_t=cycle_t)
+
+def mk_ObtuseSuperbase(ndim,float_t=ti.f32,offset_t=ti.i8,nitermax=100):
+    """
+    Maker of ObtuseSuperbase(m:mat_t) -> b:superbase_t
+    which computes an m-obtuse superbase, where m is symmetric positive definite
+    """
+    types = mk_SellingTypes(ndim,float_t,offset_t) if isinstance(ndim,Integral) else ndim
+    ndim,mat_t,superbase_t,cycle_t = types.ndim,types.mat_t,types.superbase_t,types.cycle_t
+
+    @ti.func
+    def ObtuseSuperbase1(m:mat_t):
+        ti.static_assert(m.n==m.m==1)
+        return superbase_t((1,))
+
+    @ti.func
+    def ObtuseSuperbase2(m:mat_t):
+        ti.static_assert(m.n==m.m==2)
+        cycle = cycle_t( (0,1,2),(1,2,0),(2,0,1) )
+        b = superbase_t((1,0),(0,1),(-1,-1)) # Canonical superbase
+        npass:ti.i32=0
+        for niter in range(nitermax):
+            i,j,k = cycle[niter%cycle.n,:]
+            if b[i,:]@m@b[j,:]>0: # Check if the angle is acute
+                npass=0
+                b[k,:] =   b[j,:] - b[i,:]
+                b[j,:] = - b[j,:]
+            else:
+                npass+=1
+                if npass==cycle.n: break
+        return b
+
+    @ti.func
+    def ObtuseSuperbase3(m:mat_t):
+        """Compute an m-obtuse superbase, where m is symmetric positive definite"""
+        ti.static_assert(m.n==m.m==3)
+        b = superbase_t((1,0,0),(0,1,0),(0,0,1),(-1,-1,-1)) # Canonical superbase
+        npass:ti.i32=0
+        for niter in range(nitermax):
+            i,j,k,l = cycle[niter%cycle.n,:]
+            if b[i,:]@m@b[j,:]>0: # Check if the angle is acute
+                npass=0
+                b[k,:] += b[j,:] 
+                b[l,:] += b[j,:]
+                b[j,:] = - b[j,:]
+            else:
+                npass+=1
+                if npass==cycle.n: break
+        return b
+
+    f = [None,ObtuseSuperbase1,ObtuseSuperbase2,ObtuseSuperbase3][ndim]
+    f.types = types
+    return f
+
+def mk_Decomp(ndim,float_t=ti.f32,offset_t=ti.i8):
+    """
+    Maker of Decomp(m:mat_t,b:superbase_t) -> λ:weights_t,e:offsets_t
+    which decomposes a symmetric matrix using a given superbase, via Selling's formula
+    """
+    types = mk_SellingTypes(ndim,float_t,offset_t) if isinstance(ndim,Integral) else ndim
+    ndim,mat_t,superbase_t,weights_t,offsets_t = \
+    types.ndim,types.mat_t,types.superbase_t,types.weights_t,types.offsets_t
+
+    @ti.func
+    def Decomp1(m : mat_t, b : superbase_t):
+        ti.static_assert(m.n==m.n==1)
+        return weights_t(m[0,0]), b
+
+    @ti.func
+    def Decomp2(m : mat_t, e : superbase_t):
+        ti.static_assert(m.n==m.n==2)
+        λ = - weights_t(e[1,:]@m@e[2,:], e[0,:]@m@e[2,:], e[0,:]@m@e[1,:])
+        for i in range(e.n):
+            e[i,0],e[i,1] = -e[i,1],e[i,0] # Compute perpendicular vectors
+        return λ,e #weights,offsets
+
+    @ti.func
+    def Decomp3(m:mat_t, b:superbase_t):
+        ti.static_assert(m.n==m.n==3)
+        λ = weights_t(0)
+        e = offsets_t(0)
+        for n in range(cycle.n):
+            i,j,k,l = cycle[n,:]
+            λ[n] = - b[i,:]@m@b[j,:]
+            e[n,:] = b[k,:].cross(b[l,:])
+        return λ,e
+
+    f = [None,Decomp1,Decomp2,Decomp3][ndim]
+    f.types = types
+    return f
+
+def mk_Selling(ndim,float_t=ti.f32,offset_t=ti.i8):
+    """
+    Maker of Selling(m:mat) -> λ:weights_t,e:offsets_t
+    which decomposes a symmetric positive definite matrix using an obtuse superbase.
+    """
+    types = mk_SellingTypes(ndim,float_t,offset_t) if isinstance(ndim,Integral) else ndim
+    ObtuseSuperbase,Decomp = mk_ObtuseSuperbase(types),mk_Decomp(types)
+
+    @ti.func
+    def Selling(m:types.mat_t):
+        return Decomp(m, ObtuseSuperbase(m))
+
+    Selling.types = types
+    return Selling
+
+def mk_RandomSym(ndim,float_t=ti.f32):
+    """
+    Maker of RandomSym(relax:float_t) -> m:mat_t
+    which generates a random symmetric matrix. It is positive definite if relax>0
+    """
+    mat_t = ti.lang.matrix.MatrixType(ndim,ndim,2,float_t)
+
+    @ti.func
+    def RandomSym(relax):
+        m = mat_t(0)
+        for i,j in ti.ndrange(*m.get_shape()): m[i,j] = ti.random()
+        m = m.transpose() @ m
+        for i in range(m.n): m[i,i] += relax
+        return m
+
+    RandomSym.types = SimpleNamespace(ndim=ndim,float_t=float_t,mat_t=mat_t)
+    return RandomSym
+
+def mk_Reconstruct(ndim,float_t:ti.f32):
+    """
+    Maker of Reconstruct(λ:weights_t,e:offsets_t) -> m:mat_t
+    which computes Sum_i λi ei ei^T
+    """
+    mat_t = ti.lang.matrix.MatrixType(ndim,ndim,2,float_t)
+    @ti.func
+    def Reconstruct(λ:ti.template(),e:ti.template()):
+        m = mat_t(0)
+        for i in range(λ.n):
+            m += λ[i] * e[i,:].outer_product(e[i,:])
+        return m
+    Reconstruct.types = SimpleNamespace(mat_t=mat_t)
+    return Reconstruct
+
+
+
 
 
 class Selling:
     """
     This class implements the Selling decomposition.
 
-    Members : 
+    Members generated at initialization : 
     - vec, mat, superbase, offsets, weights : variable types
-    - Superbase, Decomp, Selling : functions
+    - Superbase : computation of an obtuse superbase
+    - Decomp : Selling's decomposition formula using a given superbase
+    - Selling
+    - Reconstruct
 
     Usage : 
         Python scope : 
@@ -32,7 +202,8 @@ class Selling:
         offsets = ti.lang.matrix.MatrixType(symdim,ndim,2,offset_t)
         weights = ti.lang.matrix.VectorType(symdim,float_t)
 
-        self.vec,self.mat,self.superbase,self.offsets,self.weights = vec,mat,superbase,offsets,weights
+        self.float_t,self.offset_t,self.vec,self.mat,self.superbase,self.offsets,self.weights = \
+        float_t,offset_t,vec,mat,superbase,offsets,weights
 
         if ndim==1:
             @ti.func
@@ -105,7 +276,7 @@ class Selling:
                 return λ,e
 
         @ti.func
-        def Selling(m : mat):
+        def Selling(m:mat):
             """Selling decomposition of m"""
             return Decomp(m, Superbase(m))
 
@@ -122,8 +293,18 @@ class Selling:
                 m += λ[i] * e[i,:].outer_product(e[i,:])
             return m
 
+        @ti.func
+        def RandomSym(relax):
+            """Generate a random symmetric matrix, which is positive definite if relax>0"""
+            m = mat(0)
+            for i,j in ti.ndrange(*m.get_shape()): m[i,j] = ti.random()
+            m = m.transpose() @ m
+            for i in range(m.n): m[i,i] += relax
+            return m
 
-        self.Superbase,self.Decomp,self.Selling,self.Reconstruct = Superbase,Decomp,Selling,Reconstruct
+        self.Superbase,self.Decomp,self.Selling,self.Reconstruct,self.RandomSym = \
+        Superbase,Decomp,Selling,Reconstruct,RandomSym
+
 
 def DecompWithFixedOffsets(λ,e,base=256):
     """
