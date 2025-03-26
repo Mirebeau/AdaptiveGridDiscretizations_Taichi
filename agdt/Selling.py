@@ -355,6 +355,17 @@ def DecompWithFixedOffsets(λ,e,base=256):
     # The new offsets
     N = len(ie_unique) # Number of different offsets
     E = e.reshape(-1,ndim)[ie_index,:] # Collection of all different offsets
+    @ti.kernel # normalization : first non-zero offset coefficient is positive
+    def normalize_offsets(E : ti.types.ndarray(dtype=short_t,ndim=2) ):
+        for i in range(E.shape[0]):
+            sign:short_t = 0
+            for j in range(E.shape[1]):
+                if sign==0:
+                    if   E[i,j]>0 : sign = short_t( 1)
+                    elif E[i,j]<0 : sign = short_t(-1)
+                E[i,j]*=sign
+    normalize_offsets(E)
+
 
     # The new weights
     @ti.kernel
@@ -455,7 +466,7 @@ def mk_SmoothSelling2(*args,order=3,**kwargs):
     return SmoothSelling2
 
 # --------------- Smooth three-dimensional decomposition -----------
-def mk_SmoothSelling3(*args,relax=0.004,nitermax_softmin=10,sb0=False,nitermax_dual=12,**kwargs):
+def mk_SmoothSelling3(*args,relax=0.04,nitermax_softmin=10,sb0=False,nitermax_dual=12,**kwargs):
     """
     Maker of SmoothSelling2(m:mat)->λ:sweights,e:soffsets_t
     smooth variant of Selling's decomposition of the 3x3 symmetric matrix m
@@ -485,8 +496,6 @@ def mk_SmoothSelling3(*args,relax=0.004,nitermax_softmin=10,sb0=False,nitermax_d
         m = sb[:3,:] @ m @ sb[:3,:].transpose()
         λ = weights_t(m[0,0]+m[0,1]+m[0,2], -m[0,2], -m[0,1],
             m[1,0]+m[1,1]+m[1,2], -m[1,2], m[2,0]+m[2,1]+m[2,2])
-        print(m)
-        print(λ)
         for i in range(λ.n): assert λ[i]>=0
 
         # Constexpr data. Hope the compiler sees this.
@@ -504,8 +513,8 @@ def mk_SmoothSelling3(*args,relax=0.004,nitermax_softmin=10,sb0=False,nitermax_d
         n_sb = 0
         for i in range(tot_energies.n):
             energy = λ @ tot_energies[i,:]
-            score = (energy*energy*energy - energy0_3)/det # TODO : divide by 6 ??
-            assert score>=0
+            score = (energy*energy*energy - energy0_3)/(6*det) 
+            assert score>=-1e-5
             if score>=1: continue
             assert n_sb<nmax_sb
             i_sbs[n_sb] = short_t(i)
@@ -526,10 +535,6 @@ def mk_SmoothSelling3(*args,relax=0.004,nitermax_softmin=10,sb0=False,nitermax_d
                 dval+=dcutoff
             softmin -= (val-1)/dval # Newton update
         
-        print("n_sb",n_sb)
-        print("scores",scores)
-        print("softmin",softmin)
-
         # Compute the weights associated to the offsets
         i_offsets = VectorType(decompdim,short_t)(0)
         w_offsets = sweights_t(0)
@@ -560,16 +565,13 @@ def mk_SmoothSelling3(*args,relax=0.004,nitermax_softmin=10,sb0=False,nitermax_d
                     i_offsets[n_offsets] = i_offset
                     w_offsets[n_offsets] = cutoff
                     n_offsets+=1;
-
-        print("n_offsets",n_offsets)
-        print("i_offsets",i_offsets)
-        print("w_offsets",w_offsets)
             
         # Prepare for Newton method
         offsets = soffsets_t(0)
         offsets_m = MatrixType(decompdim,symdim,2,ti.f16)(0) # offsets_mm
         for n in range(n_offsets):
             offsets[n,:] = tot_offsets[i_offsets[n],:]
+            o = VectorType(ndim,ti.f16)(0)
             o = offsets[n,:]
             offsets_m[n,:] = (o[0]*o[0], 2*o[0]*o[1], o[1]*o[1], 2*o[0]*o[2], 2*o[1]*o[2], o[2]*o[2])
         
@@ -594,13 +596,6 @@ def mk_SmoothSelling3(*args,relax=0.004,nitermax_softmin=10,sb0=False,nitermax_d
                 dobj  -= (w_offsets[n]*dB)*offsets_m[n,:]
                 ddobj += ((w_offsets[n]*ddB/relax)*offsets_m[n,:]).outer_product(offsets_m[n,:])
             m_opt -= LinSolve(ddobj,dobj)
-            if niter<4: 
-                print("--iter--",niter,"--over--",nitermax_dual)
-                print("obj",obj); print("dobj",dobj); 
-                print("Descent",LinSolve(ddobj,dobj)); print(ddobj)
-                print("m_opt",m_opt)
-
-        print("final m_opt",m_opt)
 
         # Compute the decomposition weights using the optimality conditions
         weights = sweights_t(0)
