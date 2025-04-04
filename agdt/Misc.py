@@ -55,3 +55,24 @@ def asarray(arr,like,**kwargs):
         if xp is torch: return torch.asarray(arr,device=like.device,**kwargs)
  
 
+
+# ------------------------------ type copying -------------------------------------
+@ti.func
+def zero_like(x):
+    """Returns a variable with the same shape and type as x, but filled with zeros"""
+    # Note : ti.zero promotes i8->i32 (v1.7.2)
+    y=x; y=ti.i8(0); return y
+
+@ti.func
+def one_like(x):
+    """Returns a variable with the same shape and type as x, but filled with ones"""
+    # Note : ti.one promotes i8->i32 (v1.7.2)
+    y=x; y=ti.i8(1); return y
+
+def full_like(x,fill_value):
+    """Returns a variable with the same shape and type as x, but filled with given value"""
+    # Note : full_like(x:i8,0) issues a warning : "conversion may loose accuracy" (v1.7.2)
+    y=x; y=fill_value; return y
+
+
+

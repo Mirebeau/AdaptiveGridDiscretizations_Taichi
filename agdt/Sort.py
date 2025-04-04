@@ -21,42 +21,64 @@ tuple(), # 1 element to sort
 ((0,1),(2,3),(4,5),(6,7),(8,9),(10,11),(12,13),(14,15),(0,2),(4,6),(8,10),(12,14),(1,3),(5,7),(9,11),(13,15),(0,4),(8,12),(1,5),(9,13),(2,6),(10,14),(3,7),(11,15),(0,8),(1,9),(2,10),(3,11),(4,12),(5,13),(6,14),(7,15),(5,10),(6,9),(3,12),(13,14),(7,11),(1,2),(4,8),(1,4),(7,13),(2,8),(11,14),(5,6),(9,10),(2,4),(11,13),(3,8),(7,12),(6,8),(10,12),(3,5),(7,9),(3,4),(5,6),(7,8),(9,10),(11,12),(6,7),(8,9)),
 ]
 
-def mk_ArgSort(n,int_t=ti.i8):
-	"""
-	Maker of ArgSort(x:vec(n,dtype))->order:vec(n,int_t)
-	Fixed length argsort, using Network sort, length<=16
-	"""
-	res_t = ti.lang.matrix.VectorType(n,int_t)
-	gates = NetworkGates[n]
+# def mk_ArgSort(n,int_t=ti.i8):
+# 	"""
+# 	Maker of ArgSort(x:vec(n,dtype))->order:vec(n,int_t)
+# 	Fixed length argsort, using Network sort, length<=16
+# 	"""
+# 	res_t = ti.lang.matrix.VectorType(n,int_t)
+# 	gates = NetworkGates[n]
 
-	@ti.func
-	def ArgSort(x:ti.template()):
-		ti.static_assert(x.n==n)
-		r = res_t(0)
-		for i in ti.static(range(r.n)): r[i]=int_t(i)
-		for i,j in ti.static(gates):
-			_i = r[i]
-			_j = r[j]
-			if x[_i]>x[_j]:
-				r[i]=_j
-				r[j]=_i
-		return r
-	ArgSort.types = SimpleNamespace(n=n,int_t=int_t,res_t=res_t)
-	return ArgSort
+# 	@ti.func
+# 	def ArgSort(x:ti.template()):
+# 		ti.static_assert(x.n==n)
+# 		r = res_t(0)
+# 		for i in ti.static(range(r.n)): r[i]=int_t(i)
+# 		for i,j in ti.static(gates):
+# 			_i = r[i]
+# 			_j = r[j]
+# 			if x[_i]>x[_j]:
+# 				r[i]=_j
+# 				r[j]=_i
+# 		return r
+# 	ArgSort.types = SimpleNamespace(n=n,int_t=int_t,res_t=res_t)
+# 	return ArgSort
 
-def mk_Sort(n):
-	"""
-	Maker of Sort(x:vec(n,dtype))->xsorted:vec(n,dtype)
-	Fixed length sort, using Network sort, length<=16
-	"""
-	gates = NetworkGates[n]
+# def mk_Sort(n):
+# 	"""
+# 	Maker of Sort(x:vec(n,dtype))->xsorted:vec(n,dtype)
+# 	Fixed length sort, using Network sort, length<=16
+# 	"""
+# 	gates = NetworkGates[n]
 
-	@ti.func
-	def Sort(x:ti.template()):
-		ti.static_assert(x.n==n)
-		for i,j in ti.static(gates):
-			if x[i]>x[j]:
-				x[j],x[i]=x[i],x[j]
-		return x
-	return Sort
+# 	@ti.func
+# 	def Sort(x): # Purposedly passed by value
+# 		ti.static_assert(x.n==n)
+# 		for i,j in ti.static(gates):
+# 			if x[i]>x[j]:
+# 				x[j],x[i]=x[i],x[j]
+# 		return x
+# 	return Sort
+
+@ti.func
+def argsort(x,int_t:ti.template()=int):
+	gates = ti.static(NetworkGates[x.n])
+	r = ti.lang.matrix.VectorType(x.n,int_t)(0)
+	for i in ti.static(range(r.n)): r[i]=int_t(i)
+	for i,j in ti.static(gates):
+		_i = r[i]
+		_j = r[j]
+		if x[_i]>x[_j]:
+			r[i]=_j
+			r[j]=_i
+	return r
+
+@ti.func
+def sort(x):
+	gates = ti.static(NetworkGates[x.n])
+	for i,j in ti.static(gates):
+		if x[i]>x[j]:
+			x[j],x[i]=x[i],x[j]
+	return x
+
 

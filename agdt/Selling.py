@@ -8,299 +8,300 @@ from taichi.lang.matrix import VectorType,MatrixType
 
 from . import Misc
 
-@ti.func
-def Trace(A):
-    """
-    Returns the trace of a square matrix.
-    Trace(A:mat(n,n,dtype))->dtype
-    """
-    ti.static_assert(A.n==A.m)
-    tr = A[0,0]
-    for i in range(1,A.n): tr += A[i,i]
-    return tr
+# @ti.func
+# def Trace(A): # TODO : Use A.trace()
+#     """
+#     Returns the trace of a square matrix.
+#     Trace(A:mat(n,n,dtype))->dtype
+#     """
+#     ti.static_assert(A.n==A.m)
+#     tr = A[0,0]
+#     for i in range(1,A.n): tr += A[i,i]
+#     return tr
 
-@ti.func
-def Perp(v):
-    """
-    Returns the vector perpendicular to a given input vector
-    """
-    ti.static_assert(v.n==2)
-    v[0],v[1] = -v[1],v[0]
-    return v
-
-
-def mk_FlattenSymmetricMatrix(ndim,float_t=ti.f32):
-    """
-    Maker of FlattenSymmetricMatrix(m:mat_t) -> s:sym_t,
-    where mat_t denotes ndim x ndim matrices, and sym_t denotes vectors of length ndim*(ndim+1)/2
-    Also generates ExpandSymmetricMatrix(s:sym_t) -> m:mat_t, and 
-    to_flat(i,j)->k and to_pair(k)->(i,j), for converting indices.
-    """
-    symdim = (ndim * (ndim+1))//2
-    sym_t = VectorType(symdim,float_t)
-    mat_t = MatrixType(ndim,ndim,2,float_t)
-
-    @tifunc
-    def to_flat(i,j):
-        I = max(i,j)
-        J = min(i,j)
-        return (I*(I+1))//2 + J
-
-    @ti.func
-    def to_pair(k):
-        i:ti.i32 = ti.i32(ti.math.sqrt(k))
-        j = k - (i*(i+1))//2
-        if j<0:
-            j += (i+1)
-            i -= 1
-        return i,j
-
-    @ti.func
-    def FlattenSymmetricMatrix(m:mat_t):
-        s = sym_t(0)
-        k=0
-        for i in ti.static(range(ndim)):
-            for j in ti.static(range(i+1)):
-                s[k] = m[i,j]
-                k+=1
-        return s
-
-    @ti.func
-    def ExpandSymmetricMatrix(s:sym_t):
-        m = mat_t(0)
-        k=0
-        for i in ti.static(range(ndim)):
-            for j in ti.static(range(i+1)):
-                m[i,j] = s[k]
-                k+=1
-        return m
+# @ti.func
+# def Perp(v):
+#     """
+#     Returns the vector perpendicular to a given input vector
+#     """
+#     ti.static_assert(v.n==2)
+#     v[0],v[1] = -v[1],v[0]
+#     return v
 
 
-    FlattenSymmetricMatrix.types = SimpleNamespace(symdim=symdim,sym_t=sym_t,mat_t=mat_t,
-        ExpandSymmetricMatrix=ExpandSymmetricMatrix,to_flat=to_flat,to_pair=to_pair)
+# def mk_FlattenSymmetricMatrix(ndim,float_t=ti.f32):
+#     """
+#     Maker of FlattenSymmetricMatrix(m:mat_t) -> s:sym_t,
+#     where mat_t denotes ndim x ndim matrices, and sym_t denotes vectors of length ndim*(ndim+1)/2
+#     Also generates ExpandSymmetricMatrix(s:sym_t) -> m:mat_t, and 
+#     to_flat(i,j)->k and to_pair(k)->(i,j), for converting indices.
+#     """
+#     symdim = (ndim * (ndim+1))//2
+#     sym_t = VectorType(symdim,float_t)
+#     mat_t = MatrixType(ndim,ndim,2,float_t)
 
-    return FlattenSymmetricMatrix
+#     @tifunc
+#     def to_flat(i,j):
+#         I = max(i,j)
+#         J = min(i,j)
+#         return (I*(I+1))//2 + J
 
-def mk_LinSolve(ndim,float_t=ti.f32,int_t=ti.i32):
-    """
-    Solve a linear system a x = b, using Gauss pivot.
-    Surprisingly, this is absent from Taichi's math library (1.7.2 only has inverses when d<=4).
-    """
-    mat_t = MatrixType(ndim,ndim,2,float_t)
-    vec_t = VectorType(ndim,float_t)
-    ivec_t = VectorType(ndim,int_t)
+#     @ti.func
+#     def to_pair(k):
+#         i:ti.i32 = ti.i32(ti.math.sqrt(k))
+#         j = k - (i*(i+1))//2
+#         if j<0:
+#             j += (i+1)
+#             i -= 1
+#         return i,j
 
-    @ti.func
-    def LinSolve(a:mat_t,b:vec_t):
-        """A basic Gauss pivot"""
-        i2j = ivec_t(-1); j2i = ivec_t(-1)
-        for j in ti.static(range(ndim)):
-            # Get largest coefficient in column j
-            cMax:float_t = 0
-            iMax:int_t = 0
-            for i in range(ndim):
-                if i2j[i]>=0: continue
-                c:float_t = a[i,j]
-                if abs(c)>abs(cMax):
-                    cMax=c; iMax=i
-            i2j[iMax]=j
-            j2i[j]=iMax
+#     @ti.func
+#     def FlattenSymmetricMatrix(m:mat_t):
+#         s = sym_t(0)
+#         k=0
+#         for i in ti.static(range(ndim)):
+#             for j in ti.static(range(i+1)):
+#                 s[k] = m[i,j]
+#                 k+=1
+#         return s
 
-            invcMax:float_t = 1./cMax;
-            # Remove line iMax from other lines, while performing likewise on b
-            for i in range(ndim):
-                if i2j[i]>=0: continue
-                r:float_t = a[i,j]*invcMax;
-                for k in range(j+1,ndim): a[i,k]-=a[iMax,k]*r
-                b[i]-=b[iMax]*r
-        # Solve the remaining triangular system
-        out = vec_t(0)
-        for j in ti.static(tuple(reversed(range(ndim)))):
-            i:int_t = j2i[j]
-            out[j]=b[i]
-            for k in range(j+1,ndim): out[j]-=out[k]*a[i,k]
-            out[j]/=a[i,j]
-
-        return out
-    LinSolve.types = SimpleNamespace(mat_t=mat_t,vec_t=vec_t,ivec_t=ivec_t)
-    return LinSolve
-
-def mk_LinProd(ndim,dtype=ti.f32):
-    """
-    The standard  matrix @ vector product, but with a custom datatype.
-    (@ raises warnings if used with e.g. i8)
-    """
-    mat_t = MatrixType(ndim,ndim,2,dtype)
-    vec_t = VectorType(ndim,dtype)
-    @ti.func
-    def LinProd(a:mat_t,x:vec_t):
-        b = vec_t(0)
-        for i in ti.static(range(ndim)):
-            for j in ti.static(range(ndim)):
-                b[i]+=a[i,j]*x[j]
-        return b
-    LinProd.types = SimpleNamespace(ndim=ndim,dtype=dtype,mat_t=mat_t,vec_t=vec_t)
-    return LinProd
+#     @ti.func
+#     def ExpandSymmetricMatrix(s:sym_t):
+#         m = mat_t(0)
+#         k=0
+#         for i in ti.static(range(ndim)):
+#             for j in ti.static(range(i+1)):
+#                 m[i,j] = s[k]
+#                 k+=1
+#         return m
 
 
-def mk_RandomSym(ndim,float_t=ti.f32):
-    """
-    Maker of RandomSym(relax:float_t) -> m:mat_t
-    which generates a random symmetric matrix. It is positive definite if relax>0
-    """
-    mat_t = MatrixType(ndim,ndim,2,float_t)
+#     FlattenSymmetricMatrix.types = SimpleNamespace(symdim=symdim,sym_t=sym_t,mat_t=mat_t,
+#         ExpandSymmetricMatrix=ExpandSymmetricMatrix,to_flat=to_flat,to_pair=to_pair)
 
-    @ti.func
-    def RandomSym(relax): # :float_t
-        m = mat_t(0)
-        for i,j in ti.ndrange(*m.get_shape()): m[i,j] = 2*ti.random()-1
-        m = m.transpose() @ m
-        for i in range(m.n): m[i,i] += relax
-        return m
+#     return FlattenSymmetricMatrix
 
-    RandomSym.types = SimpleNamespace(ndim=ndim,float_t=float_t,mat_t=mat_t)
-    return RandomSym
+# def mk_LinSolve(ndim,float_t=ti.f32,int_t=ti.i32):
+#     """
+#     Solve a linear system a x = b, using Gauss pivot.
+#     Note : taichi has an implementation in dimension <=3 (ti.solve)
+#     """
+#     mat_t = MatrixType(ndim,ndim,2,float_t)
+#     vec_t = VectorType(ndim,float_t)
+#     ivec_t = VectorType(ndim,int_t)
+
+#     @ti.func
+#     def LinSolve(a:mat_t,b:vec_t):
+#         """A basic Gauss pivot"""
+#         i2j = ivec_t(-1); j2i = ivec_t(-1)
+#         for j in ti.static(range(ndim)):
+#             # Get largest coefficient in column j
+#             cMax:float_t = 0
+#             iMax:int_t = 0
+#             for i in range(ndim):
+#                 if i2j[i]>=0: continue
+#                 c:float_t = a[i,j]
+#                 if abs(c)>abs(cMax):
+#                     cMax=c; iMax=i
+#             i2j[iMax]=j
+#             j2i[j]=iMax
+
+#             invcMax:float_t = 1./cMax;
+#             # Remove line iMax from other lines, while performing likewise on b
+#             for i in range(ndim):
+#                 if i2j[i]>=0: continue
+#                 r:float_t = a[i,j]*invcMax;
+#                 for k in range(j+1,ndim): a[i,k]-=a[iMax,k]*r
+#                 b[i]-=b[iMax]*r
+#         # Solve the remaining triangular system
+#         out = vec_t(0)
+#         for j in ti.static(tuple(reversed(range(ndim)))):
+#             i:int_t = j2i[j]
+#             out[j]=b[i]
+#             for k in range(j+1,ndim): out[j]-=out[k]*a[i,k]
+#             out[j]/=a[i,j]
+
+#         return out
+#     LinSolve.types = SimpleNamespace(mat_t=mat_t,vec_t=vec_t,ivec_t=ivec_t)
+#     return LinSolve
+
+# def mk_LinProd(ndim,dtype=ti.f32):
+#     """
+#     The standard  matrix @ vector product, but with a custom datatype.
+#     (@ raises warnings if used with e.g. i8) # TODO : Really ? Could not reproduce
+#     """
+#     mat_t = MatrixType(ndim,ndim,2,dtype)
+#     vec_t = VectorType(ndim,dtype)
+#     @ti.func
+#     def LinProd(a:mat_t,x:vec_t):
+#         b = vec_t(0)
+#         for i in ti.static(range(ndim)):
+#             for j in ti.static(range(ndim)):
+#                 b[i]+=a[i,j]*x[j]
+#         return b
+#     LinProd.types = SimpleNamespace(ndim=ndim,dtype=dtype,mat_t=mat_t,vec_t=vec_t)
+#     return LinProd
+
+
+# def mk_RandomSym(ndim,float_t=ti.f32):
+#     """
+#     Maker of RandomSym(relax:float_t) -> m:mat_t
+#     which generates a random symmetric matrix. It is positive definite if relax>0
+#     """
+#     mat_t = MatrixType(ndim,ndim,2,float_t)
+
+#     @ti.func
+#     def RandomSym(relax): # :float_t
+#         m = mat_t(0)
+#         for i,j in ti.ndrange(*m.get_shape()): m[i,j] = 2*ti.random()-1
+#         m = m.transpose() @ m
+#         for i in range(m.n): m[i,i] += relax
+#         return m
+
+#     RandomSym.types = SimpleNamespace(ndim=ndim,float_t=float_t,mat_t=mat_t)
+#     return RandomSym
 
 # -------- Selling decomposition -------
 
 
-def mk_SellingTypes(ndim,float_t=ti.f32,short_t=ti.i8):
-    """
-    Generates a collection of types used in Selling decomposition and related methods.
-    """
-    symdim = (ndim*(ndim+1))//2
-    vec_t = VectorType(ndim,float_t)
-    mat_t = MatrixType(ndim,ndim,2,float_t)
-    superbase_t = MatrixType(ndim+1,ndim,2,short_t)
-    offsets_t = MatrixType(symdim,ndim,2,short_t)
-    weights_t = VectorType(symdim,float_t)
-    cycle_t = MatrixType(symdim,ndim+1,2,ti.i32)
 
-    return SimpleNamespace(
-        ndim=ndim,float_t=float_t,short_t=short_t,
-        symdim=symdim,vec_t=vec_t,mat_t=mat_t,superbase_t=superbase_t,
-        offsets_t=offsets_t,weights_t=weights_t,cycle_t=cycle_t)
+# def mk_SellingTypes(ndim,float_t=ti.f32,short_t=ti.i8):
+#     """
+#     Generates a collection of types used in Selling decomposition and related methods.
+#     """
+#     symdim = (ndim*(ndim+1))//2
+#     vec_t = VectorType(ndim,float_t)
+#     mat_t = MatrixType(ndim,ndim,2,float_t)
+#     superbase_t = MatrixType(ndim+1,ndim,2,short_t)
+#     offsets_t = MatrixType(symdim,ndim,2,short_t)
+#     weights_t = VectorType(symdim,float_t)
+#     cycle_t = MatrixType(symdim,ndim+1,2,ti.i32)
 
-def mk_ObtuseSuperbase(ndim,float_t=ti.f32,short_t=ti.i8,nitermax=100):
-    """
-    Maker of ObtuseSuperbase(m:mat_t) -> b:superbase_t
-    which computes an m-obtuse superbase, where m is symmetric positive definite
-    """
-    types = mk_SellingTypes(ndim,float_t,short_t) if isinstance(ndim,Integral) else ndim
-    ndim,mat_t,superbase_t,cycle_t = types.ndim,types.mat_t,types.superbase_t,types.cycle_t
+#     return SimpleNamespace(
+#         ndim=ndim,float_t=float_t,short_t=short_t,
+#         symdim=symdim,vec_t=vec_t,mat_t=mat_t,superbase_t=superbase_t,
+#         offsets_t=offsets_t,weights_t=weights_t,cycle_t=cycle_t)
 
-    @ti.func
-    def ObtuseSuperbase1(m:mat_t):
-        ti.static_assert(m.n==m.m==1)
-        return superbase_t((1,))
+# def mk_ObtuseSuperbase(ndim,float_t=ti.f32,short_t=ti.i8,nitermax=100):
+#     """
+#     Maker of ObtuseSuperbase(m:mat_t) -> b:superbase_t
+#     which computes an m-obtuse superbase, where m is symmetric positive definite
+#     """
+#     types = mk_SellingTypes(ndim,float_t,short_t) if isinstance(ndim,Integral) else ndim
+#     ndim,mat_t,superbase_t,cycle_t = types.ndim,types.mat_t,types.superbase_t,types.cycle_t
 
-    @ti.func
-    def ObtuseSuperbase2(m:mat_t):
-        ti.static_assert(m.n==m.m==2)
-        b = superbase_t((1,0),(0,1),(-1,-1)) # Canonical superbase
-        cycle = cycle_t( (0,1,2),(1,2,0),(2,0,1) ) # Constexpr. Hope compiler catches this.
-        npass:ti.i32=0
-        for niter in range(nitermax):
-            i,j,k = cycle[niter%cycle.n,:]
-            if b[i,:]@m@b[j,:]>0: # Check if the angle is acute
-                npass=0
-                b[k,:] =   b[j,:] - b[i,:]
-                b[j,:] = - b[j,:]
-            else:
-                npass+=1
-                if npass==cycle.n: break
-        return b
+#     @ti.func
+#     def ObtuseSuperbase1(m:mat_t):
+#         ti.static_assert(m.n==m.m==1)
+#         return superbase_t((1,))
 
-    @ti.func
-    def ObtuseSuperbase3(m:mat_t):
-        """Compute an m-obtuse superbase, where m is symmetric positive definite"""
-        ti.static_assert(m.n==m.m==3)
-        b = superbase_t((1,0,0),(0,1,0),(0,0,1),(-1,-1,-1)) # Canonical superbase
-        cycle = cycle_t((0,1,2,3),(0,2,1,3),(0,3,1,2),(1,2,0,3),(1,3,0,2),(2,3,0,1)) # Constexpr
-        npass:ti.i32=0
-        for niter in range(nitermax):
-            i,j,k,l = cycle[niter%cycle.n,:]
-            if b[i,:]@m@b[j,:]>0: # Check if the angle is acute
-                npass=0
-                b[k,:] += b[j,:] 
-                b[l,:] += b[j,:]
-                b[j,:] = - b[j,:]
-            else:
-                npass+=1
-                if npass==cycle.n: break
-        return b
+#     @ti.func
+#     def ObtuseSuperbase2(m:mat_t):
+#         ti.static_assert(m.n==m.m==2)
+#         b = superbase_t((1,0),(0,1),(-1,-1)) # Canonical superbase
+#         cycle = cycle_t( (0,1,2),(1,2,0),(2,0,1) ) # Constexpr. Hope compiler catches this.
+#         npass:ti.i32=0
+#         for niter in range(nitermax):
+#             i,j,k = cycle[niter%cycle.n,:]
+#             if b[i,:]@m@b[j,:]>0: # Check if the angle is acute
+#                 npass=0
+#                 b[k,:] =   b[j,:] - b[i,:]
+#                 b[j,:] = - b[j,:]
+#             else:
+#                 npass+=1
+#                 if npass==cycle.n: break
+#         return b
 
-    f = [None,ObtuseSuperbase1,ObtuseSuperbase2,ObtuseSuperbase3][ndim]
-    f.types = types
-    return f
+#     @ti.func
+#     def ObtuseSuperbase3(m:mat_t):
+#         """Compute an m-obtuse superbase, where m is symmetric positive definite"""
+#         ti.static_assert(m.n==m.m==3)
+#         b = superbase_t((1,0,0),(0,1,0),(0,0,1),(-1,-1,-1)) # Canonical superbase
+#         cycle = cycle_t((0,1,2,3),(0,2,1,3),(0,3,1,2),(1,2,0,3),(1,3,0,2),(2,3,0,1)) # Constexpr
+#         npass:ti.i32=0
+#         for niter in range(nitermax):
+#             i,j,k,l = cycle[niter%cycle.n,:]
+#             if b[i,:]@m@b[j,:]>0: # Check if the angle is acute
+#                 npass=0
+#                 b[k,:] += b[j,:] 
+#                 b[l,:] += b[j,:]
+#                 b[j,:] = - b[j,:]
+#             else:
+#                 npass+=1
+#                 if npass==cycle.n: break
+#         return b
 
-def mk_Decomp(ndim,float_t=ti.f32,short_t=ti.i8):
-    """
-    Maker of Decomp(m:mat_t,b:superbase_t) -> λ:weights_t,e:offsets_t
-    which decomposes a symmetric matrix using a given superbase, via Selling's formula
-    """
-    types = mk_SellingTypes(ndim,float_t,short_t) if isinstance(ndim,Integral) else ndim
-    ndim,mat_t,superbase_t,weights_t,offsets_t,cycle_t = \
-    types.ndim,types.mat_t,types.superbase_t,types.weights_t,types.offsets_t,types.cycle_t
+#     f = [None,ObtuseSuperbase1,ObtuseSuperbase2,ObtuseSuperbase3][ndim]
+#     f.types = types
+#     return f
 
-    @ti.func
-    def Decomp1(m : mat_t, b : superbase_t):
-        ti.static_assert(m.n==m.n==1)
-        return weights_t(m[0,0]), b
+# def mk_Decomp(ndim,float_t=ti.f32,short_t=ti.i8):
+#     """
+#     Maker of Decomp(m:mat_t,b:superbase_t) -> λ:weights_t,e:offsets_t
+#     which decomposes a symmetric matrix using a given superbase, via Selling's formula
+#     """
+#     types = mk_SellingTypes(ndim,float_t,short_t) if isinstance(ndim,Integral) else ndim
+#     ndim,mat_t,superbase_t,weights_t,offsets_t,cycle_t = \
+#     types.ndim,types.mat_t,types.superbase_t,types.weights_t,types.offsets_t,types.cycle_t
 
-    @ti.func
-    def Decomp2(m : mat_t, e : superbase_t):
-        ti.static_assert(m.n==m.n==2)
-        λ = - weights_t(e[1,:]@m@e[2,:], e[0,:]@m@e[2,:], e[0,:]@m@e[1,:])
-        for i in range(e.n):
-            e[i,0],e[i,1] = -e[i,1],e[i,0] # Compute perpendicular vectors
-        return λ,e #weights,offsets
+#     @ti.func
+#     def Decomp1(m : mat_t, b : superbase_t):
+#         ti.static_assert(m.n==m.n==1)
+#         return weights_t(m[0,0]), b
 
-    @ti.func
-    def Decomp3(m:mat_t, b:superbase_t):
-        ti.static_assert(m.n==m.n==3)
-        λ = weights_t(0)
-        e = offsets_t(0)
-        cycle = cycle_t((0,1,2,3),(0,2,1,3),(0,3,1,2),(1,2,0,3),(1,3,0,2),(2,3,0,1)) # Constexpr
-        for n in range(cycle.n):
-            i,j,k,l = cycle[n,:]
-            λ[n] = - b[i,:]@m@b[j,:]
-            e[n,:] = b[k,:].cross(b[l,:])
-        return λ,e
+#     @ti.func
+#     def Decomp2(m : mat_t, e : superbase_t):
+#         ti.static_assert(m.n==m.n==2)
+#         λ = - weights_t(e[1,:]@m@e[2,:], e[0,:]@m@e[2,:], e[0,:]@m@e[1,:])
+#         for i in range(e.n):
+#             e[i,0],e[i,1] = -e[i,1],e[i,0] # Compute perpendicular vectors
+#         return λ,e #weights,offsets
 
-    f = [None,Decomp1,Decomp2,Decomp3][ndim]
-    f.types = types
-    return f
+#     @ti.func
+#     def Decomp3(m:mat_t, b:superbase_t):
+#         ti.static_assert(m.n==m.n==3)
+#         λ = weights_t(0)
+#         e = offsets_t(0)
+#         cycle = cycle_t((0,1,2,3),(0,2,1,3),(0,3,1,2),(1,2,0,3),(1,3,0,2),(2,3,0,1)) # Constexpr
+#         for n in range(cycle.n):
+#             i,j,k,l = cycle[n,:]
+#             λ[n] = - b[i,:]@m@b[j,:]
+#             e[n,:] = b[k,:].cross(b[l,:])
+#         return λ,e
 
-def mk_Selling(ndim,float_t=ti.f32,short_t=ti.i8):
-    """
-    Maker of Selling(m:mat) -> λ:weights_t,e:offsets_t
-    which decomposes a symmetric positive definite matrix using an obtuse superbase.
-    """
-    types = mk_SellingTypes(ndim,float_t,short_t) if isinstance(ndim,Integral) else ndim
-    ObtuseSuperbase,Decomp = mk_ObtuseSuperbase(types),mk_Decomp(types)
+#     f = [None,Decomp1,Decomp2,Decomp3][ndim]
+#     f.types = types
+#     return f
 
-    @ti.func
-    def Selling(m:types.mat_t):
-        return Decomp(m, ObtuseSuperbase(m))
+# def mk_Selling(ndim,float_t=ti.f32,short_t=ti.i8):
+#     """
+#     Maker of Selling(m:mat) -> λ:weights_t,e:offsets_t
+#     which decomposes a symmetric positive definite matrix using an obtuse superbase.
+#     """
+#     types = mk_SellingTypes(ndim,float_t,short_t) if isinstance(ndim,Integral) else ndim
+#     ObtuseSuperbase,Decomp = mk_ObtuseSuperbase(types),mk_Decomp(types)
 
-    Selling.types = types
-    return Selling
+#     @ti.func
+#     def Selling(m:types.mat_t):
+#         return Decomp(m, ObtuseSuperbase(m))
 
-def mk_Reconstruct(ndim,float_t:ti.f32):
-    """
-    Maker of Reconstruct(λ:weights_t,e:offsets_t) -> m:mat_t
-    which computes Sum_i λi ei ei^T
-    """
-    mat_t = MatrixType(ndim,ndim,2,float_t)
-    @ti.func
-    def Reconstruct(λ:ti.template(),e:ti.template()):
-        m = mat_t(0)
-        for i in range(λ.n):
-            m += λ[i] * e[i,:].outer_product(e[i,:])
-        return m
-    Reconstruct.types = SimpleNamespace(ndim=ndim,float_t=float_t,mat_t=mat_t)
-    return Reconstruct
+#     Selling.types = types
+#     return Selling
+
+# def mk_Reconstruct(ndim,float_t:ti.f32):
+#     """
+#     Maker of Reconstruct(λ:weights_t,e:offsets_t) -> m:mat_t
+#     which computes Sum_i λi ei ei^T
+#     """
+#     mat_t = MatrixType(ndim,ndim,2,float_t)
+#     @ti.func
+#     def Reconstruct(λ:ti.template(),e:ti.template()):
+#         m = mat_t(0)
+#         for i in range(λ.n):
+#             m += λ[i] * e[i,:].outer_product(e[i,:])
+#         return m
+#     Reconstruct.types = SimpleNamespace(ndim=ndim,float_t=float_t,mat_t=mat_t)
+#     return Reconstruct
 
 
 def DecompWithFixedOffsets(λ,e,base=256):
@@ -384,86 +385,86 @@ def DecompWithFixedOffsets(λ,e,base=256):
 
 # ---------------- Smooth two-dimensional decomposition -----------------
 
-def mk_Sabs(order=3):
-    """
-    Maker of Sabs(x:float_t)->y:float_t,
-    which is a smoothed absolute value function.
-    Guarantee : 0 <= result-|x| <= 1/2.
-    - order : order of the last continuous derivative.
-    """
-    @ti.func
-    def Sabs(x):
-        x = abs(x)
-        y = x
-        for _ in range(1): # break emulates different return statements ... (forbidden in Taichi)
-            if x>=1:     break
-            if order==0: break
-            x2 = x*x
-            if order==2: y = (1./2)*(1.+x2); break
-            x4 = x2*x2
-            if order==3: y = (1./8)*(3+6*x2-x4); break
-            x6 = x2*x4;
-            if order==3: y = (1./16)*(5+15*x2-5*x4+x6); break
-        return y
-    Sabs.types = SimpleNamespace(order=order)
-    return Sabs
+# def mk_Sabs(order=3):
+#     """
+#     Maker of Sabs(x:float_t)->y:float_t,
+#     which is a smoothed absolute value function.
+#     Guarantee : 0 <= result-|x| <= 1/2.
+#     - order : order of the last continuous derivative.
+#     """
+#     @ti.func
+#     def Sabs(x):
+#         x = abs(x)
+#         y = x
+#         for _ in range(1): # break emulates different return statements ... (forbidden in Taichi)
+#             if x>=1:     break
+#             if order==0: break
+#             x2 = x*x
+#             if order==2: y = (1./2)*(1.+x2); break
+#             x4 = x2*x2
+#             if order==3: y = (1./8)*(3+6*x2-x4); break
+#             x6 = x2*x4;
+#             if order==3: y = (1./16)*(5+15*x2-5*x4+x6); break
+#         return y
+#     Sabs.types = SimpleNamespace(order=order)
+#     return Sabs
 
 
-@ti.func
-def Smed(p0,p1,p2):
-    """
-    Smed(p0:float_t,p1:float_t,p2:float_t)->ρ1:float_t
-    Regularized median (a.k.a. ρ1) assuming p0<=p1<=p2.
-    Guarantee : p1/(2*sqrt(2)) <= result < p1
-    Has invariance properties used in the two-dimensional smooth decomposition
-    """
-    # s and q are invariant quantities under Selling superbase flip
-    s = p0*p1+p1*p2+p2*p0;
-    p12 = p2-p1 
-    q = p12*p12
-    return 0.5*s/ti.math.sqrt(q+2*s);
+# @ti.func
+# def Smed(p0,p1,p2):
+#     """
+#     Smed(p0:float_t,p1:float_t,p2:float_t)->ρ1:float_t
+#     Regularized median (a.k.a. ρ1) assuming p0<=p1<=p2.
+#     Guarantee : p1/(2*sqrt(2)) <= result < p1
+#     Has invariance properties used in the two-dimensional smooth decomposition
+#     """
+#     # s and q are invariant quantities under Selling superbase flip
+#     s = p0*p1+p1*p2+p2*p0;
+#     p12 = p2-p1 
+#     q = p12*p12
+#     return 0.5*s/ti.math.sqrt(q+2*s);
 
 
-def mk_SmoothSelling2(*args,order=3,**kwargs):
-    """
-    Maker of SmoothSelling2(m:mat)->λ:sweights,e:soffsets_t
-    smooth variant of Selling's decomposition of the 2x2 symmetric matrix m
-    - order : smoothness order, passed to mk_Sabs 
-    - *args,**kwargs : passed to mk_ObtuseSuperbase
-    """
-    # Reimplementation of agd/Eikonal/HFM_CUDA/cuda/Geometry2_smooth.h
-    ObtuseSuperbase = mk_ObtuseSuperbase(*args,**kwargs)
-    types = copy(ObtuseSuperbase.types)
-    ndim,float_t,mat_t,superbase_t,weights_t,short_t = \
-    types.ndim,types.float_t,types.mat_t,types.superbase_t,types.weights_t,types.short_t
-    assert ndim==2
-    from .Sort import mk_ArgSort
-    ArgSort = mk_ArgSort(3)
-    Sabs = mk_Sabs(order)
+# def mk_SmoothSelling2(*args,order=3,**kwargs):
+#     """
+#     Maker of SmoothSelling2(m:mat)->λ:sweights,e:soffsets_t
+#     smooth variant of Selling's decomposition of the 2x2 symmetric matrix m
+#     - order : smoothness order, passed to mk_Sabs 
+#     - *args,**kwargs : passed to mk_ObtuseSuperbase
+#     """
+#     # Reimplementation of agd/Eikonal/HFM_CUDA/cuda/Geometry2_smooth.h
+#     ObtuseSuperbase = mk_ObtuseSuperbase(*args,**kwargs)
+#     types = copy(ObtuseSuperbase.types)
+#     ndim,float_t,mat_t,superbase_t,weights_t,short_t = \
+#     types.ndim,types.float_t,types.mat_t,types.superbase_t,types.weights_t,types.short_t
+#     assert ndim==2
+#     from .Sort import mk_ArgSort
+#     ArgSort = mk_ArgSort(3)
+#     Sabs = mk_Sabs(order)
 
-    decompdim = 4
-    sweights_t = VectorType(decompdim,float_t)
-    soffsets_t = MatrixType(decompdim,ndim,2,short_t)
+#     decompdim = 4
+#     sweights_t = VectorType(decompdim,float_t)
+#     soffsets_t = MatrixType(decompdim,ndim,2,short_t)
 
     
-    @ti.func
-    def SmoothSelling2(m:mat_t):
-        ti.static_assert(m.n==m.m==2)
-        b = ObtuseSuperbase(m)
-        ρ_ = - weights_t(b[1,:]@m@b[2,:], b[0,:]@m@b[2,:], b[0,:]@m@b[1,:])
-        o = ArgSort(ρ_)
-        ρ = weights_t(ρ_[o[0]],ρ_[o[1]],ρ_[o[2]])
-        med = Smed(ρ[0],ρ[1],ρ[2])
-        w = max(0,med*Sabs(ρ[0]/med)-ρ[0])
-        sρ = sweights_t(ρ[0]+w/2, ρ[1]-w, ρ[2]-w, w/2)
-        se=soffsets_t(0) # Arbitrary fill value
-        se[0,:]=Perp(b[o[0],:]); se[1,:]=Perp(b[o[1],:]); se[2,:]=Perp(b[o[2],:])
-        se[3,:]=se[1,:]-se[2,:]
-        return sρ,se
+#     @ti.func
+#     def SmoothSelling2(m:mat_t):
+#         ti.static_assert(m.n==m.m==2)
+#         b = ObtuseSuperbase(m)
+#         ρ_ = - weights_t(b[1,:]@m@b[2,:], b[0,:]@m@b[2,:], b[0,:]@m@b[1,:])
+#         o = ArgSort(ρ_)
+#         ρ = weights_t(ρ_[o[0]],ρ_[o[1]],ρ_[o[2]])
+#         med = Smed(ρ[0],ρ[1],ρ[2])
+#         w = max(0,med*Sabs(ρ[0]/med)-ρ[0])
+#         sρ = sweights_t(ρ[0]+w/2, ρ[1]-w, ρ[2]-w, w/2)
+#         se=soffsets_t(0) # Arbitrary fill value
+#         se[0,:]=Perp(b[o[0],:]); se[1,:]=Perp(b[o[1],:]); se[2,:]=Perp(b[o[2],:])
+#         se[3,:]=se[1,:]-se[2,:]
+#         return sρ,se
 
-    types.__dict__.update({'weights_t':sweights_t,'offsets_t':soffsets_t})
-    SmoothSelling2.types = types
-    return SmoothSelling2
+#     types.__dict__.update({'weights_t':sweights_t,'offsets_t':soffsets_t})
+#     SmoothSelling2.types = types
+#     return SmoothSelling2
 
 # --------------- Smooth three-dimensional decomposition -----------
 def mk_SmoothSelling3(*args,relax=0.04,nitermax_softmin=10,sb0=False,nitermax_dual=12,**kwargs):
@@ -483,7 +484,7 @@ def mk_SmoothSelling3(*args,relax=0.04,nitermax_softmin=10,sb0=False,nitermax_du
     decompdim = 13 # 37 is guaranteed, but we conjecture that 13 is sufficient (attained for Id)
     sweights_t = VectorType(decompdim,float_t)
     soffsets_t = MatrixType(decompdim,ndim,2,short_t)
-    nmax_sb = 16 # Conjectured pper bound on the number of superbases s.t. E^3 <= Emin^3 + 6*det(D). At worst, 127 is guaranteed
+    nmax_sb = 16 # Conjectured upper bound on the number of superbases s.t. E^3 <= Emin^3 + 6*det(D). At worst, 127 is guaranteed
 
     LinSolve = mk_LinSolve(symdim,float_t)
     LinProd_short = mk_LinProd(ndim,short_t)

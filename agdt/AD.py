@@ -1,8 +1,9 @@
 """
 This file implements a basic forward autodiff class, for use in Taichi.
 
-Note that Taichi does implement forward and backward autodiff. However it does so in a manner that 
-is not convenient for all purposes - in our case, running a Newton method inside a Taichi function. 
+Note that Taichi does implement forward and backward autodiff. 
+However, the autodiff must be initialized, and its result are recovered, from the python scope.
+The code below allows to initialize autodiff, and used its results, within a Taichi function. 
 """
 
 import taichi as ti
@@ -93,13 +94,13 @@ def mk_fwd1(vdim=1,dtype=float):
 	@ti.dataclass
 	class fwd1:
 		"""
-		A class implementing forward automatic differentiation within Taichi kernels
+		A class implementing 1-st order forward automatic differentiation within Taichi kernels
 		(Operator overloading does not seem to work, so we do member functions for all arithmetic)
 		"""
 		x:val_t
 		v:vec_t
 
-#		@ti.func # does not work
+#		@ti.func # Does not work. Any ideas ?
 #		def __add__(self,other): return fwd1(self.x+other.x,self.v+other.v)
 
 		# Arithmetic between fwd1 types
