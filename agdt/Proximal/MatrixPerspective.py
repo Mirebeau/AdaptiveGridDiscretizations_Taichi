@@ -9,47 +9,6 @@ from taichi.lang.matrix import VectorType,MatrixType
 vec1 = VectorType(1,float)
 mat1 = MatrixType(1,1,2,float)
 
-@ti.func 
-def mat2diag(mat:ti.template(),dtype:ti.template()=None): 
-	"""Extract the diagonal of a matrix"""
-	# Warning : promotes to default float and int if dtype is unspecified (v1.7.2)
-	return ti.Vector([mat[i,i] for i in ti.static(range(mat.n))],dtype)
-
-@ti.func
-def diag2mat(diag:ti.template(),dtype:ti.template()=None):
-	"""Generates a matrix from the given diagonal elements"""
-	# Warning : promotes to default float and int if dtype is unspecified (v1.7.2)
-	rg = ti.static(range(diag.n))
-	return ti.Matrix([[diag[i] * (1 if i==j else 0) for i in rg] for j in rg],dtype)
-
-@ti.func
-def sym2flt_index(i,j):
-	"""Converts an index in a symmetric matrix, into a linear index in the flattened vector"""
-	i,j = max(i,j),min(i,j)
-	return (i*(i+1))//2 + j
-
-@ti.func
-def flt2sym_index(k):
-	"""Get an index in a symmetric matrix, from a linear index in the flattened vector"""
-	i = int(ti.math.sqrt(2*k)) # Done at compile time ??
-	j =  k-(i*(i+1))//2
-	if j<0: 
-		j+=i+1
-		j-=1
-	return i,j
-
-
-@ti.func
-def sym2flt(sym:ti.template(),dtype:ti.template()=None):
-	"""Flattens a dxd symmetric matrix into an array of size d(d+1)//2"""
-	assert all(sym==sym.transpose()), "sym must be symmetric" 
-	return ti.Vector([sym[i,j] for i in ti.static(range(sym.n)) for j in ti.static(range(0,i+1))],dtype)
-
-@ti.func
-def flt2sym(flt:ti.template(),dtype:ti.template()=None):
-	"""Expands a vector into a symmetric matrix"""
-	rg = ti.static( range(int(sqrt(2*flt.n))) )
-	return ti.Matrix([[flt[sym2flt_index(i,j)] for i in ti.static(range(d))] for j in range(d)])
 
 
 
