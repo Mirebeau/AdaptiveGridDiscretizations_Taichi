@@ -41,3 +41,5 @@ def f():
 @ti.func
 def f(n):
 	return ti.lang.matrix.VectorType(n,ti.i8) # Return a type
+
+- **kwargs are not supported (v1.7.2)

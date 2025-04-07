@@ -1,3 +1,8 @@
+"""
+This file helps inter-operability between taichi, numpy, and pytorch.
+"""
+
+
 import numpy as np
 import taichi as ti
 
@@ -18,7 +23,7 @@ try:
 except ImportError: pass     
 
 
-"""Usage : convert_dtype['ti'][arr.dtype]. May replace 'ti' with 'np', 'torch' """
+"""Usage : convert_dtype['ti'][arr.dtype]. One may replace 'ti' with 'np', 'torch' """
 convert_dtype = {
 xp:{key:value for yp in dtypes for key,value in zip(dtypes[yp],dtypes[xp])}
 for xp in dtypes}
@@ -56,23 +61,6 @@ def asarray(arr,like,**kwargs):
  
 
 
-# ------------------------------ type copying -------------------------------------
-@ti.func
-def zero_like(x):
-    """Returns a variable with the same shape and type as x, but filled with zeros"""
-    # Note : ti.zero promotes i8->i32 (v1.7.2)
-    y=x; y=ti.i8(0); return y
-
-@ti.func
-def one_like(x):
-    """Returns a variable with the same shape and type as x, but filled with ones"""
-    # Note : ti.one promotes i8->i32 (v1.7.2)
-    y=x; y=ti.i8(1); return y
-
-def full_like(x,fill_value):
-    """Returns a variable with the same shape and type as x, but filled with given value"""
-    # Note : full_like(x:i8,0) issues a warning : "conversion may loose accuracy" (v1.7.2)
-    y=x; y=fill_value; return y
 
 
 
