@@ -61,7 +61,7 @@ class AnisoScalar:
 		size = np.prod(shape)
 		np_float_t = convert_dtype['np'][μ.dtype]
 		float_t = convert_dtype['ti'][np_float_t]
-		self.shape,self.size,self.float_t = shape,size,float_t
+		self._shape,self._size,self._float_t = shape,size,float_t
 
 		assert len(shape)==vdim
 		assert λ.dtype==np_float_t
@@ -73,7 +73,7 @@ class AnisoScalar:
 		τ = np_float_t(dt/2)
 		τih = τ/h
 		τihh = τ/(h*h)
-		self.h,self.dt,self._τ,self.τih,self.τihh = h,dt,τ,τih,τihh
+		self._h,self._dt,self._τ,self.τih,self.τihh = h,dt,τ,τih,τihh
 
 		# -------- inverse density μ --------
 		# Flatten and convert 
@@ -163,7 +163,18 @@ class AnisoScalar:
 		self._eAv,self._eAσ = eAv,eAσ
 
 	# ---------------- Properties -----------------
-	# shape, size, float_t are member fields
+	@property
+	def shape(self):
+		"""The domain grid dimensions"""
+		return self._shape
+	@property
+	def size(self):
+		"""The number of points in the grid"""
+		return self._size
+	@property
+	def float_t(self):
+		"""The taichi floating point type"""
+		return self._float_t
 	@property
 	def E(self):
 		"""Offsets of the numerical scheme"""
@@ -178,8 +189,17 @@ class AnisoScalar:
 		return self.E.shape[1]
 
 	@property
+	def h(self):
+		"""The gridscale"""
+		return self._h
+	@property
+	def dt(self):
+		"""The timestep"""
+		return self._dt
+	@property
 	def τ(self):
-		"""Half timestep τ=dt/2"""
+		"""Half timestep τ=dt/2. 
+		Note that the Verlet scheme uses half timesteps in the symplectic substeps"""
 		return self._τ
 
 	@property
@@ -229,7 +249,10 @@ class AnisoScalar:
 	def Verlet_p(self,
 		q:ti.template(),  # field(float_t,size) [INOUT]
 		p:ti.template()): # field(float_t,size) [INOUT]
-		"""One Verlet_p timestep (update p first), in the position-momentum coordinates"""
+		"""
+		One Verlet_p timestep (update p first), in the position-momentum coordinates.
+		Momentum is damped, but NOT position (would make little sense)
+		"""
 		dt,μ,eAv = ti.static(self.dt,self.μ,self.eAv)
 		for I in μ: self.update_p(q,p,I) # Update p
 		for I in μ: q[I] += dt*μ[I]*p[I] # Update q (double timestep)
@@ -260,7 +283,8 @@ class AnisoScalar:
 	def Verlet_v(self,
 		σ:ti.template(),  # field(float_t,(size,decompdim)) [INOUT]
 		v:ti.template()): # field(float_t,size)             [INOUT]
-		"""One Vertlet_v timestep (update v first) in the velocity-stress coordinates""" 
+		"""One Vertlet_v timestep (update v first) in the velocity-stress coordinates.
+		Includes the damping of velocity and stress.""" 
 		μ,eAσ,eAv = ti.static(self.μ,self.eAσ,self.eAv)
 		for I in μ: self.update_v(σ,v,I) 
 		for I in μ: self.update_σ(σ,v,I)
@@ -283,8 +307,7 @@ class AnisoScalar:
 				else: σ[I,e] = 0
 
 	def q2σ(self,q):
-		"""Change of coordinates position->stress 
-		σ = D grad q"""
+		"""Change of coordinates position->stress : σ = D grad q"""
 		σ = ti.field(self.float_t,(self.size,self.decompdim));
 		self._q2σ(q,σ)
 		return σ
@@ -298,8 +321,7 @@ class AnisoScalar:
 		for I in μ: v[I] = p[I]*μ[I]
 
 	def p2v(self,p):
-		"""Change of coordinates momentum density -> velocity
-		v = μ p. (μ is the inverse density)"""
+		"""Change of coordinates momentum -> velocity : v = μ p"""
 		v = ti.field(self.float_t,self.size)
 		self._p2v(p,v)
 		return v
