@@ -9,8 +9,78 @@ This file implements the linear anisotropic wave equation,
 D_tt q = μ div(D grad q), using adaptive finite differences. 
 """
 
+@ti.func
+def sSign(x,
+	order:ti.template()=2):
+	"""Smoothed sign function, interpolating from -1 to 1 on [-1,1].
+	- order : order of the last continuous derivative"""
+	x = min(1,max(-1,x))
+	if ti.static(order==0): return x
+	x2 = x*x
+	if ti.static(order==1): return x*(3-x2)/2
+	if ti.static(order==2): return x*(15+x2*(-10+x2*3))/8 # See notebook SmoothSign.nb
+	if ti.static(order==3): return x*(35+x2*(-35+x2*(21-x2*5)))/16
+	ti.static_assert(False,"Unsupported smoothness order")
 
+# @ti.func
+# def sHeaviside01(r,order:ti.template()=2):
+# 	"""Smoothed heaviside function, interpolates from 0 to 1 on [0,1]
+# 	- order : order of the last continuous derivative"""
+# 	return (sSign(2*r-1,order)+1)/2
 
+def BoxNormal(shape,width=3,sides=True,out=None):
+	"""
+	Computes the unit outward normal vector to the given box shape, on the given sides, smoothed
+	over the given width. Used in the implementation of boundary conditions.
+	Inputs : 
+	 - shape : tuple (n1,...,nd)
+	 - sides : tuple ((a1,b1),...,(ad,bd)) where ai or bi is true if normal is needed on side i, min or max
+	 - width : smooth the normal over the given width
+	 - out (optional) : array of shape (n1,...,nd,d)
+	"""
+	vdim = len(shape)
+	if isinstance(sides,bool): sides = (sides,sides)*vdim
+	normal_shape = (*shape,vdim)
+	if out is None: out = np.zeros(normal_shape)
+	else: assert out.shape == normal_shape
+	vec = ti.lang.matrix.VectorType(vdim,convert_dtype['ti'][out.dtype])
+	@ti.kernel
+	def set_normal(out:ti.types.ndarray(dtype=vec,ndim=vdim)):
+		for x in ti.grouped(out): # Only this loop is parallelized
+			for i in ti.static(range(vdim)):
+				if sides[i][0]: out[x][i] -= max(0, 1-x[i]/width)**2
+				if sides[i][1]: out[x][i] += max(0, 1-(shape[i]-1-x[i])/width)**2
+			nx = out[x].norm()
+			if nx>0: out[x] *= sSign(nx)/nx
+	set_normal(out)
+	return out
+
+def Damping(shape,width,width1=None,sides=True,order=2,out=None):
+	"""
+	Computes some damping coefficients, with a polynomial growth profile.
+	Typical usage γ = Damping(...) / forcing_period in the constructor of AnisoScalar.
+	(Can adjust multiplier, typically slightly smaller so that the absorbing conditions have an effect.)
+
+	Inputs : 
+	- shape : tuple (n1,...,nd)
+	- sides : tuple (a1,b1),...,(ad,bd)) where ai or bi is true if damping is needed on side i, min or max
+	- width : thickness of the damping layer in pixels (recomm : a few wavelengths)
+	- width1: thickness over which the damping coefficient goes from 0 to 1 (recomm : approx wavelength)
+	- order : polynomial profile order (recomm : 2 or 3)
+	"""
+	vdim=len(shape)
+	if isinstance(sides,bool): sides = (sides,sides)*vdim
+	if out is None: out = np.zeros(shape)
+	else: assert out.shape==shape
+	if width1 is None: width1 = width/3
+	@ti.kernel
+	def set_damping(out:ti.types.ndarray(ndim=vdim)):
+		for x in ti.grouped(out):
+			for i in ti.static(range(vdim)):
+				if sides[i][0]: out[x] += max(0, (width-x[i])/width1)**order
+				if sides[i][1]: out[x] += max(0, (width-(shape[i]-1-x[i]))/width1)**order
+	set_damping(out)
+	return out
 
 @ti.data_oriented
 class AnisoScalar:
@@ -24,11 +94,11 @@ class AnisoScalar:
 
 	Constructor inputs : 
 	- μ (float,(n1,...,nd)): the inverse density
-	- λ (float,(n1,...,nd,nE)) : the weights
+	- λ (float,(n1,...,nd,nE)) : the weights of the scheme stencils
 	- E (nE,d) : the offsets
-	- dt : timestep
-	- h (optional, default=1) : gridscale
-	- α (optional, default=None) : sponge coefficient
+	- dt : timestep. Convention : if dt=-r<0, then the timestep r*dx/v_cfl is used
+	- dx (optional, default=1) : gridscale
+	- γ (optional, default=None) : sponge coefficient
 	- absorbing_bc (optional, default=None): where to apply absorbing boundary conditions
 
 	Hamiltonian Position-Momentum formulation : 
@@ -36,8 +106,8 @@ class AnisoScalar:
 	Dt p = div(D grad q) - Av p
 
 	Velocity-Stress formulation, with variables σ = D grad q, v = μ p : 
-	Dt σ = D grad v - α σ
-	Dt v = μ div σ - α v
+	Dt σ = D grad v - γ σ
+	Dt v = μ div σ - γ v
 
 	Where Aσ and Av are optional damping factors.
 	- The two formulations coincide if Aσ = 0
@@ -51,7 +121,12 @@ class AnisoScalar:
 	 - We only implement the second order scheme.
 	"""
 
-	def __init__(self,μ,λ,E,dt,h=1.,α=None,absorbing_bc=None):
+	def __init__(self,
+		μ,λ,E, # inverse density, weights and offsets
+		dx=1.,dt=-0.5, # gridscale, timestep with negative convention above
+		γ=None, # Damping for momentum, velocity and stress (not position)
+		normal=None,ζpos=True # Absorbing boundary conditions
+		):
 
 		# Shape and float type
 		E = np.ascontiguousarray(E.astype(np.int8))
@@ -67,8 +142,11 @@ class AnisoScalar:
 		assert λ.dtype==np_float_t
 		assert λ.shape==(*shape,decompdim)
 
+		self._v_cfl = np.sqrt(np.max(μ*np.sum(λ,axis=-1))) # Cfl pseudo-velocity
+		if dt<0: dt = -dt * dx / abs(self.v_cfl) # Timestep given via the cfl ratio
+
 		# Timestep and gridscale
-		h = np_float_t(h)
+		h = np_float_t(dx) # Renaming the gridscale to match the paper
 		dt = np_float_t(dt)
 		τ = np_float_t(dt/2)
 		τih = τ/h
@@ -87,16 +165,12 @@ class AnisoScalar:
 		self.cshape,self._iE = cshape,iE
 
 		# Compute a mask indicating wether any point+offset falls outside the domain
-		# We also compute the normal vector to the domain, *only where absorbing_bc are active*
 		mE_t = ti.i32; assert decompdim <= 16 # data type used as bit mask
 		offset_t = VectorType(vdim,ti.i8)
-		if absorbing_bc is None: absorbing_bc = np.zeros((vdim,2),dtype=np.int8)
-		thickness_bc = 2 # Thickness of the layer on which the normal vector is computed
 		@ti.kernel
 		def set_offsets_masks(
 			mE:ti.types.ndarray(dtype=mE_t,ndim=vdim),
-			E: ti.types.ndarray(dtype=offset_t,ndim=1),
-			normal:ti.types.ndarray(dtype=offset_t,ndim=vdim)):
+			E: ti.types.ndarray(dtype=offset_t,ndim=1)):
 			for x in ti.grouped(mE): # Only this loop is parallelized
 				# Check which offsets go outside the domain
 				mask:mE_t = 0
@@ -106,17 +180,10 @@ class AnisoScalar:
 					for i in ti.static(range(vdim)):
 						if not(0<=yp[i]<shape[i]): mask |= 1<<(2*e)
 						if not(0<=ym[i]<shape[i]): mask |= 1<<(2*e+1)
-				mE[x] = -1-mask # Change 0s into 1s
-
-				# Build a normal vector to the domain
-				for i in ti.static(range(vdim)):
-					if x[i]<thickness_bc           and absorbing_bc[i,0]: normal[x][i] = ti.i8(-1)
-					if x[i]>=shape[i]-thickness_bc and absorbing_bc[i,1]: normal[x][i] = ti.i8( 1) 
+				mE[x] = -1-mask # Change 0s into 1s. Now 1 stands for inside the domain.
 
 		mE = np.zeros(shape,dtype=convert_dtype['np'][mE_t]);
-		normal = np.zeros((*shape,vdim), dtype=np.int8)
-		set_offsets_masks(mE,E,normal)
-#		print(-1-E,self.iE,"\n",mE)
+		set_offsets_masks(mE,E)
 		self._mE = ti.field(mE_t,size); self._mE.from_numpy(mE.reshape(-1)); mE = self.mE
 
 		# ------------- Weights λ --------------
@@ -131,17 +198,16 @@ class AnisoScalar:
 					else: mλ[I,e]=0
 		set_weights_masks(λ.reshape(-1,decompdim))
 		self._mλ = mλ
-#		print(mλ.to_numpy().reshape(*shape,decompdim)[:,:,0])
-
 
 		# ------------- Absorbing coefficients ------------
-		if α is None: α = np.zeros(shape,dtype=np_float_t)
-		eAv = ti.field(float_t,size)
-		eAσ = ti.field(float_t,(size,decompdim))
+		if γ is None: γ = np.zeros(shape,dtype=np_float_t)
+		Γv = ti.field(float_t,size)
+		Γσ = ti.field(float_t,(size,decompdim))
+		vector_t = VectorType(vdim,float_t)
 		@ti.kernel
 		def set_absorbing(
-			α:ti.types.ndarray(dtype=float_t,ndim=1),
-			normal:ti.types.ndarray(dtype=offset_t,ndim=1),
+			γ:ti.types.ndarray(dtype=float_t,ndim=1),
+			normal:ti.types.ndarray(dtype=vector_t,ndim=1),
 			E: ti.types.ndarray(dtype=offset_t,ndim=1),
 			λ:ti.types.ndarray(dtype=float_t,ndim=2) ):
 			for I in μ:
@@ -150,17 +216,23 @@ class AnisoScalar:
 				n = normal[I]
 				nDn:float_t = 0
 				for e in range(decompdim):
-					if mask & 1<<(2*e): eAσ[I,e] = ti.math.exp( -τ*(α[I]+α[I+iE[e]]) )
+					# Damp stress inside the domain
+					if mask & 1<<(2*e): Γσ[I,e] = ti.math.exp( -τ*(γ[I]+γ[I+iE[e]]) )
 
+					# Absorbing b.c. are equivalent to damping on the domain boundary
+					# Note : in the paper, we use max(0,ne) and max(0,-ne) to ensure that 
+					# absorbing bc has a stabilizing effect. Here ζ = max(0,ζ) has similar effect
 					ne = n@E[e]
-					if not(mask & 1<<(2*e)):   ζ += λ[I,e]*max(0, ne)
-					if not(mask & 1<<(2*e+1)): ζ += λ[I,e]*max(0,-ne)
+					if not(mask & 1<<(2*e)):   ζ += ne * λ[I,e] # *max(0, ne)
+					if not(mask & 1<<(2*e+1)): ζ -= ne * λ[I,e] # *max(0,-ne)
 					nDn += λ[I,e]*ne*ne
-				if nDn>0: ζ /= ti.math.sqrt(μ[I]*nDn)
-				eAv[I] = ti.math.exp(-dt*α[I]) * (1-τih*ζ)/(1+τih*ζ) 
-
-		set_absorbing(α.reshape(-1),normal.reshape(-1,vdim), E, λ.reshape(-1,decompdim))
-		self._eAv,self._eAσ = eAv,eAσ
+				# We multiply ζ by n.norm to smoothly fade the effect of b.c if needed.
+				if nDn>0: ζ *= ti.math.sqrt(n.norm_sqr()/(μ[I]*nDn)) 
+				if ti.static(ζpos): ζ = max(0,ζ)
+				Γv[I] = ti.math.exp(-dt*γ[I]) * (1-τih*ζ)/(1+τih*ζ) 
+		if normal is None: normal = np.zeros((*shape,vdim),dtype=np_float_t)
+		set_absorbing(γ.reshape(-1),normal.reshape(-1,vdim), E, λ.reshape(-1,decompdim))
+		self._Γv,self._Γσ = Γv,Γσ
 
 	# ---------------- Properties -----------------
 	@property
@@ -201,6 +273,10 @@ class AnisoScalar:
 		"""Half timestep τ=dt/2. 
 		Note that the Verlet scheme uses half timesteps in the symplectic substeps"""
 		return self._τ
+	@property
+	def v_cfl(self):
+		"""Courant-Friedrichs-Levy pseudo-velocity. One must have dt <= dx / v_cfl"""
+		return self._v_cfl
 
 	@property
 	def μ(self):
@@ -214,8 +290,8 @@ class AnisoScalar:
 	@property
 	def mE(self):
 		"""Domain complement mask. Second coordinate accessed using bit masks.
-		mE[x,2e] : true iff x+e falls outside the domain.
-		mE[x,2e+1] : true iff x-e falls outside the domain.
+		mE[x,2e] : true iff x+e falls inside the domain.
+		mE[x,2e+1] : true iff x-e falls inside the domain.
 		"""
 		return self._mE
 	@property
@@ -223,14 +299,20 @@ class AnisoScalar:
 		"""Averaged weights mλ(x,e) = (λ^e(x)+λ^e(x+he))/2"""
 		return self._mλ
 	@property
-	def eAv(self):
+	def Γv(self):
 		"""Multiplicative factor for the velocity variable in a damping + absorbing b.c. step"""
-		return self._eAv
+		return self._Γv
 	@property
-	def eAσ(self):
+	def Γσ(self):
 		"""Multiplicative factor for the stress variable in a damping step."""
-		return self._eAσ
+		return self._Γσ
 
+	def empty_like_v(self):
+		"""An empty field correctly shaped for v, but also q and p"""
+		return ti.field(self.float_t,self.size)
+	def empty_like_σ(self):
+		"""An empty field correctly shaped for σ"""
+		return ti.field(self.float_t,(self.size,self.decompdim))
 	# ------------- Symplectic evolution schemes ------------
 
 	@ti.func
@@ -253,11 +335,11 @@ class AnisoScalar:
 		One Verlet_p timestep (update p first), in the position-momentum coordinates.
 		Momentum is damped, but NOT position (would make little sense)
 		"""
-		dt,μ,eAv = ti.static(self.dt,self.μ,self.eAv)
+		dt,μ,Γv = ti.static(self.dt,self.μ,self.Γv)
 		for I in μ: self.update_p(q,p,I) # Update p
 		for I in μ: q[I] += dt*μ[I]*p[I] # Update q (double timestep)
 		for I in μ: self.update_p(q,p,I) # Update p, again
-		for I in μ: p[I] *= eAv[I]       # Damp p
+		for I in μ: p[I] *= Γv[I]       # Damp p
 
 	@ti.func
 	def update_v(self,σ,v,I):
@@ -285,13 +367,13 @@ class AnisoScalar:
 		v:ti.template()): # field(float_t,size)             [INOUT]
 		"""One Vertlet_v timestep (update v first) in the velocity-stress coordinates.
 		Includes the damping of velocity and stress.""" 
-		μ,eAσ,eAv = ti.static(self.μ,self.eAσ,self.eAv)
+		μ,Γσ,Γv = ti.static(self.μ,self.Γσ,self.Γv)
 		for I in μ: self.update_v(σ,v,I) 
 		for I in μ: self.update_σ(σ,v,I)
-		for I,e in σ: σ[I,e] *= eAσ[I,e] # Damp σ
+		for I,e in σ: σ[I,e] *= Γσ[I,e] # Damp σ
 		for I in μ: self.update_σ(σ,v,I)
 		for I in μ: self.update_v(σ,v,I) 
-		for I in μ: v[I] *= eAv[I]       # Damp v
+		for I in μ: v[I] *= Γv[I]       # Damp v
 
 	# ------------- Change of variables ------------
 
@@ -333,13 +415,13 @@ class AnisoScalar:
 		"""Hamiltonian (original unperturbed) of the system, in position-momentum variables
 		(<p,Ap> + <q,Bq>)/2, where Ap = μ p and Bq = -div(D grad q) discretized
 		"""
-		μ,mE,decompdim,mλ,iE = ti.static(self.μ,self.mE,self.decompdim,self.mλ,self.iE)
+		μ,mE,decompdim,mλ,iE,ih2 = ti.static(self.μ,self.mE,self.decompdim,self.mλ,self.iE,self.h**-2)
 		H:self.float_t = 0
 		for I in μ:
 			H += μ[I]*p[I]**2
 			mask = mE[I]
 			for e in range(decompdim):
-				if mask & 1<<(2*e): H += mλ[I,e]*(q[I+iE[e]]-q[I])**2 
+				if mask & 1<<(2*e): H += ih2*mλ[I,e]*(q[I+iE[e]]-q[I])**2
 		return H/2
 	@ti.kernel
 	def _Hp(self,q:ti.template(),dp:ti.template()) -> float:
@@ -399,7 +481,7 @@ class AnisoScalar:
 		μ,mE,decompdim,mλ = ti.static(self.μ,self.mE,self.decompdim,self.mλ)
 		H:self.float_t = 0
 		for I in μ:
-			self.update_σ(dσ,v)
+			self.update_σ(dσ,v,I)
 			for e in range(decompdim): 
 				if mλ[I,e]!=0: H += dσ[I,e]**2 / mλ[I,e] # Note : mλ[I,e] is a factor of dσ[I,e] 
 		return H/2

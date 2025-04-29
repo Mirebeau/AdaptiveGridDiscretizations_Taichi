@@ -153,7 +153,7 @@ def sabs(x,
     order:ti.template()=3): 
     """
     Smoothed absolute value function.
-    Guarantee : 0 <= result-|x| <= 1/2.
+    Guarantee : 0 <= result-|x| <= 1/2, and result = |x| if |x|>=1
     - order : order of the last continuous derivative.
     """
     x=min(abs(x),Linalg.one_like(x))
@@ -282,6 +282,6 @@ def DecompWithFixedOffsets(λ,e,base=256):
             J = ie_inverse[i,j]
             Λ[i,J] = λ[i,j]
     Λ = np.zeros_like(λ,shape = (*shape,N))
-    set_coefficients(λ,ie_inverse.reshape(λ.shape),Λ)
+    set_coefficients(λ,ie_inverse.reshape(λ.shape),Λ.reshape(-1,N))
 
     return Λ,E
