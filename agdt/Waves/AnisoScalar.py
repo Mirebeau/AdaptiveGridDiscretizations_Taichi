@@ -10,6 +10,13 @@ D_tt q = μ div(D grad q), using adaptive finite differences.
 """
 
 @ti.func
+def inShape(x:ti.template(),shape:ti.template()):
+    inside=True
+    for i in ti.static(range(len(shape))):
+        inside = inside and (0<=x[i]<shape[i])
+    return inside
+
+@ti.func
 def sSign(x,
 	order:ti.template()=2):
 	"""Smoothed sign function, interpolating from -1 to 1 on [-1,1].
@@ -167,6 +174,7 @@ class AnisoScalar:
 		# Compute a mask indicating wether any point+offset falls outside the domain
 		mE_t = ti.i32; assert decompdim <= 16 # data type used as bit mask
 		offset_t = VectorType(vdim,ti.i8)
+		self.offset_t = offset_t
 		@ti.kernel
 		def set_offsets_masks(
 			mE:ti.types.ndarray(dtype=mE_t,ndim=vdim),
@@ -390,7 +398,7 @@ class AnisoScalar:
 
 	def q2σ(self,q):
 		"""Change of coordinates position->stress : σ = D grad q"""
-		σ = ti.field(self.float_t,(self.size,self.decompdim));
+		σ = self.empty_like_σ()
 		self._q2σ(q,σ)
 		return σ
 
@@ -404,7 +412,7 @@ class AnisoScalar:
 
 	def p2v(self,p):
 		"""Change of coordinates momentum -> velocity : v = μ p"""
-		v = ti.field(self.float_t,self.size)
+		v = self.empty_like_v()
 		self._p2v(p,v)
 		return v
 
@@ -436,8 +444,9 @@ class AnisoScalar:
 		"""Hamiltonian perturbation <p,ABA p>/2.
 		Depending on μp = Ap in non-diagonal manner. (dq=0, shaped as q)"""
 		H:self.float_t = 0
-		for I in μp: self.update_p(dq,μp,I); H += μp[I]*dq[I]
-		return H/2
+		for I in μp: 
+			self.update_p(μp,dq,I); H -= μp[I]*dq[I]
+		return self.τ*H/2
 
 	def Hqp(self,q,p,choice='p'):
 		"""
@@ -501,3 +510,156 @@ class AnisoScalar:
 		elif choice=='σ': dσ=ti.field(float_t,(size,decompdim)); dσ.fill(0); H-=self._Hσ(dσ,v)
 		else: assert choice=='orig'
 		return H
+
+
+	# -------------------- Mixed formulation q,p and σ,v -----------------
+	# This is a proof of concept. Idea : for strong anisotropies, the stencil E is large 
+	# (decompdim>>1), because we use non-adaptive offsets. In any case, the stencil E contains 
+	# at least 14 points for smooth 3D, which makes σ much more expensive than q to store. 
+	# In the context of seismic inversion, some history of past iterations needs to be kept, 
+	# and storing numerous values of σ may become prohibitive. The mixed formulation only 
+	# needs σ stored on the boundary layers, where the damping is active.
+	# Note : substantial additional memory optimizations are possible, e.g. getting rid of Γσ
+
+	def mixed_σmask(self):
+		"""Returns a mask of the places where σ is needed for the mixed formulation (depends on damping)."""
+		return np.any(Γσ.to_numpy()>0,axis=-1)
+
+	def mixed_setup(self,σmask=None,dealloc_unused=False):
+		"""
+		This function prepares for the mixed updates, in which the stress is only stored on a subdomain.
+		- σmask : where to save the stress. By default, it is stored only where needed, see mixed_σpos. 
+		However, this may lead to bad memory alignment, hence the user may modify this mask.
+		"""
+		if σmask is None: σmask = self.mixed_σmask()
+		indσ = np.nonzero(σmask)
+		σind = np.full(-1,size,dtype=np.int32)
+		σind[indσ] = np.arange(indσ.size)
+		Γσi = self.Γσ.to_numpy()[indσ]
+		self.indσ = indσ # Not used for now, but who knows.
+		self.σind = σind
+		self.Γσi = Γσi
+		if dealloc_unused: self.Γσ = None
+
+
+	def mixed_empty_like_σ(self):
+		return ti.field(self.float_t,(self.Γσi.size,self.decompdim))
+
+	@ti.func
+	def mixed_update_v(self,q,σ,v,I):
+		"""Symplectic update of the velocity, v += τ μ div σ == τ μ div D grad q"""
+		mE,decompdim,iE,τih,τihh,μ = ti.static(self.mE,self.decompdim,self.iE,self.τih,self.τihh,self.μ)
+		mask = mE[I]
+		dp:self.float_t = 0
+		for e in ti.static(range(decompdim)):
+			ie = iE[e]
+			if mask & 1<<(2*e):   
+				σi = σind[I+ie]
+				if σi==-1: dp += τihh * mλ[I,e]    * (q[I+ie]-q[I])
+				else:      dp += τih  * σ[σi,e]
+			if mask & 1<<(2*e+1): 
+				σi = σind[I-ie]
+				if σi==-1: dp += τihh * mλ[I-ie,e] * (q[I-ie]-q[I])
+				else:      dp += τih  * σ[σi,e]
+		v[I] += μ[I]*dv
+
+	@ti.func
+	def mixed_update_σq(self,q,σ,v,I):
+		"""Symplectic update of the position and/or stress. q += τ v, σ += D grad v"""
+		mE,decompdim,iE,τ,τih,mλ = ti.static(self.mE,self.decompdim,self.iE,self.τ,self.τih,self.mλ)
+		q[I] += τ*v[I] # Values where γ!=0 are rubbish, but that is ok
+		σi = σind[I]
+		if σi!=-1:
+			mask = mE[I]
+			for e in ti.static(range(decompdim)):
+				if mask & 1<<(2*e): σ[σi,e] += τih * mλ[I,e] * (v[I+iE[e]]-v[I])
+
+	@ti.kernel
+	def mixed_Verlet_v(self,
+		σ:ti.template(),  # field(float_t,(size,decompdim)) [INOUT]
+		v:ti.template()): # field(float_t,size)             [INOUT]
+		"""One Vertlet_v timestep (update v first) in the velocity-stress coordinates.
+		Includes the damping of velocity and stress.""" 
+		μ,Γσi,Γv = ti.static(self.μ,self.Γσi,self.Γv)
+		for I in μ: self.mixed_update_v(σ,v,I) 
+		for I in μ: self.mixed_update_σ(σ,v,I)
+		for I,e in σ: σ[I,e] *= Γσi[I,e] # Damp σ
+		for I in μ: self.mixed_update_σ(σ,v,I)
+		for I in μ: self.mixed_update_v(σ,v,I) 
+		for I in μ: v[I] *= Γv[I]        # Damp v
+				
+	# ------------------- Extended formulation Q=v, P=divσ, R=σgradγ -------------------
+	# This formulation uses three scalar values, which is a bit more than position-momentum, but 
+	# much less than velocity-stress if the stencil E is large.
+	# In the absence of damping, this formulation is equivalent to the position-momentum, with q=v, p=divσ.
+	# In the presence of damping, it is *almost* equivalent to the velocity-stress one, up to a 
+	# small error term related with the hessian of the damping factor. 
+
+	def extended_setup(self,γ,dealloc_unused=False):
+		"""Setup for the extended formulation. We need to recover the damping weights."""
+		# Damping γ was not saved, because it is not needed by the other schemes
+		assert γ.shape==self.shape
+		self.γ = self.empty_like_v()
+		self.γ.from_numpy(γ.reshape(-1))
+		self.Γ = self.empty_like_v()
+		self.Γ.from_numpy(np.exp(-γ*self.dt).reshape(-1))
+		if dealloc_unused: self.Γσ = None
+
+	@ti.kernel
+	def _extended_divσ_σgradγ(self,σ:ti.template(),divσ:ti.template(),σgradγ:ti.template()):
+		mE,decompdim,ih = ti.static(self.mE,self.decompdim,self.iE,1/self.h)
+		for I in divσ:
+			mask = mE[I]
+			for e in ti.static(decompdim):
+				ie = iE[e]
+				if mask & 1<<(2*e): 
+					divσ[I]   += ih*σ[I   ,e]
+					σgradγ[I] += ih*σ[I   ,e]*(γ[I+ie]-γ[I])/2
+				if mask & 1<<(2*e+1): 
+					divσ[I]   -= ih*σ[I-ie,e]
+					σgradγ[I] -= ih*σ[I-ie,e]*(γ[I-ie]-γ[I])/2
+
+	def extended_divσ_σgradγ(self,σ):
+		"""Returns P = div σ, and R = <σ, grad γ>"""
+		divσ = self.empty_like_v(); divσ.fill(0)
+		σgradγ = self.empty_like_v(); σgradγ.fill(0)
+		_extended_divσ_σgradγ(σ,divσ,σgradγ)
+		return divσ,σgradγ
+
+	@ti.func	
+	def extended_update_divσ(self,v,divσ,σgradγ,I):
+		τ = ti.static(self.τ)
+		self.update_p(v,divσ,I)
+		divσ[I] -= τ*σgradγ[I]
+
+	@ti.func
+	def extended_update_σgradγ(self,v,σgradγ,I):
+		mE,mλ,iE,decompdim,τihh = ti.static(self.mE,self.mλ,self.iE,self.decompdim,self.τihh)	
+		mask = mE[I]
+		δ:self.float_t = 0
+		for e in ti.static(range(decompdim)):
+			ie = iE[e]
+			if mask & 1<<(2*e):   δ += mλ[I   ,e] * (γ[I+ie]-γ[I]) * (q[I+ie]-q[I])
+			if mask & 1<<(2*e+1): δ += mλ[I-ie,e] * (γ[I-ie]-γ[I]) * (q[I-ie]-q[I])
+		σgradγ[I] += 0.5*τihh * δ
+
+	@ti.kernel
+	def extended_Verlet(self,
+		v:ti.template(),		# field(float_t,size) [INOUT]
+		divσ:ti.template(),		# field(float_t,size) [INOUT]
+		σgradγ: ti.template()): # field(float_t,size) [INOUT]
+		"""One Verlet timestep. Not sure about the natural order of updates."""
+		# Maybe v first for consistency with the other schemes ? 
+		μ,Γ,Γv = ti.static(self.μ,self.Γ,self.Γv)
+		for I in μ: v[I] += τ*μ[I]*divσ[I]                     # update v
+		for I in μ: self.extended_update_divσ(v,divσ,σgradγ,I) # update divσ
+		for I in μ: self.extended_update_σgradγ(v,σgradγ,I)    # update σgradγ
+		for I in μ: divσ[I]   *= Γ[I]                          # Damp divσ
+		for I in μ: σgradγ[I] *= Γ[I]                          # Damp σgradγ
+		for I in μ: self.extended_update_σgradγ(v,σgradγ,I)    # update σgradγ
+		for I in μ: self.extended_update_divσ(v,divσ,σgradγ,I) # update divσ
+		for I in μ: v[I] += τ*μ[I]*divσ[I]                     # update v
+		for I in μ: v[I]      *= Γv[I]                         # Damp v
+
+
+
