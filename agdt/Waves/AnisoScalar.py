@@ -443,10 +443,12 @@ class AnisoScalar:
 	def _Hq(self,dq:ti.template(),μp:ti.template()) -> float:
 		"""Hamiltonian perturbation <p,ABA p>/2.
 		Depending on μp = Ap in non-diagonal manner. (dq=0, shaped as q)"""
+		μ,τ = ti.static(self.μ,self.τ)
 		H:self.float_t = 0
-		for I in μp: 
-			self.update_p(μp,dq,I); H -= μp[I]*dq[I]
-		return self.τ*H/2
+		for I in μ:
+			self.update_p(μp,dq,I)
+			H -= μp[I]*dq[I]
+		return τ*H/2
 
 	def Hqp(self,q,p,choice='p'):
 		"""
@@ -457,9 +459,8 @@ class AnisoScalar:
 		 - 'orig' : original Hamiltonian
 		"""
 		H = self._Hqp(q,p)
-		float_t,size = self.float_t,self.size	
-		if   choice=='p': dp=ti.field(float_t,size); dp.fill(0); H-=self._Hp(q,dp)
-		elif choice=='q': dq=ti.field(float_t,size); dq.fill(0); H-=self._Hq(dq,self.p2v(p)) # TODO : fix 
+		if   choice=='p': dp=self.empty_like_v(); dp.fill(0); H-=self._Hp(q,dp)
+		elif choice=='q': dq=ti.field(float_t,size); dq.fill(0); H-=self._Hq(dq,self.p2v(p))
 		else: assert choice=='orig'
 		return H
 
@@ -523,7 +524,12 @@ class AnisoScalar:
 
 	def mixed_σmask(self):
 		"""Returns a mask of the places where σ is needed for the mixed formulation (depends on damping)."""
-		return np.any(Γσ.to_numpy()>0,axis=-1)
+		# Effective mask used, after mixed_setup
+		if hasattr(self,'σind'): return self.σind.to_numpy()!=-1 
+		# Make a proposal, before mixed_setup
+		# Not that genuine damping yields and exponential value which must be different from 0
+		# (Value 0 is used for Neumann b.c.).
+		return np.any(np.logical_and(self.Γσ.to_numpy()!=1,self.Γσ.to_numpy()!=0),axis=-1)
 
 	def mixed_setup(self,σmask=None,dealloc_unused=False):
 		"""
@@ -532,61 +538,92 @@ class AnisoScalar:
 		However, this may lead to bad memory alignment, hence the user may modify this mask.
 		"""
 		if σmask is None: σmask = self.mixed_σmask()
-		indσ = np.nonzero(σmask)
-		σind = np.full(-1,size,dtype=np.int32)
+		indσ = np.nonzero(σmask)[0]
+		σind = np.full(self.size,-1,dtype=np.int32)
 		σind[indσ] = np.arange(indσ.size)
-		Γσi = self.Γσ.to_numpy()[indσ]
-		self.indσ = indσ # Not used for now, but who knows.
-		self.σind = σind
-		self.Γσi = Γσi
+		ΓDσ = self.Γσ.to_numpy()[indσ]
+		self.indσ = ti.field(ti.i32,indσ.shape); self.indσ.from_numpy(indσ.astype(np.int32)) 
+		self.σind = ti.field(ti.i32,σind.shape); self.σind.from_numpy(σind)
+		self.ΓDσ  = ti.field(self.float_t,ΓDσ.shape); self.ΓDσ.from_numpy(ΓDσ)
 		if dealloc_unused: self.Γσ = None
 
+	def mixed_empty_like_Dσ(self,σ=None):
+		"""Builds a correctly shaped field Dσ (boundary values only) for the mixed formulation. 
+		- σ (optional) : values to restrict"""
+		Dσ = ti.field(self.float_t,self.ΓDσ.shape)
+		@ti.kernel
+		def restrict_σ(Dσ:ti.template(), σ:ti.template()):
+			indσ,decompdim = ti.static(self.indσ,self.decompdim)
+			for I in indσ:
+				for e in ti.static(range(decompdim)):
+					Dσ[I,e] = σ[indσ[I],e]
+		if σ is not None: restrict_σ(Dσ,σ)
+		return Dσ
 
-	def mixed_empty_like_σ(self):
-		return ti.field(self.float_t,(self.Γσi.size,self.decompdim))
+	@ti.kernel
+	def _qDσ2σ(self,
+		q: ti.template(), # field(float_t,size) [IN]
+		Dσ:ti.template(), # field(float_t,(Dsize,decompdim)) [IN]
+		σ:ti.template()): # field(float_t,(size,decompdim)) [OUT]
+		mE,decompdim,iE,mλ,ih,σind = ti.static(self.mE,self.decompdim,self.iE,self.mλ,1/self.h,self.σind)
+		for I in q:
+			mask = mE[I]
+			σi = σind[I]
+			for e in ti.static(range(decompdim)):
+				if mask & 1<<(2*e):   
+					if σi==-1: σ[I,e] = ih * mλ[I,e] * (q[I+iE[e]]-q[I])
+					else:      σ[I,e] = Dσ[σi,e]
+	
+	def qDσ2σ(self,q,Dσ):
+		"""Complete field σ, from potential q (where no damping), and Dσ (on boundary layers)"""
+		σ = self.empty_like_σ()
+		σ.fill(0)
+		self._qDσ2σ(q,Dσ,σ)
+		return σ
 
 	@ti.func
-	def mixed_update_v(self,q,σ,v,I):
+	def mixed_update_v(self,q,Dσ,v,I):
 		"""Symplectic update of the velocity, v += τ μ div σ == τ μ div D grad q"""
-		mE,decompdim,iE,τih,τihh,μ = ti.static(self.mE,self.decompdim,self.iE,self.τih,self.τihh,self.μ)
+		mE,decompdim,iE,mλ,τih,τihh,μ,σind = ti.static(self.mE,self.decompdim,self.iE,self.mλ,self.τih,self.τihh,self.μ,self.σind)
 		mask = mE[I]
 		dp:self.float_t = 0
 		for e in ti.static(range(decompdim)):
 			ie = iE[e]
 			if mask & 1<<(2*e):   
-				σi = σind[I+ie]
+				σi = σind[I]
 				if σi==-1: dp += τihh * mλ[I,e]    * (q[I+ie]-q[I])
-				else:      dp += τih  * σ[σi,e]
+				else:      dp += τih  * Dσ[σi,e]
 			if mask & 1<<(2*e+1): 
 				σi = σind[I-ie]
 				if σi==-1: dp += τihh * mλ[I-ie,e] * (q[I-ie]-q[I])
-				else:      dp += τih  * σ[σi,e]
-		v[I] += μ[I]*dv
+				else:      dp -= τih  * Dσ[σi,e]
+		v[I] += μ[I]*dp
 
 	@ti.func
-	def mixed_update_σq(self,q,σ,v,I):
+	def mixed_update_Dσq(self,q,Dσ,v,I):
 		"""Symplectic update of the position and/or stress. q += τ v, σ += D grad v"""
-		mE,decompdim,iE,τ,τih,mλ = ti.static(self.mE,self.decompdim,self.iE,self.τ,self.τih,self.mλ)
+		mE,decompdim,iE,τ,τih,mλ,σind = ti.static(self.mE,self.decompdim,self.iE,self.τ,self.τih,self.mλ,self.σind)
 		q[I] += τ*v[I] # Values where γ!=0 are rubbish, but that is ok
 		σi = σind[I]
 		if σi!=-1:
 			mask = mE[I]
 			for e in ti.static(range(decompdim)):
-				if mask & 1<<(2*e): σ[σi,e] += τih * mλ[I,e] * (v[I+iE[e]]-v[I])
+				if mask & 1<<(2*e): Dσ[σi,e] += τih * mλ[I,e] * (v[I+iE[e]]-v[I])
 
 	@ti.kernel
 	def mixed_Verlet_v(self,
-		σ:ti.template(),  # field(float_t,(size,decompdim)) [INOUT]
-		v:ti.template()): # field(float_t,size)             [INOUT]
+		q: ti.template(),  # field(float_t,size)              [INOUT]
+		Dσ:ti.template(),  # field(float_t,(Dsize,decompdim)) [INOUT]
+		v: ti.template()): # field(float_t,size)              [INOUT]
 		"""One Vertlet_v timestep (update v first) in the velocity-stress coordinates.
 		Includes the damping of velocity and stress.""" 
-		μ,Γσi,Γv = ti.static(self.μ,self.Γσi,self.Γv)
-		for I in μ: self.mixed_update_v(σ,v,I) 
-		for I in μ: self.mixed_update_σ(σ,v,I)
-		for I,e in σ: σ[I,e] *= Γσi[I,e] # Damp σ
-		for I in μ: self.mixed_update_σ(σ,v,I)
-		for I in μ: self.mixed_update_v(σ,v,I) 
-		for I in μ: v[I] *= Γv[I]        # Damp v
+		μ,ΓDσ,Γv = ti.static(self.μ,self.ΓDσ,self.Γv)
+		for I in μ: self.mixed_update_v(  q,Dσ,v,I) 
+		for I in μ: self.mixed_update_Dσq(q,Dσ,v,I)
+		for I,e in Dσ: Dσ[I,e] *= ΓDσ[I,e] # Damp Dσ. Field q is not damped.
+		for I in μ: self.mixed_update_Dσq(q,Dσ,v,I)
+		for I in μ: self.mixed_update_v(  q,Dσ,v,I)
+		for I in μ: v[I] *= Γv[I]          # Damp v
 				
 	# ------------------- Extended formulation Q=v, P=divσ, R=σgradγ -------------------
 	# This formulation uses three scalar values, which is a bit more than position-momentum, but 
@@ -607,10 +644,10 @@ class AnisoScalar:
 
 	@ti.kernel
 	def _extended_divσ_σgradγ(self,σ:ti.template(),divσ:ti.template(),σgradγ:ti.template()):
-		mE,decompdim,ih = ti.static(self.mE,self.decompdim,self.iE,1/self.h)
+		mE,decompdim,iE,ih,γ = ti.static(self.mE,self.decompdim,self.iE,1/self.h,self.γ)
 		for I in divσ:
 			mask = mE[I]
-			for e in ti.static(decompdim):
+			for e in ti.static(range(decompdim)):
 				ie = iE[e]
 				if mask & 1<<(2*e): 
 					divσ[I]   += ih*σ[I   ,e]
@@ -623,7 +660,7 @@ class AnisoScalar:
 		"""Returns P = div σ, and R = <σ, grad γ>"""
 		divσ = self.empty_like_v(); divσ.fill(0)
 		σgradγ = self.empty_like_v(); σgradγ.fill(0)
-		_extended_divσ_σgradγ(σ,divσ,σgradγ)
+		self._extended_divσ_σgradγ(σ,divσ,σgradγ)
 		return divσ,σgradγ
 
 	@ti.func	
@@ -634,13 +671,13 @@ class AnisoScalar:
 
 	@ti.func
 	def extended_update_σgradγ(self,v,σgradγ,I):
-		mE,mλ,iE,decompdim,τihh = ti.static(self.mE,self.mλ,self.iE,self.decompdim,self.τihh)	
+		mE,mλ,iE,decompdim,τihh,γ = ti.static(self.mE,self.mλ,self.iE,self.decompdim,self.τihh,self.γ)	
 		mask = mE[I]
 		δ:self.float_t = 0
 		for e in ti.static(range(decompdim)):
 			ie = iE[e]
-			if mask & 1<<(2*e):   δ += mλ[I   ,e] * (γ[I+ie]-γ[I]) * (q[I+ie]-q[I])
-			if mask & 1<<(2*e+1): δ += mλ[I-ie,e] * (γ[I-ie]-γ[I]) * (q[I-ie]-q[I])
+			if mask & 1<<(2*e):   δ += mλ[I   ,e] * (γ[I+ie]-γ[I]) * (v[I+ie]-v[I])
+			if mask & 1<<(2*e+1): δ += mλ[I-ie,e] * (γ[I-ie]-γ[I]) * (v[I-ie]-v[I])
 		σgradγ[I] += 0.5*τihh * δ
 
 	@ti.kernel
@@ -650,7 +687,7 @@ class AnisoScalar:
 		σgradγ: ti.template()): # field(float_t,size) [INOUT]
 		"""One Verlet timestep. Not sure about the natural order of updates."""
 		# Maybe v first for consistency with the other schemes ? 
-		μ,Γ,Γv = ti.static(self.μ,self.Γ,self.Γv)
+		μ,Γ,Γv,τ = ti.static(self.μ,self.Γ,self.Γv,self.τ)
 		for I in μ: v[I] += τ*μ[I]*divσ[I]                     # update v
 		for I in μ: self.extended_update_divσ(v,divσ,σgradγ,I) # update divσ
 		for I in μ: self.extended_update_σgradγ(v,σgradγ,I)    # update σgradγ
