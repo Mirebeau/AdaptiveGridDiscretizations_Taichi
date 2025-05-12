@@ -157,13 +157,13 @@ def sabs(x,
     - order : order of the last continuous derivative.
     """
     x=min(abs(x),Linalg.one_like(x))
-    if ti.static(order==1): return x
+    if ti.static(order==0): return x
     x2 = x*x
-    if ti.static(order==2): return (1./2)*(1.+x2)
+    if ti.static(order==1): return (1./2)*(1.+x2)
     x4 = x2*x2
-    if ti.static(order==3): return (1./8)*(3+6*x2-x4)
+    if ti.static(order==2): return (1./8)*(3+6*x2-x4)
     x6 = x2*x4;
-    if ti.static(order==4): return (1./16)*(5+15*x2-5*x4+x6)
+    if ti.static(order==3): return (1./16)*(5+15*x2-5*x4+x6)
     ti.static_assert(False,"Unsupported smoothness order")
 
 @ti.func

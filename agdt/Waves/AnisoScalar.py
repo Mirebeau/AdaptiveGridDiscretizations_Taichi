@@ -106,7 +106,8 @@ class AnisoScalar:
 	- dt : timestep. Convention : if dt=-r<0, then the timestep r*dx/v_cfl is used
 	- dx (optional, default=1) : gridscale
 	- γ (optional, default=None) : sponge coefficient
-	- absorbing_bc (optional, default=None): where to apply absorbing boundary conditions
+	- normal (optional, default=None): where to apply absorbing boundary conditions
+	- ζpos (optional, default=True): ensures the stability of the absorbing b.c.
 
 	Hamiltonian Position-Momentum formulation : 
 	Dt q = μ p
