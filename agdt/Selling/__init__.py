@@ -12,7 +12,7 @@ def random_sym(n:ti.template(),relax=0.1,dtype:ti.template()=float):
     """Generates an nxn positive definite symmetric matrix (if relax>0)"""
     ndim = ti.static(n)
     m = MatrixType(ndim,ndim,2,dtype)(0)
-    for i,j in ti.static(ti.ndrange(*m.get_shape())): m[i,j] = 2*ti.random()-1
+    for i,j in ti.static(ti.ndrange(*m.get_shape())): m[i,j] = 2*ti.random()-1 # pyfunc fail : ti.random()
     m = m.transpose() @ m
     t = m.trace()/ndim
     for i in range(ndim): m[i,i] += t*relax
@@ -49,7 +49,7 @@ def offsets_t(d:ti.template(),decompdim:ti.template()=None,short_t:ti.template()
     """This type holds the offsets of Selling's decomposition"""
     if ti.static(decompdim==None): return offsets_t(d,symdim(d),short_t)
     return MatrixType(decompdim,d,2,short_t)
-@ti.func
+@ti.pyfunc
 def cycle_t(d:ti.template()): 
     """We often need to iterate over tuples (i,j,...) where 0 <= i < j < d, and ... 
     completes this pair into the set 0...(d-1). This type holds such a list."""
@@ -82,7 +82,7 @@ def _obtuse_superbase2(m:ti.template(),short_t:ti.template()=ti.i8,nitermax=100)
     npass = 0
     for niter in range(nitermax):
         i,j,k = cycle[niter%cycle.n,:]
-        if b[i,:]@m@b[j,:]>0: # Check if the angle is acute
+        if b[i,:] @ m @ b[j,:]>0: # Check if the angle is acute # pyfunc fail : b[i,:] is ndarray
             npass=0
             b[k,:] =   b[j,:] - b[i,:]
             b[j,:] = - b[j,:]

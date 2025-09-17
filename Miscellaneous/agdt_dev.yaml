@@ -1,0 +1,26 @@
+# conda env create -f environment.yml
+name: agdt_313
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.13
+  - matplotlib
+  - notebook
+  - scipy
+  - nbformat
+  - ffmpeg
+  - twine # Upload to PyPI
+
+# Once the environnement is created : 
+# pip install taichi
+
+
+# The following ones are for upload to conda, but not much interest w.r.t. pip eventually.
+#  - conda-build
+#  - conda-verify
+#  - anaconda-client
+
+# Not used anymore
+#  - nbdime
+#  - ipywidgets
+#  - plotly

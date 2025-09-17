@@ -42,4 +42,9 @@ def f():
 def f(n):
 	return ti.lang.matrix.VectorType(n,ti.i8) # Return a type
 
-- **kwargs are not supported (v1.7.2)
+- kwargs are not supported (v1.7.2)
+
+- no greek letters in function names for CUDA
+
+- get default float or int types : 
+  taichi.lang.impl.default_cfg().default_fp / default_ip
