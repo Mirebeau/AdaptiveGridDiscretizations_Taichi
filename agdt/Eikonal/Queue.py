@@ -9,7 +9,6 @@ class priority_queue:
 	"""
 	A priority queue implemented using a binary heap.
 	- capacity : one should always have capacity >= size
-	
 	"""
 	# Strongly inspired by : https://github.com/g1n0st/taichi-ferrofluid/blob/main/priority_queue.py
 
@@ -187,12 +186,12 @@ class lifo:
 	
 	@ti.pyfunc
 	def top(self):
-		assert not self.empty
+		assert not self.empty()
 		return self.elem[self.size-1]
 	
 	@ti.pyfunc
 	def pop(self):
-		assert not self.empty
+		assert not self.empty()
 		self._size[None]-=1
 
 	def set_capacity(self,capacity=None):
