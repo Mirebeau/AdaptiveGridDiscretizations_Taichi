@@ -10,6 +10,18 @@ Will likely simplified when (?) we can get the dtype of taichi variables (in add
 """
 
 # ------------------------------ type copying -------------------------------------
+# Type copying is very annoying in taichi, often types are lost, or behavior is dependent on 
+# taichi vs python environment in pyfunc execution
+@ti.pyfunc
+def zero_vec(x):
+	"""Produces a zero vector with the same type and shape"""
+	y = x-x; y.fill(0); return y # Pyfunc tested on both taichi and python envs
+
+@ti.pyfunc
+def cast_vec(x,dtype:ti.template()):
+	"""Casts a vector to the given vector type (shape must be compatible)"""
+	y = dtype(0); y = dtype(x); return y # Pyfunc tested on both taichi and python envs
+
 @ti.func
 def zero_like(x):
     """Returns a variable with the same shape and type as x, but filled with zeros"""
@@ -76,6 +88,13 @@ def perp(v): # Purposedly passed by value
     ti.static_assert(v.n==2)
     v[0],v[1] = -v[1],v[0]
     return v
+
+# @ti.pyfunc # Turned out to be useless
+# def product(v:ti.template()):
+# 	"""Returns the product of the coordinates of a vector v"""
+# 	value = v[0]
+# 	for i in ti.static(range(1,v.n)): value*=v[i]
+# 	return value
 
 # --------- Flattening of symmetric matrices -------
 
