@@ -1,21 +1,42 @@
-# This file implements Hamiltonian Fast Marching, a SEQUENTIAL eikonal solver with adaptive stencils
+"""
+This file implements Hamiltonian Fast Marching (HFM), a numerical solver of anisotropic eikonal equations.
+This is a SEQUENTIAL algorithms, like all instance of the Fast Marching method, hence it does not 
+benefit from parallel hardware or GPU acceleration.
+"""
 # This solver is does *not* benefit from parallel hardware, e.g. GPU 
 
 import taichi as ti
 import numpy as np
+from dataclasses import dataclass
 from . import Queue
 from .. import Sort 
-from ..GetArrayModule import convert_dtype
+from ..GetArrayModule import convert_dtype,reshape_field,getitem_broadcast
+from .. import Linalg
 
-def reshape_field(arr,shape,dtype=None): # Unclear how to do this properly in Taichi ...
-	if dtype is None: dtype=arr.dtype; ishape=tuple()
-	else: ishape = (dtype.n,dtype.m)
-	res = ti.field(dtype,shape) # arr.dtype only retains the float/int type (ex : vec2->float)
-	res.from_numpy(arr.to_numpy().reshape(shape+ishape))
-# def reshape_field(arr,shape,ishape=()): # Unclear how to do this properly in Taichi ...
-# 	res = ti.field(arr.dtype,shape)
-# 	res.from_numpy(arr.to_numpy().reshape(shape+ishape))
-	return res
+@dataclass
+class TraitsType:
+	ndim:int
+	float_t:type
+	nmix:int=1
+	nrev:int=0
+	nfwd:int=0
+	periodic_axis:int=None # None or int
+	offset_t=ti.i8
+
+	@property
+	def vec_t(self): return ti.lang.matrix.VectorType(self.ndim,self.float_t)
+	@property
+	def mat_t(self): return ti.lang.matrix.MatrixType(self.ndim,self.ndim,2,self.float_t)
+	@property
+	def nact(self): return self.nfwd+self.nrev
+	@property
+	def ntot(self): return self.nfwd+2*self.nrev
+	@property
+	def nactx(self):return self.nmix*self.nact
+	@property
+	def ntotx(self):return self.nmix*self.ntot
+
+# -------------------------------------- Core Algorithm ------------------------------------------
 
 wall_code = {
 	'normal -nper' :-2,  # normal node ix, which has periodic dummy duplicate (ix-nper)
@@ -29,10 +50,9 @@ wall_code = {
 }
 
 @ti.data_oriented
-class HFM:
+class _Algo:
 	"""
-	Taichi implementation of the Hamiltonian Fast Marching (HFM) eikonal solver.
-	CAUTION : Experimental. Non parallel. 
+	Taichi implementation of the core of the Hamiltonian Fast Marching (HFM) eikonal solver.
 	Fewer features and possibly less computationally efficient than the : 
 	* C++ implementation available at (https://github.com/Mirebeau/HamiltonFastMarching)
 	* CUDA implementation available at (https://github.com/Mirebeau/AdaptiveGridDiscretizations)
@@ -183,7 +203,6 @@ class HFM:
 		self.roffsets_max = np.max(boff_np[1:]-boff_np[:-1]) # Maximum number of reversed offests
 		boff_np = None
 
-
 	# Domain dimensions
 	@property
 	def shape(self): return self._shape
@@ -280,7 +299,7 @@ class HFM:
 		- ix : index of x
 		- callback : called with ix, and iy the index of the neighbor
 		"""
-		assert 0<ix<35, "Out of domain ix in rneigh"
+		assert 0<=ix<self.size, "Out of domain ix in rneigh"
 		fx = self.factored_index(ix)
 		#print(f"rneigh, {ix=}, {self.ix2x(ix)=} {fx=}, {self.size=}")
 		begin = self.boffsets[fx] 
@@ -563,3 +582,165 @@ class HFM:
 
 
 
+# -------------------------------------- Domain ------------------------------------------
+
+@ti.data_oriented
+class Domain:
+	"""User facing interface for the Hamiltonian Fast Marching (HFM) algorithm"""
+	def __init__(self,bounds,shape,metric):
+		"""
+		periodic_axis : index of the periodic axis
+		"""
+		self.shape = shape
+		self.metric = metric
+
+		Traits = self.Traits
+		self.h = Traits.vec_t( [ (b[1]-b[0])/s for b,s in zip(bounds,self.shape) ] )
+		self.ih = 1/self.h
+		self.origin = Traits.vec_t([b[0]+h/2 for b,h in zip(bounds,self.h)]) # ! Take periodicity into account
+		if (per_ax:=self.periodic_axis) is not None: self.origin[per_ax] -= self.h[per_ax]/2
+
+
+	def sgrid(self):
+		"""Returns a sparse grid of the domain"""
+		return tuple(o+h*np.arange(s,dtype=convert_dtype['np'][self.Traits.float_t]
+							  ).reshape((1,)*i+(s,)+(1,)*(len(self.shape)-i-1))
+				for i,(s,h,o) in enumerate(zip(self.shape,self.h,self.origin)))
+	
+	def build_scheme(self,costs=None,walls=None,**kwargs):
+		Traits = self.Traits
+		# Broadcast the data appropriately
+		data = self.metric.set_defaults(self.sgrid(),**kwargs)
+		datashapes = [a.shape for a in data if a.shape!=tuple()]
+		bshape = (1,)*Traits.ndim if len(datashapes)==0 else tuple(np.max(datashapes,axis=0))
+		if costs is None: costs = ti.field(Traits.float_t,self.shape); costs.fill(1)
+		if walls is None: walls = ti.field(ti.i8,self.shape); walls.fill(0)
+
+		# Generate the weights and offsets
+		weights = ti.field(Traits.float_t,shape=bshape+(Traits.nactx,))
+		offsets = ti.Vector.field(Traits.ndim,self.offset_t,shape=weights.shape)
+		@ti.kernel
+		def decomp():
+			for x in ti.grouped(ti.ndrange(*bshape)):
+				self.metric.hfm_scheme(x,self.ih,weights,offsets,*data)
+		decomp()
+
+		
+		if not self.periodic: self.Algo = _Algo(costs,weights,offsets,walls,Traits.nfwd,Traits.nmix)
+		else:  # Padding the weights and offsets with zeros in the periodic case
+			per_ax = self.periodic_axis
+			self.periodic_pad = np.max(np.abs(offsets.to_numpy()[...,per_ax]))
+			per_pad = self.periodic_pad
+			if bshape[per_ax]>1:
+				bshape_pad = list(bshape)
+				bshape_pad[per_ax] += 2*per_pad
+				bshape_pad = tuple(bshape_pad)
+				weights_pad = ti.field(Traits.float_t,shape=self.bshape_pad + (Traits.nactx,))
+				offsets_pad = ti.Vector.field(Traits.ndim,Traits.float_t,shape=weights_pad.shape)
+				weights_pad.fill(0); offsets_pad.fill(0)
+				@ti.kernel
+				def scheme_pad():
+					for x in ti.grouped(weights):
+						y = x; y[per_ax] += per_pad
+						weights_pad[y] = weights[x]
+						offsets_pad[y] = offsets[x]
+				scheme_pad()
+			else: weights_pad=weights; offsets_pad=offsets
+
+			shape_pad = list(self.shape)
+			shape_pad[per_ax] += 2*per_pad
+			self.shape_pad = tuple(shape_pad)
+			costs_pad = ti.field(Traits.float_t,shape_pad)
+			walls_pad = ti.field(ti.i8,shape_pad)
+			wc = wall_code
+			@ti.kernel
+			def coef_pad():
+				for x in ti.grouped(costs_pad):
+					y = x; y[per_ax]-=per_pad
+					if 0 <= y[per_ax] < self.shape[per_ax]: costs_pad[x] = costs[y]
+					else: costs_pad[x] = np.nan
+				for y in ti.grouped(walls):
+					x = y; x[per_ax]+=per_pad
+					if y[per_ax]<per_pad:
+						xper=x; xper[per_ax]+=self.shape[per_ax]
+						if walls[y]==wc['normal']: walls_pad[x]=wc['normal +nper']; walls_pad[xper]=wc['dummy -nper']
+						elif walls[y]==wc['wall']: walls_pad[x]=wc['wall']; walls_pad[xper]=wc['wall']
+					elif y[per_ax]>=self.shape[per_ax]-per_pad:
+						xper=x; xper[per_ax]-=self.shape[per_ax]
+						if walls[y]==wc['normal']: walls_pad[x]=wc['normal -nper']; walls_pad[xper]=wc['dummy +nper']
+						elif walls[y]==wc['wall']: walls_pad[x]=wc['wall']; walls_pad[xper]=wc['wall']
+					else: walls_pad[x]=walls[y]
+			coef_pad()
+			print("costs,costs_pad",costs,costs_pad)
+			nper = np.prod(self.shape[per_ax:])
+			self.Algo = _Algo(costs_pad,weights_pad,offsets_pad,walls_pad,Traits.nfwd,Traits.nmix,nper)
+
+	@property
+	def Traits(self): return self.metric.HFMTraits
+	@property
+	def periodic_axis(self): return self.Traits.periodic_axis
+	@property
+	def offset_t(self): return self.Traits.offset_t
+	@property
+	def periodic(self): return self.periodic_axis is not None
+
+	@ti.pyfunc
+	def PointFromIndex(self,index): return index*self.h+self.origin
+	@ti.pyfunc
+	def IndexFromPoint(self,point): return (point-self.origin)*self.ih
+	@ti.func
+	def Interpolate(self,field,point):
+		"""
+		Interpolated the given field, at the given point.
+		Takes care of broadcasting, and periodic boundary conditions.
+		"""
+		ndim = ti.static(self.Traits.ndim)
+		ti.static_assert(point.n==ndim)
+		ti.static_assert(len(field.shape)==ndim)
+		x = self.IndexFromPoint(point)
+		x0 = ti.cast(ti.math.floor(x),ti.i32) # ti.cast is only taichi scope
+		e0 = x-x0
+		value = getitem_broadcast(field,x0); value*=0 # Very bad way to get zero value
+		for e in ti.grouped(ti.ndrange(*(2,)*ndim)): # ti.grouped is only taichi scope
+			# Possible improvement : take advantage of broadcasting
+			weight = Linalg.product(1-ti.abs(e-e0)) 
+			y = x0+e
+			if ti.static(self.periodic): y[self.periodic_axis] = y[self.periodic_axis] % self.shape[self.periodic_axis]
+			value += getitem_broadcast(field,y) * weight
+		return value
+
+	def values(self):
+		"""The numerical solution of the eikonal equation"""
+		if self.periodic: return self.Algo.values.to_numpy().reshape(self.shape_pad)[
+			(slice(None),)*self.periodic_axis+(slice(self.periodic_pad,-self.periodic_pad),)]
+		else: return self.Algo.values.to_numpy().reshape(self.shape)
+
+	@ti.pyfunc
+	def set_seed(self,point,value=0):
+		index = self.IndexFromPoint(point)
+		x = Linalg.cast_vec(ti.round(index),self.Algo.ivec_t)
+		self.Algo.set_seed(self.Algo.x2ix(x),value)
+	
+	@ti.pyfunc
+	def spread_seed(self,point,norm:ti.template(),radius=1.5,value=0):
+		"""
+		Sets several seed points for the eikonal equation
+		- point : seed position
+		- value : initial value of the front
+		- radius (in pixels) : if positive, several seed points will be inserted within given radius
+		- metric (optional) : added to the value in the case of several seed points 
+		"""
+		index = self.IndexFromPoint(point)
+		x = Linalg.cast_vec(ti.round(index),self.Algo.ivec_t)
+		print("x=",x)
+		r = ti.i32(ti.floor(radius))
+		for e in ti.grouped(ti.ndrange(*((-r,r+1),)*self.Traits.ndim)):
+			if e.norm_sqr()>radius**2: continue
+			y = x+e
+			val = value + norm.norm(self.PointFromIndex(y)-point)
+			if ti.static(self.periodic): 
+				y[self.periodic_axis] = y[self.periodic_axis]%self.shape[self.periodic_axis]
+				y[self.periodic_axis] += self.periodic_pad
+			iy = self.Algo.x2ix(y)
+			#print(f"{x=},{y=}")
+			self.Algo.set_seed(iy,val)
