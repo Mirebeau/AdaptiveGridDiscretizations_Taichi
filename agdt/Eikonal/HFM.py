@@ -5,6 +5,7 @@ import taichi as ti
 import numpy as np
 from . import Queue
 from .. import Sort 
+from ..GetArrayModule import convert_dtype
 
 def reshape_field(arr,shape,dtype=None): # Unclear how to do this properly in Taichi ...
 	if dtype is None: dtype=arr.dtype; ishape=tuple()
@@ -17,14 +18,14 @@ def reshape_field(arr,shape,dtype=None): # Unclear how to do this properly in Ta
 	return res
 
 wall_code = {
-	'normal -nper' :-2, # normal node, which has periodic dummy duplicate (-nper)
-	'normal +nper' :-1, # normal node, which has periodic dummy duplicate (-nper)
-	'normal'       : 0,       # normal node
-	'wall'         : 1,         # wall, stops offsets
-	'seed'         : 2,         # seed point, starts front propagation
-	'dummy seed'   : 3,   # dummy duplicate of seed point (+-nper), does not start front
-	'dummy +nper'  : 4,  # is periodic dummy duplicate (+nper)
-	'dummy -nper'  : 5,  # is periodic dummy duplicate (-nper)
+	'normal -nper' :-2,  # normal node ix, which has periodic dummy duplicate (ix-nper)
+	'normal +nper' :-1,  # normal node ix, which has periodic dummy duplicate (ix+nper)
+	'normal'       : 0,  # normal node
+	'wall'         : 1,  # wall, stops offsets
+	'seed'         : 2,  # seed point, starts front propagation
+	'dummy seed'   : 3,  # dummy duplicate of seed point (+-nper), does not start front
+	'dummy +nper'  : 4,  # dummy mode ix, duplicate of normal mode (ix+nper)
+	'dummy -nper'  : 5,  # dummy mode ix, duplicate of normal mode (ix-nper)
 }
 
 @ti.data_oriented
@@ -47,10 +48,13 @@ class HFM:
 		nmix : number of max in the hfm formulation (set negative for min)
 		"""
 		self._shape = costs.shape 
-		self.float_t = costs.dtype
-		self.int_t = ti.i32
+		self.float_t = costs.dtype # Type used for floating point computations
+		self.int_t = ti.i32 # Type used for array indexing
 		self.vec_t = ti.lang.matrix.VectorType(self.ndim,self.float_t)
 		self.ivec_t = ti.lang.matrix.VectorType(self.ndim,self.int_t)
+		self.ioffset_t = ti.i32 # Type used for scheme offsets converted to indices
+		self.voffset_t = ti.i32 # Must hold as many bits as there are offsets
+		
 		self.nper = nper
 		self.seeds = Queue.lifo(self.int_t,capacity=64)
 
@@ -62,6 +66,7 @@ class HFM:
 		nsym = nact - nfwd; assert nsym>=0 # Number of symmetric offsets
 		self.nmix = nmix; self.mix_is_min = mix_is_min; self.nsym = nsym; self.nfwd = nfwd
 		ntotx = self.ntotx # Total number of offsets
+		assert ntotx<=8*convert_dtype['np'][self.voffset_t]().nbytes
 
 		# Compute the index conversion modulus for the weights and offsets
 		shape = self.shape; ndim = self.ndim
@@ -74,7 +79,7 @@ class HFM:
 			if s==t: 
 				if factored_start==-1: factored_start=i
 				if factored_stop!=-1: raise ValueError("Factored axes must be contiguous")
-			else:
+			elif factored_start!=-1:
 				if factored_stop==-1: factored_stop=i
 		if factored_start==-1: factored_start=ndim
 		if factored_stop==-1:  factored_stop=ndim
@@ -82,41 +87,48 @@ class HFM:
 		self._factored_stop=factored_stop
 
 		# --- Convert the offsets vectors into integers ---
-		ioffsets = ti.field(dtype=ti.i32,shape=weights.shape) # i32 needed for 3D
-		ioffsets_factored = ti.field(dtype=ti.i32,shape=weights.shape) if self.factored else ioffsets
+		ioffsets = ti.field(dtype=self.ioffset_t,shape=weights.shape) # i32 needed for 3D
+		ioffsets_factored = ti.field(dtype=self.ioffset_t,shape=weights.shape) if self.factored else ioffsets
 		@ti.kernel
 		def set_ioffsets():
 			for xe in ti.grouped(weights):
-				ioffset = offsets[xe][0]
+				ioffset:self.ioffset_t = offsets[xe][0]
 				for i in ti.static(range(1,ndim)):
-					ioffset = self.shape[i-1]*ioffset + offsets[xe][i]
+					ioffset = self.shape[i]*ioffset + offsets[xe][i]
 				ioffsets[xe] = ioffset
 				if ti.static(self.factored):
-					ioffset = offsets[xe][self.factored_start]
-					for i in ti.static(range(self.factored_start,self.factored_stop)):
-						ioffset = self.shape[i-1]*ioffset + offsets[xe][i]
-					ioffsets_factored[xe] = ioffset
+					if ti.static(self.factored_start<self.ndim):
+						ioffset = offsets[xe][self.factored_start]
+						for i in ti.static(range(self.factored_start+1,self.factored_stop)):
+							ioffset = self.shape[i]*ioffset + offsets[xe][i]
+						ioffsets_factored[xe] = ioffset
+					else: ioffsets_factored[xe] = 0
 		set_ioffsets()
 
 		# --- Compute the masks for valid offsets, corresponding to visible pair points ---
 		if walls is None: walls = ti.field(dtype=ti.i8,shape=self.shape); walls.fill(0)
 		self.walls = walls 
-		walls_np = walls.to_numpy(); self.periodic = np.min(walls_np)<0 or np.max(walls_np)>=4; walls_np=None
-		voffsets = ti.field(dtype=ti.i32,shape=self.shape); assert ntotx<=32
+		#walls_np = walls.to_numpy(); self.periodic = np.min(walls_np)<0 or np.max(walls_np)>=4; walls_np=None
+		voffsets = ti.field(dtype=self.voffset_t,shape=self.shape)
+
+		print(f"{self.factored=}, {self.shape=}, {factored_start=}, {factored_stop=}, {ndim=}")
 		@ti.kernel
 		def set_voffsets():
 			for x in ti.grouped(costs):
+				bx=x # Broadcasted x, used for the offsets which may be factored
+				for i in ti.static(range(factored_start)): bx[i]=0
+				for i in ti.static(range(factored_stop,ndim)): bx[i]=0
 				bact = 0
 				btot = 0
 				voffset = 0
 				for mix in ti.static(range(nmix)):
 					for e in ti.static(range(nsym)):
-						if self.visible(x, offsets[*x,bact]): voffset |= 1<<btot
+						if self.visible(x, offsets[*bx,bact]): voffset |= 1<<btot
 						btot+=1
-						if self.visible(x,-offsets[*x,bact]): voffset |= 1<<btot
+						if self.visible(x,-offsets[*bx,bact]): voffset |= 1<<btot
 						btot+=1; bact+=1
 					for e in ti.static(range(nfwd)):
-						if self.visible(x, offsets[*x,bact]): voffset |= 1<<btot
+						if self.visible(x, offsets[*bx,bact]): voffset |= 1<<btot
 						btot+=1; bact+=1
 				voffsets[x] = voffset
 		set_voffsets()
@@ -137,6 +149,8 @@ class HFM:
 		pq = Queue.priority_queue(ti.i32,ti.i32,capacity=self.factored_size*ntotx)
 		roffsets = ti.field(dtype=ti.i32,shape=self.factored_size*ntotx) 
 		boffsets = ti.field(dtype=ti.i32,shape=self.factored_size+1); boffsets[0]=0
+		print(f"{self.factored_size=}, {ioffsets_factored.shape}, {ioffsets.shape}")
+		print(f"ioffsets_factored, basic :{ioffsets_factored},{ioffsets}")
 		@ti.kernel
 		def set_roffsets():
 			factored_size = ti.static(self.factored_size)
@@ -150,16 +164,19 @@ class HFM:
 							pq.push(-(x-ioffsets_factored[x,bact]),-ioffsets[x,bact]); btot+=1; bact+=1
 						for e in ti.static(range(nfwd)):
 							pq.push(-(x+ioffsets_factored[x,bact]), ioffsets[x,bact]); btot+=1; bact+=1
-				while not pq.empty() and pq.top()[0]>0: pq.pop()
+				while not pq.empty():
+					if pq.top()[0]>0: pq.pop()
+					else: break
 				boffset=0
 				for x in range(factored_size):
-					while not pq.empty() and pq.top()[0]==-x:
+					#while (not pq.empty()) and pq.top()[0]==-x: # Fails : no early branch in while
+					while not pq.empty():
+						if pq.top()[0]!=-x: break
 						roffsets[boffset] = pq.top()[1]
 						pq.pop()
 						boffset+=1
 					boffsets[x+1]=boffset
 		set_roffsets()
-
 		self._roffsets = roffsets # Reversed offsets of all points, concatenated
 		self.boffsets = boffsets # Start and stop of reversed offsets for any given point
 		boff_np = boffsets.to_numpy()
@@ -174,6 +191,10 @@ class HFM:
 	def size(self): return np.prod(self.shape)
 	@property
 	def ndim(self): return len(self.shape)
+	@property
+	def periodic(self):
+		"""Wether periodic boundary conditions apply"""
+		return self.nper!=0
 
 	# Factored dimension, used when the stencil is shared between points
 	@property
@@ -188,14 +209,22 @@ class HFM:
 	def factored_div(self): return np.prod(self.shape[self.factored_stop:],dtype=int)
 
 	# Scheme parameters, obtained from nmix, nsym, nfwd
-	@property # Max number of active offsets, in each mix term
-	def nact(self): return self.nsym + self.nfwd 
-	@property # Total number of offsets, in each mix term
-	def ntot(self): return 2*self.nsym + self.nfwd 
-	@property # Total number of offsets, counting symmetric offsets as one
-	def nactx(self): return self.nmix*self.nact
-	@property # Total number of offsets of the numerical scheme
-	def ntotx(self): return self.nmix*self.ntot
+	@property 
+	def nact(self):
+		"Max number of active offsets, in each mix term" 
+		return self.nsym + self.nfwd 
+	@property 
+	def ntot(self): 
+		"Total number of offsets, in each mix term"
+		return 2*self.nsym + self.nfwd 
+	@property 
+	def nactx(self): 
+		"Total number of offsets, counting symmetric offsets as one"
+		return self.nmix*self.nact
+	@property 
+	def ntotx(self): 
+		"Total number of offsets of the numerical scheme"
+		return self.nmix*self.ntot
 
 
 	@ti.pyfunc
@@ -215,7 +244,7 @@ class HFM:
 		assert self.indomain(x)
 		ix = x[0]
 		for i in ti.static(range(1,self.ndim)):
-			ix = ix*self.shape[i-1] + x[i]
+			ix = ix*self.shape[i] + x[i]
 		return ix
 
 
@@ -246,24 +275,25 @@ class HFM:
 	
 	@ti.pyfunc
 	def rneigh(self,ix,callback:ti.template()):
-		"""Enumerate the reverse neighbors of x."""
+		"""
+		Enumerate the reverse neighbors of x.
+		- ix : index of x
+		- callback : called with ix, and iy the index of the neighbor
+		"""
+		assert 0<ix<35, "Out of domain ix in rneigh"
 		fx = self.factored_index(ix)
+		#print(f"rneigh, {ix=}, {self.ix2x(ix)=} {fx=}, {self.size=}")
 		begin = self.boffsets[fx] 
 		end = self.boffsets[fx+1]
 		for i in range(begin,end): 
 			iy = ix - self._roffsets[i]
-			if ti.static(self.periodic):
-				wall = self.walls[iy]
-				if wall==ti.static(wall_code['dummy +nper']):iy+=self.nper
-				if wall==ti.static(wall_code['dummy -nper']):iy-=self.nper
-			callback(ix,iy)
-
-	# @ti.func
-	# def callme(self,x,callback:ti.template()): 
-	# 	ox = self.factored_index(x)
-	# 	begin = self.boffsets[ox] 
-	# 	end = self.boffsets[ox+1]
-	# 	callback(x)
+			#print("-roffset",-self._roffsets[i],iy,self.ix2x(iy))
+			if 0<=iy<self.size: # If the offsets are factored, we may get out of domain values
+				if ti.static(self.periodic): # Replace dummy periodic neighbor with normal neighbor
+					wall = self.walls[iy]
+					if wall==ti.static(wall_code['dummy +nper']):iy+=self.nper
+					if wall==ti.static(wall_code['dummy -nper']):iy-=self.nper
+				callback(ix,iy)
 
 	@ti.pyfunc
 	def set_seed(self,ix,value):
@@ -279,13 +309,13 @@ class HFM:
 		wall = walls[ix]
 		assert wall<=0 # Positive wall[ix] => immutable values[ix]
 		if ti.static(self.periodic):
-			if wall == ti.static(wall_code['normal +nper']):
+			if wall == wall_code['normal +nper']:
 				values[ix+nper] = value
-				walls[ ix+nper] = ti.static(wall_code['dummy seed'])
-			if wall == ti.static(wall_code['normal -nper']):
+				walls[ ix+nper] = wall_code['dummy seed']
+			if wall == wall_code['normal -nper']:
 				values[ix-nper] = value
-				walls[ ix-nper] = ti.static(wall_code['dummy seed'])
-		walls[ix] = ti.static(wall_code['seed'])
+				walls[ ix-nper] = wall_code['dummy seed']
+		walls[ix] = wall_code['seed']
 
 	@ti.pyfunc
 	def set_value(self,ix,value):
@@ -303,7 +333,7 @@ class HFM:
 
 	@ti.pyfunc
 	def update(self,ix,ret_mix:ti.template()=False):
-		"""Compute the HFM the update value at ix."""
+		"""Compute the HFM update value at ix. (no side effect)"""
 		nmix,nsym,nfwd,nact,mix_is_min = ti.static(self.nmix,self.nsym,self.nfwd,self.nact,self.mix_is_min)
 		ioffsets,values,weights = ti.static(self.ioffsets,self.values,self.weights)
 		voffset = self.voffsets[ix]
@@ -312,6 +342,7 @@ class HFM:
 		fx = self.factored_index(ix)
 		updtx = np.nan # Unused initial value
 		mix_opt = 0
+		#print("Computing update",ix,self.ix2x(ix))
 		for mix in ti.static(range(nmix)):
 			# get the neighbor values
 			vals = ti.lang.matrix.VectorType(nact,self.float_t)(np.inf)
@@ -328,6 +359,7 @@ class HFM:
 			cost = self.costs[ix]
 			a = 0.; b = 0.; c = -cost**2
 			updt = np.inf
+			#print(vals,ivals,cost)
 			# TODO : deal with first value separately
 			# TODO : shift using first value, to avoid "large-large = small" roundoff error issue
 			for iact in range(nact):
@@ -380,7 +412,7 @@ class HFM:
 	def solve_FMM(self,stopping_criterion=None):
 		"""
 		Solve the eikonal equation using the Fast Marching Method (FMM) 
-		SEQUENTIAL solver, similar to Dijkstra's algorithm)
+		SEQUENTIAL solver, similar to Dijkstra's algorithm
 		- stopping_criterion : called each time a point is frozen. Return a positive integer for stopping.
 		"""
 		seeds = self.seeds
@@ -388,21 +420,21 @@ class HFM:
 							max(200+seeds.size,self.size//np.max(self.shape)))
 		frozen = ti.field(dtype=ti.i8,shape=self.size)
 		frozen.from_numpy(self.walls.to_numpy()>0) # Non mutable points are already frozen
-		stop = ti.field(dtype=ti.i32,shape=()); stop.fill(0)
+		stop = ti.field(dtype=ti.i32,shape=()); stop.fill(0) # True if stopping criterion is active
 
 		@ti.kernel # Set the seeds
 		def set_seeds():
 			for _ in range(1):
-				while not seeds.empty(): 
+				while not seeds.empty():
 					seed = seeds.top(); seeds.pop()
 					pq.push(-self.values[seed],seed)
 					frozen[seed]=False # We want to see the seeds once
-					
 		set_seeds()
 
 		@ti.func # Update neighbors of last frozen point in FMM
 		def FMM_update_and_push(ix,iy):
-			if not frozen[iy]: 
+			if not frozen[iy]:
+				print("updating",iy,self.ix2x(iy),self.update(iy))
 				self.set_value(iy,self.update(iy))
 				pq.push(-self.values[iy],iy)
 
@@ -413,12 +445,14 @@ class HFM:
 				while not pq.empty() and pq.size<maxsize:
 					mval,ix = pq.top() # mval = -values[ix] at insertion
 					pq.pop()
-					if frozen[ix]: continue # Outdated seed value # self.values[ix]!=-mval invalid test
+					if frozen[ix]: continue # Outdated seed value # Note m self.values[ix]!=-mval is an invalid test
 					frozen[ix] = True
+					print("Freezing",ix,self.ix2x(ix),-mval)
 					if ti.static(stopping_criterion!=None): # Optional stopping criterion
 						stop[None] = stopping_criterion(ix)
 						if stop[None]: break
 					self.rneigh(ix,FMM_update_and_push)
+					#stop[None]=True; break
 		FMM()
 		while not pq.empty() and not stop[None]: 
 			pq.set_capacity() # Double the capacity
