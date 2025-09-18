@@ -48,3 +48,14 @@ def f(n):
 
 - get default float or int types : 
   taichi.lang.impl.default_cfg().default_fp / default_ip
+
+
+### Known issues with Taichi
+- More predictable type casting
+  v = ti.math.vec2(2.3,3.5)
+  ti.math.ivec2(v) # Casts to int in python scope, but remains float in taichi
+  # Note that ti.cast is only taichi scope
+
+- pyfunc 
+ Many features unsupported. Cannot set different paths for taichi and python scope.
+
