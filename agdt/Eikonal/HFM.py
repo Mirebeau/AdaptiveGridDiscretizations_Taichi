@@ -16,15 +16,24 @@ from .. import Linalg
 @dataclass
 class TraitsType:
 	ndim:int
-	float_t:type
-	nmix:int=1
-	nrev:int=0
-	nfwd:int=0
-	periodic_axis:int=None # None or int
-	offset_t=ti.i8
+	float_t:type # Solution values
+	int_t:type = ti.i32 # Type used for array indexing
 
+	nmix:int = 1
+	nrev:int = 0
+	nfwd:int = 0
+	mix_is_min:bool = False
+
+	periodic_axis:int = None # None or int
+	offset_t:type = ti.i8 # Must hold the offsets components of the discretization scheme
+	voffset_t:type = ti.i32 # Must hold as many bits as there are offsets
+	wall_t:type = ti.i8 # Must store the wall codes, see below
+		
 	@property
 	def vec_t(self): return ti.lang.matrix.VectorType(self.ndim,self.float_t)
+	@property
+	def ivec_t(self): return ti.lang.matrix.VectorType(self.ndim,self.int_t)
+
 	@property
 	def mat_t(self): return ti.lang.matrix.MatrixType(self.ndim,self.ndim,2,self.float_t)
 	@property
@@ -35,6 +44,11 @@ class TraitsType:
 	def nactx(self):return self.nmix*self.nact
 	@property
 	def ntotx(self):return self.nmix*self.ntot
+
+@ti.pyfunc
+def div_round_closest(n,d): # https://stackoverflow.com/a/18067292/12508258
+	"""Computes the closest integer to n/d"""
+	return ti.select((n<0) != (d<0), (n-d//2)//d, (n+d//2)//d)
 
 # -------------------------------------- Core Algorithm ------------------------------------------
 
@@ -58,35 +72,21 @@ class _Algo:
 	* CUDA implementation available at (https://github.com/Mirebeau/AdaptiveGridDiscretizations)
 	"""
 
-	def __init__(self,costs,weights,offsets,walls=None,nfwd=0,nmix=1,nper=0):
+	def __init__(self,costs,weights,offsets,Traits,walls=None):
 		"""
-		cost : scalar cost function, shape (n1,...,nd)
-		weights, offsets : scheme coefficients, shape (a1,...,ad) with ai in (0,ni)
-		fwd : number of forward-only offsets
-		walls (array, dtype=i8): node type, see wall code
-		nfwd : number of forward only offsets
-		nmix : number of max in the hfm formulation (set negative for min)
+		costs : scalar cost function, shape (n1,...,nd)
+		weights, offsets : scheme coefficients, shape (a1,...,ad) with ai in (1,ni)
+		walls (array, dtype=i8): node type, see wall code, shape (n1,...,nd)
 		"""
 		self._shape = costs.shape 
-		self.float_t = costs.dtype # Type used for floating point computations
-		self.int_t = ti.i32 # Type used for array indexing
-		self.vec_t = ti.lang.matrix.VectorType(self.ndim,self.float_t)
-		self.ivec_t = ti.lang.matrix.VectorType(self.ndim,self.int_t)
+		self.Traits = Traits
 		self.ioffset_t = ti.i32 # Type used for scheme offsets converted to indices
-		self.voffset_t = ti.i32 # Must hold as many bits as there are offsets
-		
-		self.nper = nper
-		self.seeds = Queue.lifo(self.int_t,capacity=64)
+		assert Traits.nactx == weights.shape[-1]
+		assert Traits.ntotx <= 8*convert_dtype['np'][self.Traits.voffset_t]().nbytes
 
-		# compute the scheme parameters 
-		nactx = weights.shape[-1] # Number of different offsets
-		mix_is_min = nmix<0 # Wether to use min or max in HFM formulation
-		nmix = abs(nmix) # Number of min or max terms in HFM formulation
-		nact = nactx//nmix; assert nactx%nmix==0 # Max number of active offsets
-		nsym = nact - nfwd; assert nsym>=0 # Number of symmetric offsets
-		self.nmix = nmix; self.mix_is_min = mix_is_min; self.nsym = nsym; self.nfwd = nfwd
-		ntotx = self.ntotx # Total number of offsets
-		assert ntotx<=8*convert_dtype['np'][self.voffset_t]().nbytes
+		self.nper = np.prod(self.shape[self.Traits.periodic_axis:]) if self.periodic else 0
+		
+		self.seeds = Queue.lifo(self.Traits.int_t,capacity=64)
 
 		# Compute the index conversion modulus for the weights and offsets
 		shape = self.shape; ndim = self.ndim
@@ -126,12 +126,14 @@ class _Algo:
 		set_ioffsets()
 
 		# --- Compute the masks for valid offsets, corresponding to visible pair points ---
-		if walls is None: walls = ti.field(dtype=ti.i8,shape=self.shape); walls.fill(0)
-		self.walls = walls 
-		#walls_np = walls.to_numpy(); self.periodic = np.min(walls_np)<0 or np.max(walls_np)>=4; walls_np=None
-		voffsets = ti.field(dtype=self.voffset_t,shape=self.shape)
+		if walls is None: walls = ti.field(dtype=Traits.wall_t,shape=self.shape); walls.fill(0)
+		self.true_wall = np.any(walls.to_numpy()==wall_code['wall']) # Is there a true wall, or only periodic bc ? 
+		self.walls = reshape_field(walls,(self.size,))
+		walls = None		
 
-		print(f"{self.factored=}, {self.shape=}, {factored_start=}, {factored_stop=}, {ndim=}")
+		voffsets = ti.field(dtype=self.Traits.voffset_t,shape=self.shape)
+		nmix,nrev,nfwd,nactx,ntotx = Traits.nmix,Traits.nrev,Traits.nfwd,Traits.nactx,Traits.ntotx
+		#print(f"{self.factored=}, {self.shape=}, {factored_start=}, {factored_stop=}, {ndim=}")
 		@ti.kernel
 		def set_voffsets():
 			for x in ti.grouped(costs):
@@ -142,7 +144,7 @@ class _Algo:
 				btot = 0
 				voffset = 0
 				for mix in ti.static(range(nmix)):
-					for e in ti.static(range(nsym)):
+					for e in ti.static(range(nrev)):
 						if self.visible(x, offsets[*bx,bact]): voffset |= 1<<btot
 						btot+=1
 						if self.visible(x,-offsets[*bx,bact]): voffset |= 1<<btot
@@ -161,7 +163,6 @@ class _Algo:
 		self.ioffsets = ioffsets # Offsets converted to integer
 		self.voffsets = reshape_field(voffsets,(self.size,)) # Visibility mask
 		self.weights = reshape_field(weights,(self.factored_size,nactx))
-		self.walls = reshape_field(walls,(self.size,))
 		self.values = ti.field(dtype=self.float_t,shape=self.size); self.values.fill(np.inf)
 		self.costs = reshape_field(costs,(self.size,))
 
@@ -169,8 +170,8 @@ class _Algo:
 		pq = Queue.priority_queue(ti.i32,ti.i32,capacity=self.factored_size*ntotx)
 		roffsets = ti.field(dtype=ti.i32,shape=self.factored_size*ntotx) 
 		boffsets = ti.field(dtype=ti.i32,shape=self.factored_size+1); boffsets[0]=0
-		print(f"{self.factored_size=}, {ioffsets_factored.shape}, {ioffsets.shape}")
-		print(f"ioffsets_factored, basic :{ioffsets_factored},{ioffsets}")
+		#print(f"{self.factored_size=}, {ioffsets_factored.shape}, {ioffsets.shape}")
+		#print(f"ioffsets_factored, basic :{ioffsets_factored},{ioffsets}")
 		@ti.kernel
 		def set_roffsets():
 			factored_size = ti.static(self.factored_size)
@@ -179,7 +180,7 @@ class _Algo:
 					bact = 0
 					btot = 0
 					for mix in ti.static(range(nmix)):
-						for e in ti.static(range(nsym)):
+						for e in ti.static(range(nrev)):
 							pq.push(-(x+ioffsets_factored[x,bact]), ioffsets[x,bact]); btot+=1
 							pq.push(-(x-ioffsets_factored[x,bact]),-ioffsets[x,bact]); btot+=1; bact+=1
 						for e in ti.static(range(nfwd)):
@@ -189,7 +190,7 @@ class _Algo:
 					else: break
 				boffset=0
 				for x in range(factored_size):
-					#while (not pq.empty()) and pq.top()[0]==-x: # Fails : no early branch in while
+					# while (not pq.empty()) and pq.top()[0]==-x: # Fails : no early branch in while
 					while not pq.empty():
 						if pq.top()[0]!=-x: break
 						roffsets[boffset] = pq.top()[1]
@@ -213,7 +214,9 @@ class _Algo:
 	@property
 	def periodic(self):
 		"""Wether periodic boundary conditions apply"""
-		return self.nper!=0
+		return self.Traits.periodic_axis is not None
+	@property
+	def float_t(self): return self.Traits.float_t
 
 	# Factored dimension, used when the stencil is shared between points
 	@property
@@ -227,30 +230,11 @@ class _Algo:
 	@property
 	def factored_div(self): return np.prod(self.shape[self.factored_stop:],dtype=int)
 
-	# Scheme parameters, obtained from nmix, nsym, nfwd
-	@property 
-	def nact(self):
-		"Max number of active offsets, in each mix term" 
-		return self.nsym + self.nfwd 
-	@property 
-	def ntot(self): 
-		"Total number of offsets, in each mix term"
-		return 2*self.nsym + self.nfwd 
-	@property 
-	def nactx(self): 
-		"Total number of offsets, counting symmetric offsets as one"
-		return self.nmix*self.nact
-	@property 
-	def ntotx(self): 
-		"Total number of offsets of the numerical scheme"
-		return self.nmix*self.ntot
-
-
 	@ti.pyfunc
 	def ix2x(self,ix):
 		"""Convert an index to a discrete point"""
 		assert 0<=ix and ix<self.size
-		x = self.ivec_t(0)
+		x = self.Traits.ivec_t(0)
 		for i in ti.static(tuple(reversed(range(1,self.ndim)))):
 			x[i] = ix%self.shape[i]
 			ix = ix//self.shape[i]
@@ -276,12 +260,20 @@ class _Algo:
 	def visible(self,x,e):
 		"""
 		Check that the path [x,x+e] is contained within the domain
-		- x,e (ivecd) : position and offset
+		- x (ivec) : position 
+		- e (ivec) : offset (can have i8 coords)
 		"""
 		assert self.indomain(x) # Assumption : start point lies in the domain
-		y = x+e
-		return self.indomain(y) # Check : endpoint lies in domain
-		# TODO : check that path does not go through a wall
+		if visible := self.indomain(x+e): # check that endpoint lies in the domain
+			if ti.static(self.true_wall):
+				E = self.Traits.ivec_t(0); E=e # Taichi bug ? Cast not done otherwise
+				linf_e = ti.abs(E).max() # Taichi bug ? abs of ti.i8 does not work
+				for k in range(1,linf_e+1):
+					if not visible: break 
+					f = self.Traits.ivec_t(0)
+					for i in range(self.ndim): f[i] = div_round_closest(k*E[i],linf_e)
+					if self.walls[self.x2ix(x+f)]==ti.static(wall_code['wall']): visible=False #; break
+		return visible
 
 	@ti.pyfunc
 	def factored_index(self,ix):
@@ -301,12 +293,10 @@ class _Algo:
 		"""
 		assert 0<=ix<self.size, "Out of domain ix in rneigh"
 		fx = self.factored_index(ix)
-		#print(f"rneigh, {ix=}, {self.ix2x(ix)=} {fx=}, {self.size=}")
 		begin = self.boffsets[fx] 
 		end = self.boffsets[fx+1]
 		for i in range(begin,end): 
 			iy = ix - self._roffsets[i]
-			#print("-roffset",-self._roffsets[i],iy,self.ix2x(iy))
 			if 0<=iy<self.size: # If the offsets are factored, we may get out of domain values
 				if ti.static(self.periodic): # Replace dummy periodic neighbor with normal neighbor
 					wall = self.walls[iy]
@@ -323,18 +313,18 @@ class _Algo:
 		values,walls,nper = ti.static(self.values,self.walls,self.nper)
 		assert 0<=ix<self.size
 		assert self.seeds.size < self.seeds.capacity-3
-		values[ix] = value
-		self.seeds.push(ix)
-		wall = walls[ix]
-		assert wall<=0 # Positive wall[ix] => immutable values[ix]
-		if ti.static(self.periodic):
-			if wall == wall_code['normal +nper']:
-				values[ix+nper] = value
-				walls[ ix+nper] = wall_code['dummy seed']
-			if wall == wall_code['normal -nper']:
-				values[ix-nper] = value
-				walls[ ix-nper] = wall_code['dummy seed']
-		walls[ix] = wall_code['seed']
+		if (wall:=walls[ix])<=0: # Positive wall[ix] => immutable values[ix]. 
+			# One cannot insert a see if wall>0. We silently fail, in view of spreadseeds.
+			values[ix] = value
+			self.seeds.push(ix)
+			walls[ix] = wall_code['seed']
+			if ti.static(self.periodic): # Create dummy seeds in padding region
+				if wall == wall_code['normal +nper']:
+					values[ix+nper] = value
+					walls[ ix+nper] = wall_code['dummy seed']
+				if wall == wall_code['normal -nper']:
+					values[ix-nper] = value
+					walls[ ix-nper] = wall_code['dummy seed']
 
 	@ti.pyfunc
 	def set_value(self,ix,value):
@@ -353,7 +343,8 @@ class _Algo:
 	@ti.pyfunc
 	def update(self,ix,ret_mix:ti.template()=False):
 		"""Compute the HFM update value at ix. (no side effect)"""
-		nmix,nsym,nfwd,nact,mix_is_min = ti.static(self.nmix,self.nsym,self.nfwd,self.nact,self.mix_is_min)
+		nmix,nrev,nfwd,nact,mix_is_min = ti.static(self.Traits.nmix,self.Traits.nrev,
+											self.Traits.nfwd,self.Traits.nact,self.Traits.mix_is_min)
 		ioffsets,values,weights = ti.static(self.ioffsets,self.values,self.weights)
 		voffset = self.voffsets[ix]
 		bact = 0
@@ -361,11 +352,10 @@ class _Algo:
 		fx = self.factored_index(ix)
 		updtx = np.nan # Unused initial value
 		mix_opt = 0
-		#print("Computing update",ix,self.ix2x(ix))
 		for mix in ti.static(range(nmix)):
 			# get the neighbor values
 			vals = ti.lang.matrix.VectorType(nact,self.float_t)(np.inf)
-			for e in ti.static(range(nsym)):
+			for e in ti.static(range(nrev)):
 				if voffset & 1<<btot: vals[bact] = values[ix+ioffsets[fx,bact]]
 				btot+=1
 				if voffset & 1<<btot: vals[bact] = min(vals[bact],values[ix-ioffsets[fx,bact]])
@@ -378,7 +368,6 @@ class _Algo:
 			cost = self.costs[ix]
 			a = 0.; b = 0.; c = -cost**2
 			updt = np.inf
-			#print(vals,ivals,cost)
 			# TODO : deal with first value separately
 			# TODO : shift using first value, to avoid "large-large = small" roundoff error issue
 			for iact in range(nact):
@@ -404,14 +393,14 @@ class _Algo:
 
 	@ti.pyfunc
 	def gradient(self,ix):
-		nsym,nfwd,nact,ntot = ti.static(self.nsym,self.nfwd,self.nact,self.ntot)
+		nrev,nfwd,nact,ntot = ti.static(self.Traits.nrev,self.Traits.nfwd,self.Traits.nact,self.Traits.ntot)
 		values,ioffsets,offsets = ti.static(self.values,self.ioffsets,self.offsets)
 		λ,mix = self.update(ix,ret_mix=True)
 		bact = mix*nact; btot = mix*ntot
 		voffset = self.voffsets[ix]
 		fx = self.factored_index(ix)
-		grad = self.vec_t(0.)
-		for e in ti.static(range(nsym)):
+		grad = self.Traits.vec_t(0.)
+		for e in ti.static(range(nrev)):
 			val = np.inf
 			sign = 1
 			if voffset & 1<<btot: val = values[ix+ioffsets[fx,bact]]
@@ -435,7 +424,7 @@ class _Algo:
 		- stopping_criterion : called each time a point is frozen. Return a positive integer for stopping.
 		"""
 		seeds = self.seeds
-		pq = Queue.priority_queue(self.float_t,self.int_t,capacity=
+		pq = Queue.priority_queue(self.float_t,self.Traits.int_t,capacity=
 							max(200+seeds.size,self.size//np.max(self.shape)))
 		frozen = ti.field(dtype=ti.i8,shape=self.size)
 		frozen.from_numpy(self.walls.to_numpy()>0) # Non mutable points are already frozen
@@ -453,7 +442,7 @@ class _Algo:
 		@ti.func # Update neighbors of last frozen point in FMM
 		def FMM_update_and_push(ix,iy):
 			if not frozen[iy]:
-				print("updating",iy,self.ix2x(iy),self.update(iy))
+				#print("updating",iy,self.ix2x(iy),self.update(iy))
 				self.set_value(iy,self.update(iy))
 				pq.push(-self.values[iy],iy)
 
@@ -466,12 +455,11 @@ class _Algo:
 					pq.pop()
 					if frozen[ix]: continue # Outdated seed value # Note m self.values[ix]!=-mval is an invalid test
 					frozen[ix] = True
-					print("Freezing",ix,self.ix2x(ix),-mval)
+					#print("Freezing",ix,self.ix2x(ix),-mval)
 					if ti.static(stopping_criterion!=None): # Optional stopping criterion
 						stop[None] = stopping_criterion(ix)
 						if stop[None]: break
 					self.rneigh(ix,FMM_update_and_push)
-					#stop[None]=True; break
 		FMM()
 		while not pq.empty() and not stop[None]: 
 			pq.set_capacity() # Double the capacity
@@ -485,7 +473,7 @@ class _Algo:
 		"""
 		if nitermax is None: nitermax=5*max(self.shape)*self.size
 		seeds = self.seeds
-		fifo = Queue.fifo(self.int_t,capacity=
+		fifo = Queue.fifo(self.Traits.int_t,capacity=
 					max(200+seeds.size*self.roffsets_max,self.size//np.max(self.shape)))
 		infifo = ti.field(dtype=ti.i8,shape=self.values.shape) 
 		infifo.from_numpy(self.walls.to_numpy()>0) # Non mutable points cannot enter the queue
@@ -533,7 +521,7 @@ class _Algo:
 		cache = ti.field(self.float_t,self.size)
 		updated = ti.field(dtype=ti.i32,shape=())
 		@ti.kernel
-		def SweepingUpdate(i:ti.template(),n_i:self.int_t,shape_i:ti.template()):
+		def SweepingUpdate(i:ti.template(),n_i:self.Traits.int_t,shape_i:ti.template()):
 			for x in ti.grouped(ti.ndrange(*shape_i)): # Get all indices associated with slice n_i along axis i
 				x[i] = n_i
 				ix = self.x2ix(x)
@@ -614,7 +602,7 @@ class Domain:
 		datashapes = [a.shape for a in data if a.shape!=tuple()]
 		bshape = (1,)*Traits.ndim if len(datashapes)==0 else tuple(np.max(datashapes,axis=0))
 		if costs is None: costs = ti.field(Traits.float_t,self.shape); costs.fill(1)
-		if walls is None: walls = ti.field(ti.i8,self.shape); walls.fill(0)
+		if walls is None: walls = ti.field(Traits.wall_t,self.shape); walls.fill(0)
 
 		# Generate the weights and offsets
 		weights = ti.field(Traits.float_t,shape=bshape+(Traits.nactx,))
@@ -626,7 +614,7 @@ class Domain:
 		decomp()
 
 		
-		if not self.periodic: self.Algo = _Algo(costs,weights,offsets,walls,Traits.nfwd,Traits.nmix)
+		if not self.periodic: self.Algo = _Algo(costs,weights,offsets,Traits,walls)
 		else:  # Padding the weights and offsets with zeros in the periodic case
 			per_ax = self.periodic_axis
 			self.periodic_pad = np.max(np.abs(offsets.to_numpy()[...,per_ax]))
@@ -651,7 +639,7 @@ class Domain:
 			shape_pad[per_ax] += 2*per_pad
 			self.shape_pad = tuple(shape_pad)
 			costs_pad = ti.field(Traits.float_t,shape_pad)
-			walls_pad = ti.field(ti.i8,shape_pad)
+			walls_pad = ti.field(Traits.wall_t,shape_pad)
 			wc = wall_code
 			@ti.kernel
 			def coef_pad():
@@ -671,9 +659,7 @@ class Domain:
 						elif walls[y]==wc['wall']: walls_pad[x]=wc['wall']; walls_pad[xper]=wc['wall']
 					else: walls_pad[x]=walls[y]
 			coef_pad()
-			print("costs,costs_pad",costs,costs_pad)
-			nper = np.prod(self.shape[per_ax:])
-			self.Algo = _Algo(costs_pad,weights_pad,offsets_pad,walls_pad,Traits.nfwd,Traits.nmix,nper)
+			self.Algo = _Algo(costs_pad,weights_pad,offsets_pad,Traits,walls_pad)
 
 	@property
 	def Traits(self): return self.metric.HFMTraits
@@ -718,7 +704,7 @@ class Domain:
 	@ti.pyfunc
 	def set_seed(self,point,value=0):
 		index = self.IndexFromPoint(point)
-		x = Linalg.cast_vec(ti.round(index),self.Algo.ivec_t)
+		x = Linalg.cast_vec(ti.round(index),self.Traits.ivec_t)
 		self.Algo.set_seed(self.Algo.x2ix(x),value)
 	
 	@ti.pyfunc
@@ -731,8 +717,7 @@ class Domain:
 		- metric (optional) : added to the value in the case of several seed points 
 		"""
 		index = self.IndexFromPoint(point)
-		x = Linalg.cast_vec(ti.round(index),self.Algo.ivec_t)
-		print("x=",x)
+		x = Linalg.cast_vec(ti.round(index),self.Traits.ivec_t)
 		r = ti.i32(ti.floor(radius))
 		for e in ti.grouped(ti.ndrange(*((-r,r+1),)*self.Traits.ndim)):
 			if e.norm_sqr()>radius**2: continue
@@ -742,5 +727,4 @@ class Domain:
 				y[self.periodic_axis] = y[self.periodic_axis]%self.shape[self.periodic_axis]
 				y[self.periodic_axis] += self.periodic_pad
 			iy = self.Algo.x2ix(y)
-			#print(f"{x=},{y=}")
 			self.Algo.set_seed(iy,val)
