@@ -89,12 +89,12 @@ def perp(v): # Purposedly passed by value
     v[0],v[1] = -v[1],v[0]
     return v
 
-# @ti.pyfunc # Turned out to be useless
-# def product(v:ti.template()):
-# 	"""Returns the product of the coordinates of a vector v"""
-# 	value = v[0]
-# 	for i in ti.static(range(1,v.n)): value*=v[i]
-# 	return value
+@ti.pyfunc 
+def product(v:ti.template()):
+	"""Returns the product of the coordinates of a vector v"""
+	value = v[0]
+	for i in ti.static(range(1,v.n)): value*=v[i]
+	return value
 
 # --------- Flattening of symmetric matrices -------
 

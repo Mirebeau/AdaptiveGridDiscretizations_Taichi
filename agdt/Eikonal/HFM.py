@@ -205,6 +205,8 @@ class _Algo:
 		boff_np = None
 
 	# Domain dimensions
+	# TODO : for now, these are python functions, which means that taichi will recompile if they change.
+	# Turn shape,size,factored_size,factored_div into pyfuncs ? 
 	@property
 	def shape(self): return self._shape
 	@property
@@ -249,7 +251,6 @@ class _Algo:
 		for i in ti.static(range(1,self.ndim)):
 			ix = ix*self.shape[i] + x[i]
 		return ix
-
 
 	@ti.pyfunc
 	def indomain(self,x):
@@ -388,18 +389,30 @@ class _Algo:
 			elif mix_is_min: updtx = max(updtx,updt)
 			else: updtx = min(updtx,updt)
 			if ti.static(ret_mix) and mix>0 and updt==updtx: mix_opt=mix
-		if ti.static(ret_mix): return updtx,mix
+		if ti.static(ret_mix): return updtx,mix_opt
 		else: return updtx
 
 	@ti.pyfunc
-	def gradient(self,ix):
+	def flow(self,ix):
+		"""
+		Geodesic flow vector, adimensionized, extracted from the scheme.
+		(Prefer the user facing Domain.flow)
+		- ix : index where to extract the flow
+		Returns 
+		 - the geodesic flow
+		 - the average value of the finite differences used 
+		"""
 		nrev,nfwd,nact,ntot = ti.static(self.Traits.nrev,self.Traits.nfwd,self.Traits.nact,self.Traits.ntot)
-		values,ioffsets,offsets = ti.static(self.values,self.ioffsets,self.offsets)
-		λ,mix = self.update(ix,ret_mix=True)
+		values,ioffsets,offsets,weights = ti.static(self.values,self.ioffsets,self.offsets,self.weights)
+		# Note that self.update(ix) == self.values[ix] after solver is run, except at seed points
+		λ,mix = self.update(ix,ret_mix=True) 
+		λ = min(λ,self.values[ix]) # Get null gradient at the seed center
 		bact = mix*nact; btot = mix*ntot
 		voffset = self.voffsets[ix]
 		fx = self.factored_index(ix)
-		grad = self.Traits.vec_t(0.)
+		flow = self.Traits.vec_t(0.)
+		wsum : self.float_t = 0.
+		csum : self.float_t = 0.
 		for e in ti.static(range(nrev)):
 			val = np.inf
 			sign = 1
@@ -408,14 +421,22 @@ class _Algo:
 			if voffset & 1<<btot: 
 				mval = values[ix-ioffsets[fx,bact]]
 				if mval<val: val = mval; sign=-1
-			if λ>val: grad += (λ-val)*sign*offsets[fx,bact]
+			if λ>val: 
+				weight = weights[fx,bact]; wsum += weight
+				coef = (λ-val)*weight;     csum += coef
+				flow += coef*sign*offsets[fx,bact]
 			btot+=1; bact+=1
 		for e in ti.static(range(nfwd)):
 			if voffset & 1<<btot: 
-				val = -values[ix+ioffsets[fx,bact]]
-				if λ>val: grad += (λ-val)*offsets[fx,bact]
+				val = values[ix+ioffsets[fx,bact]]
+				if λ>val: 
+					weight = weights[fx,bact]; wsum += weight
+					coef = (λ-val)*weight;     csum += coef
+					flow += coef*sign*offsets[fx,bact]
 			btot+=1; bact+=1
-		return grad/self.costs[ix] # Normalization w.r.t. primal metric
+		#flow /= self.costs[ix] # Optional normalization, w.r.t. costless metric (bof)
+		if wsum>0: csum/=wsum # Average of the finite differences used
+		return flow,csum
 
 	def solve_FMM(self,stopping_criterion=None):
 		"""
@@ -686,7 +707,7 @@ class Domain:
 		x = self.IndexFromPoint(point)
 		x0 = ti.cast(ti.math.floor(x),ti.i32) # ti.cast is only taichi scope
 		e0 = x-x0
-		value = getitem_broadcast(field,x0); value*=0 # Very bad way to get zero value
+		value = getitem_broadcast(field,0*x0); value=0 # Very bad way to get zero value
 		for e in ti.grouped(ti.ndrange(*(2,)*ndim)): # ti.grouped is only taichi scope
 			# Possible improvement : take advantage of broadcasting
 			weight = Linalg.product(1-ti.abs(e-e0)) 
@@ -695,11 +716,16 @@ class Domain:
 			value += getitem_broadcast(field,y) * weight
 		return value
 
-	def values(self):
+	def values(self,as_ndarray=False):
 		"""The numerical solution of the eikonal equation"""
-		if self.periodic: return self.Algo.values.to_numpy().reshape(self.shape_pad)[
-			(slice(None),)*self.periodic_axis+(slice(self.periodic_pad,-self.periodic_pad),)]
-		else: return self.Algo.values.to_numpy().reshape(self.shape)
+		if as_ndarray:
+			if self.periodic: return self.Algo.values.to_numpy().reshape(self.shape_pad)[
+				(slice(None),)*self.periodic_axis+(slice(self.periodic_pad,-self.periodic_pad),)]
+			else: return self.Algo.values.to_numpy().reshape(self.shape)
+		else: 
+			values = ti.field(self.Traits.float_t,self.shape)
+			values.from_numpy(self.values(True))
+			return values
 
 	@ti.pyfunc
 	def set_seed(self,point,value=0):
@@ -728,3 +754,233 @@ class Domain:
 				y[self.periodic_axis] += self.periodic_pad
 			iy = self.Algo.x2ix(y)
 			self.Algo.set_seed(iy,val)
+	
+	@ti.pyfunc
+	def flow(self,x,adim:ti.template()=False):
+		"""
+		Returns the geodesic flow vector at the given index
+		- x : index, with integer coordinates
+		- adim : if true, the adimensionized flow is returned (true_flow = adim_flow * h)
+		Output :  
+		- flow : the geodesic flow
+		- diff : the averaged value of the finite differences used to compute the flow
+		"""
+		if ti.static(self.periodic): x[self.periodic_axis]+=self.periodic_pad # Note : may erase x in python mode
+		flow,diff = self.Algo.flow(self.Algo.x2ix(x)) # The algorithm returns the adimensionized flow
+		return ti.select(ti.static(adim),flow,flow*self.h),diff
+
+	def flows(self,adim:ti.template()=False):
+		"""Returns the geodesic flow field"""
+		flows = ti.field(self.Traits.vec_t,  self.shape)
+		diffs = ti.field(self.Traits.float_t,self.shape)
+		@ti.kernel
+		def evalflows():
+			for x in ti.grouped(flows): flows[x],diffs[x] = self.flow(x,adim)
+		evalflows()
+		return flows,diffs
+	
+	def seeds_distL1(self,maxL1=7):
+		"L1 distance to the seeds, up to maxL1. Used for PastSeed backtracking stopping criterion."
+		walls = self.Algo.walls.to_numpy().reshape(self.Algo.shape)
+		if self.periodic: walls = walls[
+			(slice(None),)*self.periodic_axis+(slice(self.periodic_pad,-self.periodic_pad),)]
+		distL1=ti.field(ti.i8,self.shape)
+		distL1.from_numpy((maxL1+1)*(walls!=wall_code['seed']))
+		@ti.kernel
+		def globaliter():
+			for x in ti.grouped(distL1):
+				for i in ti.static(range(self.Traits.ndim)):
+					y = x; y[i]+=1; 
+					if ti.static(self.periodic) and self.periodic_axis==i and y[i]==self.shape[i]: y[i]=0
+					if y[i]<self.shape[i]:  distL1[x] = min(distL1[x],1+distL1[y])
+					y = x; y[i]-=1; 
+					if ti.static(self.periodic) and self.periodic_axis==i and y[i]==-1: y[i]=self.shape[i]-1
+					if y[i]>=0:  distL1[x] = min(distL1[x],1+distL1[y])
+		for k in range(maxL1): globaliter()
+		return distL1
+	
+	def ode(self):
+		"""Returns the geodesic ODE solver based on the scheme data"""
+		periodic = [False]*self.Traits.ndim
+		if self.periodic: periodic[self.periodic_axis]=True
+		return GeodesicODE(self.seeds_distL1(),self.values(),*self.flows(adim=True),tuple(periodic))
+
+
+
+
+geodesic_code = {
+	'AtSeed' :            1, # Correct termination
+
+	'Continue':           0, # Error : Unfinished work, consider increasing maxlen
+	'InWall' :            2, # Error : Went out of domain
+	'StationnaryValue' :  3, # Error : Stall in ODE process, eikonal solution values do not decrease
+	'StationnaryPosition':3, # Error : Stall in ODE process, positions do not change
+	'PastSeed' :          4, # Error : Moving away from target
+	'VanishingFlow' :     5, # Error : Vanishing flow
+	'OutOfDomain' :       6, # Error : Backtracking left the domain
+}
+geodesic_rcode = dict(zip(geodesic_code.values(),geodesic_code.keys()))
+
+
+
+@ti.data_oriented
+class GeodesicODE:
+	"""
+	Geodesic backtracking algorithm
+	- seeds : some *measure of distance* to the closest seed, provided it is close enough
+	   e.g. the l1 distance up to 7 pixels (used for termination criterion) 
+	- values : eikonal solution values
+	- flows : the geodesic flow, adimensionized (assuming identical gridscales)
+	- diffs : the average value of the finite differences used to construct the flow
+	- periodic : axes along which to apply periodic boundary conditions
+	"""
+	# Note : computing the full gradient field is unnecessary and computationally and memory expensive
+
+	def __init__(self,seeds,values,flows,diffs,periodic=None):
+		self.seeds = seeds
+		self.values = values
+		self.flows = flows
+		self.diffs = diffs
+		assert seeds.shape==values.shape==self.shape
+		assert len(self.shape) == self.ndim
+
+		self.periodic = periodic
+		self.geodesicStep = 0.25    # How much to advance at each step
+		self.weightThreshold = 0.5/2**self.ndim  # Used in interpolation pruning
+		self.causalityTolerance = 4
+		self.seeds_top = 1000 # Some arbitrary upper bound for the seeds field
+		
+	@property
+	@ti.pyfunc
+	def shape(self): return self.flows.shape
+	@property
+	def ndim(self): return self.flows.n
+	@property
+	def float_t(self): return self.flows.dtype
+	@property
+	def vec_t(self): return ti.lang.matrix.VectorType(self.ndim,self.float_t)
+	@property
+	def ivec_t(self): return ti.lang.matrix.VectorType(self.ndim,ti.i32)
+
+	@ti.pyfunc
+	def crop_periodize(self,x):
+		for i in ti.static(range(self.ndim)):
+			s = self.shape[i]
+			if self.periodic[i]: 
+				x[i] = x[i] % s
+				if x[i]<0: x[i]+=s # Periodize, ensuring result les in 0..s-1
+			else: x[i] = max(0,min(x[i],s-1)) # Crop to 0..s-1
+		return x
+	
+	@ti.pyfunc
+	def indomain(self,x,tol=0.5):
+		res = True
+		for i in ti.static(range(self.ndim)): 
+			s = self.shape[i]
+			if ti.static(not self.periodic[i]): res = res and (-tol<=x[i]<=s-1+tol)
+		return res
+
+	@ti.func
+	def flow(self,x):
+		"""
+		Computes the interpolated flow at x. (Not genuine interpolation : we do pruning, etc)
+		"""
+		x0 = ti.cast(ti.math.floor(x),ti.i32) # ti.cast is only taichi scope
+		#x0 = self.ivec_t(0)
+		e0 = x-x0
+		min_seed = self.seeds_top # Minimum L1 distance to a seed (initialized with some arbitrary large value)
+		min_val  = np.inf # minimum value among interpolated points
+		minx = self.ivec_t(0) # Point where the minimum value is attained
+		for e in ti.grouped(ti.ndrange(*(2,)*self.ndim)):
+			xe = self.crop_periodize(x0+e)
+			w = Linalg.product(1-ti.abs(e-e0)) # Interpolation weight
+			if w >= self.weightThreshold: # minimum seed,val, based on points with substantial weight
+				min_seed = min(min_seed,self.seeds[xe])
+				if (val:=self.values[*xe]) < min_val:
+					min_val = val
+					minx = xe
+
+		thres_val = min_val + self.diffs[minx] * self.causalityTolerance
+		wsum = 0.; val = 0. # wsum = self.float_t(0); val = self.float_t(0) # Error ??
+		flow = self.vec_t(0)
+
+		for e in ti.grouped(ti.ndrange(*(2,)*self.ndim)):
+			xe = self.crop_periodize(x0+e)
+			if self.values[xe]<=thres_val: # Disregard too large values
+				w = Linalg.product(1-ti.abs(e-e0)) # Interpolation weight
+				wsum += w
+				val  += w*self.values[xe]
+				flow += w*self.flows[xe]
+		
+		val /= wsum; flow /= wsum # Due to pruning, weights may not sum to one
+		return flow,val,minx,min_seed
+	
+	def backtrack(self,tips,delay_values=30,delay_minx=30,delay_seeds=6,max_len=2000):
+		"""Backtrack geodesics from the given tips.
+		- delay_values : delay before stopping if values increase (StationnaryValues criterion)
+		- delay_minx : delay before stopping if values increase (StationnaryPosition criterion)
+		- delay_seeds : delay before stopping if seed distance increases (PastSeed criterion)
+		- max_len : max length of geodesic 
+		"""
+		tips = np.asarray(tips)
+		assert len(tips.shape)==2
+		assert tips.shape[1]==self.ndim
+		ntips = tips.shape[0]
+		recent_values = ti.field(self.float_t,shape=(ntips,delay_values)); recent_values.fill(np.nan)
+		recent_minx   = ti.field(self.ivec_t,shape=(ntips,delay_minx)); recent_minx.fill(-1)
+		recent_seeds  = ti.field(self.seeds.dtype,shape=(ntips,delay_seeds)); recent_seeds.fill(127)
+
+		geo_code = ti.field(ti.i32,ntips)
+		geo_size = ti.field(ti.i32,ntips)
+		@ti.kernel
+		def ode(geo:ti.template(),geo_old:ti.template()):
+			geo_begin = geo_old.shape[1]
+			geo_end  =  geo.shape[1]
+			dt = self.geodesicStep
+			for igeo in range(ntips): # Runs in parallel the backtracking for all geodesics
+				for k in range(geo_begin): geo[igeo,k] = geo_old[igeo,k] # Copy previous data
+				code = geo_code[igeo] # Exit code
+				for k in range(geo_begin,geo_end):
+					if code!=0: break
+					# Second order Euler scheme
+					x = geo[igeo,k-1]
+					v0,_,_,_ = self.flow(x)
+					if (norm_sqr:=v0.norm_sqr()) > 0: v0 /= ti.math.sqrt(norm_sqr)
+					else: code = geodesic_code['VanishingFlow']
+					x1 = x + v0 * dt/2 # Approximate midpoint 
+
+					v1,val1,minx1,seed1 = self.flow(x1) 
+					if (norm_sqr:=v1.norm_sqr()) > 0: v1 /= ti.math.sqrt(norm_sqr)
+					else: code = geodesic_code['VanishingFlow']
+					x2 = x + v1 * dt # Second order accurate step
+					
+					# Store data
+					geo_size[igeo]=k+1
+					geo[igeo,k] = x2
+					recent_values[igeo,k%delay_values] = val1
+					recent_minx[igeo,  k%delay_minx] = minx1
+					recent_seeds[igeo, k%delay_seeds] = seed1
+
+					# Check stopping criteria
+					if seed1==0: code = geodesic_code['AtSeed']
+					elif not self.indomain(x2): code = geodesic_code['OutOfDomain']
+					elif val1==np.inf: code = geodesic_code['InWall']
+					elif recent_values[igeo,  (k+1)%delay_values]<val1:  code = geodesic_code['StationnaryValue']
+					elif all(recent_minx[igeo,(k+1)%delay_minx]==minx1): code = geodesic_code['StationnaryPosition']
+					elif recent_seeds[igeo,   (k+1)%delay_seeds]<seed1:  code = geodesic_code['PastSeed']
+				geo_code[igeo]=code
+		
+		geo = ti.field(self.vec_t, shape = (ntips,256))
+		geo_old = ti.field(self.vec_t, shape = (ntips,1))
+		print(geo_old.shape,tips.shape)
+		geo_old.from_numpy(tips[:,None,:])
+		ode(geo,geo_old)
+		while any(geo_code.to_numpy()==0) and geo.shape[1]<max_len:
+			geo_old = geo
+			geo = ti.field(self.vec_t, shape=(ntips,min(2*geo_old.shape[1],max_len)))
+
+		geo_np = geo.to_numpy()
+		geodesics = [geo_np[i,:geo_size[i]] for i in range(ntips)]
+		geodesic_rcodes = [geodesic_rcode[c] for c in geo_code.to_numpy()]
+
+		return geodesics,geodesic_rcodes
