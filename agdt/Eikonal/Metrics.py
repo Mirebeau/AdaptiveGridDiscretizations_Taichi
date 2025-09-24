@@ -250,5 +250,3 @@ class Dubins2:
 	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,ε=0.1,ε_cosmin2=0.67):
 		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ)
 		return tuple(tofield(_,self.HFMTraits.float_t) for _ in (ξ,cθ,sθ,κ,ε,ε_cosmin2))
-
-

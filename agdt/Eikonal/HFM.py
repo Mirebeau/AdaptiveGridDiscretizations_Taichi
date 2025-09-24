@@ -8,7 +8,7 @@ benefit from parallel hardware or GPU acceleration.
 import taichi as ti
 import numpy as np
 from dataclasses import dataclass
-from . import Queue
+from . import Queue,CappedQueue
 from .. import Sort 
 from ..GetArrayModule import convert_dtype,reshape_field,getitem_broadcast
 from .. import Linalg
@@ -72,7 +72,7 @@ class _Algo:
 	* CUDA implementation available at (https://github.com/Mirebeau/AdaptiveGridDiscretizations)
 	"""
 
-	def __init__(self,costs,weights,offsets,Traits,walls=None):
+	def __init__(self,costs,weights,offsets,Traits,walls=None,seeds_capacity=128):
 		"""
 		costs : scalar cost function, shape (n1,...,nd)
 		weights, offsets : scheme coefficients, shape (a1,...,ad) with ai in (1,ni)
@@ -86,7 +86,7 @@ class _Algo:
 
 		self.nper = np.prod(self.shape[self.Traits.periodic_axis:]) if self.periodic else 0
 		
-		self.seeds = Queue.lifo(self.Traits.int_t,capacity=64)
+		self.seeds = CappedQueue.lifo(self.Traits.int_t,capacity=64)
 
 		# Compute the index conversion modulus for the weights and offsets
 		shape = self.shape; ndim = self.ndim
@@ -167,7 +167,7 @@ class _Algo:
 		self.costs = reshape_field(costs,(self.size,))
 
 		# ---- Compute the reversed offsets. Only needed for FMM. -----
-		pq = Queue.priority_queue(ti.i32,ti.i32,capacity=self.factored_size*ntotx)
+		pq = CappedQueue.priority_queue(ti.i32,ti.i32,capacity=self.factored_size*ntotx)
 		roffsets = ti.field(dtype=ti.i32,shape=self.factored_size*ntotx) 
 		boffsets = ti.field(dtype=ti.i32,shape=self.factored_size+1); boffsets[0]=0
 		#print(f"{self.factored_size=}, {ioffsets_factored.shape}, {ioffsets.shape}")
@@ -286,11 +286,11 @@ class _Algo:
 		return ix
 	
 	@ti.pyfunc
-	def rneigh(self,ix,callback:ti.template()):
+	def rneigh(self,ix,callback:ti.template(),arg:ti.template()):
 		"""
 		Enumerate the reverse neighbors of x.
 		- ix : index of x
-		- callback : called with ix, and iy the index of the neighbor
+		- callback : called with (ix, iy, arg), where iy is the index of the neighbor
 		"""
 		assert 0<=ix<self.size, "Out of domain ix in rneigh"
 		fx = self.factored_index(ix)
@@ -303,17 +303,17 @@ class _Algo:
 					wall = self.walls[iy]
 					if wall==ti.static(wall_code['dummy +nper']):iy+=self.nper
 					if wall==ti.static(wall_code['dummy -nper']):iy-=self.nper
-				callback(ix,iy)
+				callback(ix,iy,arg)
 
 	@ti.pyfunc
 	def set_seed(self,ix,value):
 		"""
-		Set a seed, with the given value.
-		Call self.seeds.set_capacity(newcapacity) if you have many seeds.
+		Set a seed, with the given value. 
+		Note : seeds_capacity is fixed at construction
 		"""
 		values,walls,nper = ti.static(self.values,self.walls,self.nper)
 		assert 0<=ix<self.size
-		assert self.seeds.size < self.seeds.capacity-3
+		assert self.seeds.size() < self.seeds.capacity()-3
 		if (wall:=walls[ix])<=0: # Positive wall[ix] => immutable values[ix]. 
 			# One cannot insert a see if wall>0. We silently fail, in view of spreadseeds.
 			values[ix] = value
@@ -445,46 +445,49 @@ class _Algo:
 		- stopping_criterion : called each time a point is frozen. Return a positive integer for stopping.
 		"""
 		seeds = self.seeds
-		pq = Queue.priority_queue(self.float_t,self.Traits.int_t,capacity=
-							max(200+seeds.size,self.size//np.max(self.shape)))
+		# Hard to predict the max number of items in pq, so using variable capacity
+		pq = Queue.priority_queue.init(self.float_t,self.Traits.int_t,capacity=
+							max(200+seeds.size(),self.size//np.max(self.shape)))
 		frozen = ti.field(dtype=ti.i8,shape=self.size)
 		frozen.from_numpy(self.walls.to_numpy()>0) # Non mutable points are already frozen
 		stop = ti.field(dtype=ti.i32,shape=()); stop.fill(0) # True if stopping criterion is active
 
 		@ti.kernel # Set the seeds
-		def set_seeds():
+		def set_seeds(self_pq:pq.argtype):
 			for _ in range(1):
 				while not seeds.empty():
 					seed = seeds.top(); seeds.pop()
-					pq.push(-self.values[seed],seed)
+					pq.push(self_pq,-self.values[seed],seed)
 					frozen[seed]=False # We want to see the seeds once
-		set_seeds()
+		set_seeds(pq)
 
 		@ti.func # Update neighbors of last frozen point in FMM
-		def FMM_update_and_push(ix,iy):
+		def FMM_update_and_push(ix,iy,self_pq:ti.template()):
 			if not frozen[iy]:
 				#print("updating",iy,self.ix2x(iy),self.update(iy))
 				self.set_value(iy,self.update(iy))
-				pq.push(-self.values[iy],iy)
+				pq.push(self_pq,-self.values[iy],iy)
 
 		@ti.kernel
-		def FMM(): # Early stop if queue capacity is exceeded
+		def FMM(self_pq:pq.argtype): # Early stop if queue capacity is exceeded
 			for _ in range(1):
-				maxsize = pq.capacity-self.roffsets_max
-				while not pq.empty() and pq.size<maxsize:
-					mval,ix = pq.top() # mval = -values[ix] at insertion
-					pq.pop()
+				maxsize = pq.capacity(self_pq)-self.roffsets_max
+				while not pq.empty(self_pq) and pq.size(self_pq)<maxsize:
+					mval,ix = pq.top(self_pq) # mval = -values[ix] at insertion
+					pq.pop(self_pq)
 					if frozen[ix]: continue # Outdated seed value # Note m self.values[ix]!=-mval is an invalid test
 					frozen[ix] = True
 					#print("Freezing",ix,self.ix2x(ix),-mval)
 					if ti.static(stopping_criterion!=None): # Optional stopping criterion
 						stop[None] = stopping_criterion(ix)
 						if stop[None]: break
-					self.rneigh(ix,FMM_update_and_push)
-		FMM()
-		while not pq.empty() and not stop[None]: 
-			pq.set_capacity() # Double the capacity
-			FMM()
+					self.rneigh(ix,FMM_update_and_push,self_pq)
+		FMM(pq)
+		while not pq.empty(pq) and not stop[None]: 
+			print(pq.size(pq),pq.capacity(pq),"before doubling")
+			pq = pq.with_capacity() # Double the capacity
+			print(pq.size(pq),pq.capacity(pq),"after doubling")
+			FMM(pq)
 		return stop[None] # Return stopping criterion code
 
 	def solve_AGSI(self,tol,nitermax=None):
@@ -494,13 +497,13 @@ class _Algo:
 		"""
 		if nitermax is None: nitermax=5*max(self.shape)*self.size
 		seeds = self.seeds
-		fifo = Queue.fifo(self.Traits.int_t,capacity=
-					max(200+seeds.size*self.roffsets_max,self.size//np.max(self.shape)))
+		# We now that each index can appear at most once in fifo
+		fifo = CappedQueue.fifo(self.Traits.int_t,capacity=self.size)
 		infifo = ti.field(dtype=ti.i8,shape=self.values.shape) 
 		infifo.from_numpy(self.walls.to_numpy()>0) # Non mutable points cannot enter the queue
 
 		@ti.func
-		def push_neighbors(ix,iy):
+		def push_neighbors(ix,iy,_):
 			if not infifo[iy]: fifo.push(iy); infifo[iy]=True
 
 		@ti.kernel # The AGSI requires inserting the neighbors of all seeds
@@ -508,14 +511,14 @@ class _Algo:
 			for _ in range(1):
 				while not seeds.empty(): 
 					seed = seeds.top(); seeds.pop()
-					self.rneigh(seed,push_neighbors)
+					self.rneigh(seed,push_neighbors,None)
 		set_seeds()
 
 		niter = ti.field(dtype=ti.i64,shape=()); niter.fill(0)
 		@ti.kernel
 		def AGSI(): # Early stop if queue capacity is exceeded
 			for _ in range(1):
-				while not fifo.empty() and fifo.size < fifo.capacity-self.roffsets_max:
+				while not fifo.empty() and niter[None]<nitermax:
 					ix = fifo.front()
 					fifo.pop()
 					infifo[ix] = False
@@ -523,13 +526,13 @@ class _Algo:
 					niter[None]+=1
 					if value>=self.values[ix]-tol: continue
 					self.set_value(ix,value)
-					self.rneigh(ix,push_neighbors)
+					self.rneigh(ix,push_neighbors,None)
 		AGSI()
-		while not fifo.empty():
-			fifo.set_capacity() # Double the capacity
-			AGSI()
-			if niter[None]>=nitermax: 
-				print(f"AGSI completed niter={niter[None]} iterations, without reaching tolerance {tol=}")
+		# while not fifo.empty():
+		# 	fifo.set_capacity() # Double the capacity
+		# 	AGSI()
+		if niter[None]>=nitermax: 
+			print(f"AGSI completed niter={niter[None]} iterations, without reaching tolerance {tol=}")
 		return niter[None]
 
 	def solve_FastSweeping(self,tol,nitermax=None,deterministic=False):
