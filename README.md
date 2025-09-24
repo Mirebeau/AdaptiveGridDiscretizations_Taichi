@@ -49,6 +49,9 @@ def f(n):
 - get default float or int types : 
   taichi.lang.impl.default_cfg().default_fp / default_ip
 
+### ti.field vs ti.ndarray
+- (Access in kernels) A ti.ndarray needs to be passed as a kernel parameter, a ti.field can be declared in global/surrounding scope.
+- (Recompilation) Changing a ti.field passed to a kernel leads to recompilation, but not a ti.ndarray.
 
 ### Known issues with Taichi
 - More predictable type casting
@@ -59,3 +62,6 @@ def f(n):
 - pyfunc 
  Many features unsupported. Cannot set different paths for taichi and python scope.
 
+- argpack 
+  - Two different argpack, passed to a kernel, may not have elements with identical names.
+  - !! An argpack CANNOT be passed to a taichi function !!

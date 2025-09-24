@@ -2,205 +2,283 @@
 # Fast-Marching and the AGSI solvers of eikonal equations.
 # CAUTION : assumes a sequential execution. Parallel behavior is undefined.
 
-import taichi as ti
+"""
+This file implements priority queues in Taichi.
 
-@ti.data_oriented
+Queue capacity can be changed without triggering a recompilation of the kernels, but this comes at
+the cost of an unusual call syntax. 
+See CappedQueue for fixed capacity queues, with a more standard call syntax.
+
+Call syntax : all methods are static, and you must pass the object as first argument.
+
+pq = priority_queue.init(ti.i32,ti.f32)
+pq.empty(pq) # Python scope
+
+@ti.pyfunc
+def myfunc(pq_self:ti.template()): # Pass queue as template
+	pq.push(pq_self,1,0.)
+
+@ti.kernel
+def myker(pq_self:pq.argtype): # Pass queue as argpack
+	myfunc(pq_self)
+	pq.empty(pq_self) # Taichi scope
+myker(pq)
+pq = pq.with_capacity(2*pq.capacity(pq)) # Increase capacity in python scope
+myker(pq)
+"""
+
+
+import taichi as ti
+#import numpy as np
+from functools import partial
+
 class priority_queue:
 	"""
 	A priority queue implemented using a binary heap.
 	- capacity : one should always have capacity >= size
 	"""
 	# Strongly inspired by : https://github.com/g1n0st/taichi-ferrofluid/blob/main/priority_queue.py
+	
+	@staticmethod
+	def init(prio_type,elem_type,capacity=1023):
+		prio  = ti.ndarray(prio_type,shape = capacity+1)
+		elem  = ti.ndarray(elem_type,shape = capacity+1)
+		_size = ti.ndarray(ti.i32, shape=()); _size[None]=0
+		self_t = ti.types.argpack(
+			prio=ti.types.ndarray(prio_type,ndim=1),
+			elem=ti.types.ndarray(elem_type,ndim=1),
+			_size=ti.types.ndarray(ti.i32,ndim=0))
+		
+		self = self_t(prio,elem,_size)
+		self.argtype = self_t
+		self.init = partial(priority_queue.init,prio_type,elem_type)
+		for attr in ['capacity','size','empty','clear','top','swap','pop','push','with_capacity']: 
+			setattr(self,attr,getattr(priority_queue,attr))
+		return self
 
-	def __init__(self,prio_type,elem_type,capacity=1023):
-		self.prio = ti.field(dtype=prio_type, shape=capacity+1) # Largest priority goes on top
-		self.elem = ti.field(dtype=elem_type, shape=capacity+1) # Attached value to a priority
-		self._size = ti.field(dtype=ti.i32, shape=()); self._size[None]=0
-		self._capacity = ti.field(dtype=ti.i32, shape=()); self._capacity[None]=capacity
-
-	@property
+	@staticmethod
 	@ti.pyfunc
-	def capacity(self): return self._capacity[None]
+	def capacity(self):
+		return self.elem.shape[0]-1
 
-	#@ti.pyfunc
-	#def capacity(self): return self.elem.shape[0]
-
-	@property
+	@staticmethod
 	@ti.pyfunc
-	def size(self): return self._size[None]
-
+	def size(self):
+		return self._size[None]
+	
+	@staticmethod
 	@ti.pyfunc
-	def clear(self): self._size[None]=0
-
+	def empty(self):
+		return priority_queue.size(self)==0
+	
+	@staticmethod
 	@ti.pyfunc
-	def empty(self): return self.size==0
-
+	def clear(self):
+		self._size[None]=0
+	
+	@staticmethod
 	@ti.pyfunc
 	def top(self):
-		assert not self.empty()
+		assert not priority_queue.empty(self)
 		return self.prio[1],self.elem[1]
-
+	
+	@staticmethod
 	@ti.pyfunc
 	def swap(self,i,j): # Swap queue elements of index i and j
 		prio_tmp = self.prio[i]; self.prio[i]=self.prio[j]; self.prio[j] = prio_tmp
 		elem_tmp = self.elem[i]; self.elem[i]=self.elem[j]; self.elem[j] = elem_tmp
 
+	@staticmethod
 	@ti.pyfunc
 	def pop(self):
-		assert not self.empty()
+		assert not priority_queue.empty(self)
 		# Put last element on top, and erase it
-		self.prio[1] = self.prio[self.size]; self.elem[1]=self.elem[self.size]
+		self.prio[1] = self.prio[priority_queue.size(self)]; self.elem[1]=self.elem[priority_queue.size(self)]
 		self._size[None]-=1
 		parent = 1
 		child  = 2*parent # Children are 2*parent and 2*parent+1 in binary tree
-		while child<=self.size: # Perform swaps to restore hierarchy in binary tree
-			if child+1<=self.size and self.prio[child+1]>self.prio[child]: child=child+1
+		while child<=priority_queue.size(self): # Perform swaps to restore hierarchy in binary tree
+			if child+1<=priority_queue.size(self) and self.prio[child+1]>self.prio[child]: child=child+1
 			if self.prio[child]<=self.prio[parent]: break # Priority ordering already satisfied
-			self.swap(parent,child)
+			priority_queue.swap(self,parent,child)
 			parent=child; child=2*child
-		
+	
+	@staticmethod
 	@ti.pyfunc
 	def push(self,prio,elem):
 		self._size[None]+=1
-		assert self.size<self.prio.shape[0] # Capacity increase can only be done from Python scope
-		self.prio[self.size] = prio; self.elem[self.size] = elem # Put new element last
-		child = self.size
+		size = priority_queue.size(self)
+		assert size<self.prio.shape[0] # Capacity increase can only be done from Python scope
+		self.prio[size] = prio; self.elem[size] = elem # Put new element last
+		child = size
 		parent = child//2 # Parent in binary tree
 		while parent>0: # Restore hierarchical order
 			if self.prio[parent]>self.prio[child]: break
-			self.swap(parent,child)
+			priority_queue.swap(self,parent,child)
 			child=parent; parent=child//2
 
-
-	def set_capacity(self,capacity=None):
+	@staticmethod
+	def with_capacity(self,capacity=None):
 		"""
-		Change the capacity of the priority queue. (capacity >= size+1)
-		- capacity (default = 2*old_capacity) : new capacity
+		Builds a new queue with the desired capacity, and copies the contents.
+		- capacity (default = 2*current_capacity) : new capacity
 		"""
-		if capacity is None: capacity = 2*self.capacity+1
-		else: assert capacity>=self.size
+		if capacity is None: capacity = 2*priority_queue.capacity(self)+1
+		assert capacity>=priority_queue.size(self)
+		new = self.init(capacity)
+		copy_argtype = ti.types.argpack(old=self.argtype,new=self.argtype)
 
-		prio = ti.field(dtype=self.prio.dtype, shape=capacity+1) # Largest priority goes on top
-		elem = ti.field(dtype=self.elem.dtype, shape=capacity+1) # Attached value to a priority
-		@ti.kernel
-		def copy_data():
-			for i in range(self.size+1):
-				prio[i] = self.prio[i]
-				elem[i] = self.elem[i]
-		copy_data()
-		self.prio = prio
-		self.elem = elem
-		self._capacity[None] = capacity
+		@ti.kernel # Taichi bug (?) : cannot use identical signature (old:argtype,new:argtype)
+		def copy_data(copy_ti:copy_argtype): 
+			copy_ti.new._size[None] = self.size(copy_ti.old)
+			for i in range(priority_queue.size(copy_ti.old)):
+				copy_ti.new.prio[i]  = copy_ti.old.prio[i]
+				copy_ti.new.elem[i]  = copy_ti.old.elem[i]
 
+		copy_data(copy_argtype(self,new))
+		return new
 
-@ti.data_oriented
 class fifo:
 	"""A Fist In First Out (FIFO) queue"""
-	def __init__(self,elem_type,capacity=1023):
-		self.elem = ti.field(dtype=elem_type, shape=capacity+1)
-		self.begin = ti.field(dtype=ti.i32, shape=()); self.begin.fill(0)
-		self.end = ti.field(dtype=ti.i32, shape=()); self.end.fill(0)
-		self._capacity = ti.field(dtype=ti.i32,shape=()); self._capacity.fill(capacity)
+	def init(elem_type,capacity=1023):
+		elem  = ti.ndarray(dtype=elem_type, shape=capacity+1)
+		begin = ti.ndarray(dtype=ti.i32, shape=()); begin.fill(0)
+		end   = ti.ndarray(dtype=ti.i32, shape=()); end.fill(0)
+		
+		self_t = ti.types.argpack(
+			elem=ti.types.ndarray(elem_type,ndim=1),
+			begin=ti.types.ndarray(ti.i32,ndim=0),
+			end=ti.types.ndarray(ti.i32,ndim=0))
+		
+		self = self_t(elem,begin,end,capacity)
+		self.argtype = self_t
+		self.init = partial(fifo.init,elem_type)
+		for attr in ['front','pop','push','empty','_container_size','capacity','size','with_capacity']: 
+			setattr(self,attr,getattr(fifo,attr))
+		return self
 
+	@staticmethod
 	@ti.pyfunc
 	def front(self): return self.elem[self.begin[None]]
 
+	@staticmethod
 	@ti.pyfunc
 	def pop(self):
+		assert not fifo.empty(self)
 		self.begin[None]+=1
 		if self.begin[None]==self.elem.shape[0]: self.begin[None]=0
-		assert self.begin!=self.end
 
+	@staticmethod
 	@ti.pyfunc
 	def push(self,elem):
 		self.elem[self.end[None]]=elem
 		self.end[None]+=1
 		if self.end[None]==self.elem.shape[0]: self.end[None]=0
+		assert not fifo.empty(self) # Exceeding capacity
 
-	@property
-	@ti.pyfunc
-	def capacity(self): return self._capacity[None]
-
-	@property
-	@ti.pyfunc
-	def _container_size(self): return self.elem.shape[0] # == capacity+1
-
+	@staticmethod
 	@ti.pyfunc
 	def empty(self): return self.begin[None]==self.end[None] 
 
-	@property
+	@staticmethod
+	@ti.pyfunc
+	def _container_size(self): return self.elem.shape[0]
+
+	@staticmethod
+	@ti.pyfunc
+	def capacity(self): return fifo._container_size(self)-1
+
+	@staticmethod
 	@ti.pyfunc
 	def size(self):
 		s = self.end[None]-self.begin[None]
-		return s if s>=0 else (s+self._container_size)
+		return ti.select(s>=0,s,s+fifo._container_size(self))
 
-	def set_capacity(self,capacity=None):
-		if capacity is None: capacity = 2*self.capacity+1
-		else: assert capacity>=self.size
+	@staticmethod
+	def with_capacity(self,capacity=None):
+		if capacity is None: capacity = 2*fifo.capacity(self)+1
+		else: assert capacity>=fifo.size(self)
 
-		elem = ti.field(dtype=self.elem.dtype, shape=capacity+1)
+		new = self.init(capacity)
+		copy_argtype = ti.types.argpack(old=self.argtype,new=self.argtype)
+		
 		@ti.kernel
-		def copy_data():
-			beg,end = self.begin[None],self.end[None]
-			if beg<=end:
-				for i in range(self.size):
-					elem[i] = self.elem[beg+i]
+		def copy_data(copy_ti:copy_argtype):
+			start = copy_ti.old.begin[None]; stop = copy_ti.old.end[None]; size = fifo.size(copy_ti.old)
+			#beg,end,size = copy_ti.old.begin[None],copy_ti.old.end[None],fifo.size(copy_ti.old)
+			copy_ti.new.begin[None] = 0
+			copy_ti.new.end[None] = size
+			if start<=stop:
+				for i in range(size):
+					copy_ti.new.elem[i] = copy_ti.old.elem[start+i]
 			else:
-				rem = self._container_size-beg
-				for i in range(rem): elem[i] = self.elem[beg+i]
-				for i in range(end): elem[rem+i] = self.elem[i]
-		copy_data()
-		self.elem = elem
-		self.end[None] = self.size
-		self.begin[None] = 0
-		self._capacity[None] = capacity
-
-
-@ti.data_oriented
+				rem = fifo._container_size(self)-start
+				for i in range(rem): copy_ti.new.elem[i] = copy_ti.old.elem[start+i]
+				for i in range(stop): copy_ti.new.elem[rem+i] = copy_ti.old.elem[i]
+		copy_data(copy_argtype(self,new))
+		return new
+	
 class lifo:
 	"""
 	A Last In First Out (LIFO) queue.
 	(Basically a vector container, with an index keeping track of the size)
 	"""
 
-	def __init__(self,elem_type,capacity=1024):
-		self.elem = ti.field(dtype=elem_type, shape=capacity)
-		self._size = ti.field(dtype=ti.i32, shape=()); self._size.fill(0)
+	def init(elem_type,capacity=1024):
+		elem  = ti.ndarray(dtype=elem_type, shape=capacity)
+		_size = ti.ndarray(dtype=ti.i32, shape=()); _size.fill(0)
+		self_t = ti.types.argpack(
+			elem  = ti.types.ndarray(elem_type,ndim=1),
+			_size = ti.types.ndarray(ti.i32,ndim=0))
+		
+		self = self_t(elem,_size)
+		self.argtype = self_t
+		self.init = partial(lifo.init,elem_type)
+		for attr in ['capacity','size','empty','push','top','pop','with_capacity']: 
+			setattr(self,attr,getattr(lifo,attr))
+		return self
 
-	@property
+	@staticmethod
 	@ti.pyfunc
 	def capacity(self): return self.elem.shape[0]
 
-	@property
+	@staticmethod
 	@ti.pyfunc
 	def size(self): return self._size[None]
 
+	@staticmethod
 	@ti.pyfunc
-	def empty(self): return self.size==0
+	def empty(self): return lifo.size(self)==0
 
+	@staticmethod
 	@ti.pyfunc
 	def push(self,elem):
-		assert self.size<self.capacity
-		self.elem[self.size] = elem
+		assert lifo.size(self)<lifo.capacity(self)
+		self.elem[lifo.size(self)] = elem
 		self._size[None]+=1
 	
+	@staticmethod
 	@ti.pyfunc
 	def top(self):
-		assert not self.empty()
-		return self.elem[self.size-1]
-	
+		assert not lifo.empty(self)
+		return self.elem[lifo.size(self)-1]
+
+	@staticmethod	
 	@ti.pyfunc
 	def pop(self):
-		assert not self.empty()
+		assert not lifo.empty(self)
 		self._size[None]-=1
 
-	def set_capacity(self,capacity=None):
-		if capacity is None: capacity = 2*self.capacity
-		else: assert capacity>=self.size
-
-		elem = ti.field(dtype=self.elem.dtype, shape=capacity)
+	def with_capacity(self,capacity=None):
+		if capacity is None: capacity = 2*lifo.capacity(self)
+		else: assert capacity>=lifo.size(self)
+		new = self.init(capacity)
+		copy_argtype = ti.types.argpack(old=self.argtype,new=self.argtype)
+		
 		@ti.kernel
-		def copy_data():
-			for i in range(self.size): elem[i] = self.elem[i]
-		copy_data()
-		self.elem = elem
+		def copy_data(copy_ti:copy_argtype):
+			size = lifo.size(copy_ti.old)
+			copy_ti.new._size[None] = size
+			for i in range(size): copy_ti.new[i] = copy_ti.old[i]
+		copy_data(copy_argtype(self,new))
+		return new
