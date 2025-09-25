@@ -61,18 +61,19 @@ class Riemann:
 
 	@ti.pyfunc
 	def hfm_scheme(self,x,ih,weights,offsets,ms):
-		Traits = ti.static(self.HFMTraits); ndim,nactx = ti.static(Traits.ndim,Traits.nactx)
+		#Traits = ti.static(self.HFMTraits); 
+		ndim,nactx = ti.static(self.HFMTraits.ndim,self.HFMTraits.nactx)
 		ti.static_assert(weights.shape[-1]==nactx); ti.static_assert(offsets.shape[-1]==nactx)
 		ti.static_assert(offsets.n==ndim); ti.static_assert(ih.n==ndim); ti.static_assert(ms.n==ms.m==ndim)
 		# Rescale the metric based on the grid scale
 		D = getb(ms,x).inverse() # Compute the dual of the metric, take grid scales into account
-		Dh = Traits.mat_t([[D[i,j]*ih[i]*ih[j] for i in ti.static(range(ndim))] for j in ti.static(range(ndim))])
+		Dh = self.HFMTraits.mat_t([[D[i,j]*ih[i]*ih[j] for i in ti.static(range(ndim))] for j in ti.static(range(ndim))])
 		λ,e = Selling.decomp(Dh) # Selling decomposition of the dual metric tensor
 		for i in ti.static(range(nactx)): weights[*x,i] = λ[i]; offsets[*x,i] = e[i,:]
 
 	def set_defaults(self,sgrid,m=None):
 		if m is None: m = ti.math.eye(self.HFMTraits.ndim).tolist()
-		return (tofield(m),)
+		return (tofield(m,self.HFMTraits.mat_t),)
 
 # --------- Non-holonomic models ---------
 
