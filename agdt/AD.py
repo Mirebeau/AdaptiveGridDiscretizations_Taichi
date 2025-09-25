@@ -175,7 +175,6 @@ def mk_fwd1(vdim=1,dtype=float):
 		def arctan(self): return fwd1(ti.math.arctan(self.x),self.v/(1+self.x**2))
 		# See agd/AutomaticDifferentation/Base.py for a few more...
 		
-
 	@ti.pyfunc
 	def mk(x,i):
 		"""Enhance x with a symbolic perturbation along the ith axis"""
@@ -189,7 +188,7 @@ def mk_fwd1(vdim=1,dtype=float):
 
 
 # --------- Ugly code below --------
-# This should have been much more compact, but I faced an issue becasue taichi does not support 
+# This should have been much more compact, but I faced an issue because taichi does not support 
 # variable numbers of arguments (and lambdas)
 
 def fwd_translator():
