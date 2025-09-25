@@ -365,25 +365,46 @@ class _Algo:
 			# Solve the piecewise quadratic equation, to find the update value
 			ivals = Sort.argsort(vals)
 			cost = self.costs[ix]
-			a = 0.; b = 0.; c = -cost**2
+
+			λ0 = vals[ivals[0]]
 			updt = np.inf
-			# TODO : deal with first value separately
-			# TODO : shift using first value, to avoid "large-large = small" roundoff error issue
-			for iact in range(nact):
-				w = weights[fx,ivals[iact]]
-				if w==0.: continue
-				λ = vals[ivals[iact]]
-				if λ==np.inf: break
-				a += w
-				b += w*λ
-				c += w*λ**2
-				δ = b**2-a*c
-				if δ<0: break
-				r = (b + ti.sqrt(δ))/a
-				if r<λ: break
-				updt = r
-			# Take the minimum or maximum
-			if mix==0: updtx = updt
+			if λ0 < np.inf:
+				a = weights[fx,ivals[0]]
+				b = 0.
+				c = -cost**2
+				if a>0: updt = cost/ti.sqrt(a) # First updt solves a linear equation 
+				for iact in range(1,nact):
+					w = weights[fx,ivals[iact]]
+					if w==0.: continue
+					λ = vals[ivals[iact]]-λ0  # Shift values here for quadratic solution accuracy 
+					if λ>=np.inf: break # Strangely, λ==np.inf fails here
+					a += w
+					b += w*λ
+					c += w*λ**2
+					δ = b**2-a*c
+					if δ<0: break
+					r = (b + ti.sqrt(δ))/a  # Other updt solve a quadratic equation
+					if r<λ: break
+					updt = r
+				updt+=λ0
+
+			# Simpler alternative : unified treatment of all offsets, no shift
+			# a = 0.; b = 0.; c = -cost**2; updt = np.inf 
+			# for iact in range(nact):
+			# 	w = weights[fx,ivals[iact]]
+			# 	if w==0.: continue
+			# 	λ = vals[ivals[iact]]
+			# 	if λ==np.inf: break
+			# 	a += w
+			# 	b += w*λ
+			# 	c += w*λ**2
+			# 	δ = b**2-a*c
+			# 	if δ<0: break
+			# 	r = (b + ti.sqrt(δ))/a
+			# 	if r<λ: break
+			# 	updt = r
+
+			if mix==0: updtx = updt # Take the minimum or maximum depending on mix_is_min
 			elif mix_is_min: updtx = max(updtx,updt)
 			else: updtx = min(updtx,updt)
 			if ti.static(ret_mix) and mix>0 and updt==updtx: mix_opt=mix
@@ -937,7 +958,7 @@ class GeodesicODE:
 
 		geo_code = ti.field(ti.i32,ntips)
 		geo_size = ti.field(ti.i32,ntips)
-		@ti.kernel # TODO : I should use ti.ndarray for geo,geo_old, would make more sense here
+		@ti.kernel # Using ndarray, instead of field, to avoid recompilation in case of multiple calls
 		def ode(geo:ti.types.ndarray(self.vec_t,2),geo_old:ti.types.ndarray(self.vec_t,2)):
 			geo_begin = geo_old.shape[1]
 			geo_end  =  geo.shape[1]
