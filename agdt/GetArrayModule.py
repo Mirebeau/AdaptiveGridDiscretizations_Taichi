@@ -113,15 +113,38 @@ def tofield(x,dtype):
 		xf = ti.field(dtype=dtype,shape=tuple())
 		xf.fill(x)
 		return xf
+	elif isinstance(x,np.ndarray):
+		shape = x.shape
+		if hasattr(dtype,'m') and dtype.m==shape[-1]: shape = shape[:-1]
+		if hasattr(dtype,'n') and dtype.n==shape[-1]: shape = shape[:-1]
+		field = ti.field(dtype,shape)
+		field.from_numpy(x) 
+		return field
 	else:
-		assert x.dtype==dtype.dtype 
+		assert x.dtype==dtype or x.dtype==dtype.dtype 
 		assert not (hasattr(x,'n') or hasattr(dtype,'n')) or x.n==dtype.n
 		assert not (hasattr(x,'m') or hasattr(dtype,'m')) or x.m==dtype.m
 		return x
 
 
 
-
+def to_ndarray(x,dtype):
+	if isinstance(x,numbers.Number) or isinstance(x,tuple) or isinstance(x,list):
+		xf = ti.ndarray(dtype=dtype,shape=tuple())
+		xf.fill(x)
+		return xf
+	elif isinstance(x,np.ndarray):
+		shape = x.shape
+		if hasattr(dtype,'m') and dtype.m==shape[-1]: shape = shape[:-1]
+		if hasattr(dtype,'n') and dtype.n==shape[-1]: shape = shape[:-1]
+		field = ti.ndarray(dtype,shape)
+		field.from_numpy(x) 
+		return field
+	else:
+		assert x.dtype==dtype or x.dtype==dtype.dtype 
+		assert not (hasattr(x,'n') or hasattr(dtype,'n')) or x.n==dtype.n
+		assert not (hasattr(x,'m') or hasattr(dtype,'m')) or x.m==dtype.m
+		return x
 
  
 

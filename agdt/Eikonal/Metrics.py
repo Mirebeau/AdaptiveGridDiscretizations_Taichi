@@ -5,12 +5,48 @@ eikonal solvers
 
 import taichi as ti
 import numpy as np
-from ..GetArrayModule import tofield,broadcasts
-from ..GetArrayModule import getitem_broadcast as getb
+from ..GetArrayModule import broadcasts,convert_dtype
+#from ..GetArrayModule import getitem_broadcast as getb
 from .. import Selling
 from . import HFM
 
 # Computes the decompositions of various metrics and models, suitable for the HFM method
+
+def to_ndarray(x,dtype):
+	import numbers
+	if isinstance(x,numbers.Number) or isinstance(x,tuple) or isinstance(x,list):
+		xf = ti.ndarray(dtype=dtype,shape=tuple())
+		xf.fill(x)
+		return xf
+	elif isinstance(x,np.ndarray):
+		shape = x.shape
+		if hasattr(dtype,'m') and dtype.m==shape[-1]: shape = shape[:-1]
+		if hasattr(dtype,'n') and dtype.n==shape[-1]: shape = shape[:-1]
+		field = ti.ndarray(dtype,shape)
+		field.from_numpy(x) 
+		return field
+	else:
+		assert x.dtype==dtype or x.dtype==dtype.dtype 
+		assert not (hasattr(x,'n') or hasattr(dtype,'n')) or x.n==dtype.n
+		assert not (hasattr(x,'m') or hasattr(dtype,'m')) or x.m==dtype.m
+		return x
+	
+@ti.pyfunc
+def getb(a:ti.template(),x):
+	"""
+	Get an array element at a given index, with implicit broadcasting. (Singletons field accepted.)
+	- a : ti.field
+	- x : position to extract
+	"""
+	print(ti.static(len(a.shape)),x.n)
+	if ti.static(len(a.shape)==0): return a[None]
+	else: ti.static_assert(len(a.shape)==x.n)
+	for i in ti.static(range(x.n)):
+		if a.shape[i]==1: x[i]=0 # Currently, this is a runtime test
+	return a[*x]
+
+# --------------------
+
 
 @ti.data_oriented
 class Diagonal:
@@ -29,18 +65,20 @@ class Diagonal:
 		self.NormType = NormType
 
 	@ti.pyfunc
-	def hfm_scheme(self,x,ih,weights,offsets,dcosts):
+	def hfm_scheme(self,x,ih,weights:ti.types.ndarray(),offsets:ti.types.ndarray(),data:ti.template()):#dcosts:ti.types.ndarray()):
 		ndim = ti.static(self.HFMTraits.ndim)
-		dcost = getb(dcosts,x)
+		dcost = getb(data.dcosts,x)
 		for i in ti.static(range(ndim)):
 			weights[*x,i] = (ih[i]/dcost[i])**2
 			for j in ti.static(range(ndim)):
 				offsets[*x,i][j] = (i==j)
 	
 	def set_defaults(self,sgrid,dcosts=1):
-		dcosts = tofield(dcosts,self.HFMTraits.vec_t)
+		dcosts = to_ndarray(dcosts,self.HFMTraits.vec_t)
 		shape = tuple(g.shape[i] for i,g in enumerate(sgrid)) 
 		assert broadcasts(dcosts.shape,shape)
+		argtype = ti.types.argpack(dcosts=ti.types.ndarray())
+		return argtype(dcosts),argtype
 		return (dcosts,)
 	
 @ti.data_oriented
@@ -61,7 +99,6 @@ class Riemann:
 
 	@ti.pyfunc
 	def hfm_scheme(self,x,ih,weights,offsets,ms):
-		#Traits = ti.static(self.HFMTraits); 
 		ndim,nactx = ti.static(self.HFMTraits.ndim,self.HFMTraits.nactx)
 		ti.static_assert(weights.shape[-1]==nactx); ti.static_assert(offsets.shape[-1]==nactx)
 		ti.static_assert(offsets.n==ndim); ti.static_assert(ih.n==ndim); ti.static_assert(ms.n==ms.m==ndim)
@@ -83,11 +120,11 @@ def self_outer_relax(v,ε):
 	"""Constructs the matrix (1-ε) v v^T + ε |v|^2 Id"""
 	rx2 = ε*(v@v)
 	m = ((1-ε)*v).outer_product(v)
-	for i in ti.static(m.n): m[i,i]+=rx2
+	for i in ti.static(range(m.n)): m[i,i]+=rx2
 	return m
 
 @ti.pyfunc
-def decomp_v(v,ε=0.1,ε_cosmin2=0.67):
+def decomp_v(v,ε=0.01,ε_cosmin2=0.67):
 	"""
 	Approximates the operator <grad u,v>_+^2 using finite differences with integer offsets.
 	<grad u,v>_+^2 = sum_i λi <grad u,ei>_+^2
@@ -108,7 +145,7 @@ def decomp_v(v,ε=0.1,ε_cosmin2=0.67):
 
 def _default_trigo(θ,cθ=None,sθ=None):
 	"""Returns cθ and sθ, or cos(θ) and sin(θ) if they are None"""
-	float_t = θ.dtype
+	float_t = convert_dtype['ti'][θ.dtype]
 	if cθ is None: cθ = ti.field(float_t,θ.shape); cθ.from_numpy(np.cos(θ))
 	if sθ is None: sθ = ti.field(float_t,θ.shape); sθ.from_numpy(np.sin(θ))
 	return cθ,sθ
@@ -138,7 +175,7 @@ class ReedsSheppForward2:
 		λ,e = decomp_v(v,ε,ε_cosmin2)
 		for i in range(self.HFMTraits.nfwd): weights[*x,1+i] = λ[i]; offsets[*x,1+i] = e[i,:]
 
-	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,ε=0.1,ε_cosmin2=0.67):
+	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,ε=0.01,ε_cosmin2=0.67):
 		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ)
 		return tuple(tofield(_,self.HFMTraits.float_t) for _ in (ξ,cθ,sθ,κ,ε,ε_cosmin2))
 
@@ -158,20 +195,19 @@ class ReedsShepp2:
 	@ti.pyfunc
 	def hfm_scheme(self,x,ih,weights,offsets,
 			   ξ_,cθ_,sθ_,κ_,ε_,ε_cosmin2_): # Note : iξ := 1/ξ would be a more natural parameter
-		Traits = ti.static(self.HFMTraits)
 		ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(ξ_,x),getb(cθ_,x),getb(sθ_,x),getb(κ_,x),getb(ε_,x),getb(ε_cosmin2_,x)
-		v = Traits.vect_t([cθ,sθ,κ]) * ih # Horizontal control
+		v = self.HFMTraits.vec_t([cθ,sθ,κ]) * ih # Horizontal control
 		m = self_outer_relax(v,ε) # Relaxation to allow a bit of orthogonal control
-		m[2,2] = max(m[2,2],v[2]*v[2]+(ξ*h[2])**-2) # Angular control
-		λ,e = Selling.decomp(M.inverse()) # Selling decomposition
-		w = Traits.vect_t([v[1],-v[0],0.]) # cross product of v and {0,0,1}, i.e. non-holonomy direction
-		for i in range(Traits.nactx): 
+		m[2,2] = max(m[2,2],v[2]*v[2]+(ih[2]/ξ)**2) # Angular control
+		λ,e = Selling.decomp(m) # Selling decomposition
+		w = self.HFMTraits.vec_t([v[1],-v[0],0.]) # cross product of v and {0,0,1}, i.e. non-holonomy direction
+		for i in range(self.HFMTraits.nactx): 
 			weights[*x,i] = λ[i]
-			offsets[*x,i] = e[i,:]
+			ei = e[i,:]; offsets[*x,i] = ei
 			# Pruning of the offsets which are towards the non-holonomy direction
-			if (w@e)**2 >= (e@e) * (w@w) * (1-ε_cosmin2): λ[i]=0
+			if (w@ei)**2 >= (ei@ei) * (w@w) * (1-ε_cosmin2): λ[i]=0
 
-	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,ε=0.1,ε_cosmin2=0.67):
+	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,ε=0.01,ε_cosmin2=0.67):
 		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ)
 		return tuple(tofield(_,self.HFMTraits.float_t) for _ in (ξ,cθ,sθ,κ,ε,ε_cosmin2))
 
@@ -221,7 +257,7 @@ class Elastica2:
 				if 2*l >  nFejer-1: s = 0
 			for i in range(6): weights[*x,6*l+i] = λ[i]; offsets[*x,6*l+i] = e[i,:]
 
-	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,φmax=np.pi/2,ε=0.1,ε_cosmin2=0.67):
+	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,φmax=np.pi/2,ε=0.01,ε_cosmin2=0.67):
 		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ)
 		return tuple(tofield(_,self.HFMTraits.float_t) for _ in (ξ,cθ,sθ,κ,φmax,ε,ε_cosmin2))
 
@@ -248,6 +284,6 @@ class Dubins2:
 			λ,e = decomp_v(v,ε,ε_cosmin2)
 			for i in ti.static(range(6)): weights[*x,6*s+i] = λ[i]; offsets[*x,6*s+i] = e[i,:]
 
-	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,ε=0.1,ε_cosmin2=0.67):
+	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,ε=0.01,ε_cosmin2=0.67):
 		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ)
 		return tuple(tofield(_,self.HFMTraits.float_t) for _ in (ξ,cθ,sθ,κ,ε,ε_cosmin2))

@@ -46,9 +46,12 @@ class TraitsType:
 	def ntotx(self):return self.nmix*self.ntot
 
 @ti.pyfunc
-def div_round_closest(n,d): # https://stackoverflow.com/a/18067292/12508258
+def div_round_closest(n,d):
 	"""Computes the closest integer to n/d"""
-	return ti.select((n<0) != (d<0), (n-d//2)//d, (n+d//2)//d)
+	return int(ti.math.round(n/d))
+	assert d>0; return (n+d//2)//d # Correct with python division convention, assuming d>0
+	#return ti.select((n<0) == (d<0),  (n+d//2)//d, (n-d//2)//d) # Correct with C/C++ (https://stackoverflow.com/a/18067292/12508258)
+
 
 # -------------------------------------- Core Algorithm ------------------------------------------
 
@@ -72,7 +75,7 @@ class _Algo:
 	* CUDA implementation available at (https://github.com/Mirebeau/AdaptiveGridDiscretizations)
 	"""
 
-	def __init__(self,costs,weights,offsets,Traits,walls=None,seeds_capacity=128):
+	def __init__(self,costs,weights,offsets,Traits,walls=None,nper=0,seeds_capacity=128):
 		"""
 		costs : scalar cost function, shape (n1,...,nd)
 		weights, offsets : scheme coefficients, shape (a1,...,ad) with ai in (1,ni)
@@ -83,10 +86,9 @@ class _Algo:
 		self.ioffset_t = ti.i32 # Type used for scheme offsets converted to indices
 		assert Traits.nactx == weights.shape[-1]
 		assert Traits.ntotx <= 8*convert_dtype['np'][self.Traits.voffset_t]().nbytes
-
-		self.nper = np.prod(self.shape[self.Traits.periodic_axis:]) if self.periodic else 0
+		self.nper = nper
 		
-		self.seeds = CappedQueue.lifo(self.Traits.int_t,capacity=64)
+		self.seeds = CappedQueue.lifo(self.Traits.int_t,capacity=seeds_capacity)
 
 		# Compute the index conversion modulus for the weights and offsets
 		shape = self.shape; ndim = self.ndim
@@ -134,7 +136,7 @@ class _Algo:
 		voffsets = ti.field(dtype=self.Traits.voffset_t,shape=self.shape)
 		nmix,nrev,nfwd,nactx,ntotx = Traits.nmix,Traits.nrev,Traits.nfwd,Traits.nactx,Traits.ntotx
 		#print(f"{self.factored=}, {self.shape=}, {factored_start=}, {factored_stop=}, {ndim=}")
-		@ti.kernel
+		@ti.kernel # TODO : accelerate by precomputing the distance to the walls ? 
 		def set_voffsets():
 			for x in ti.grouped(costs):
 				bx=x # Broadcasted x, used for the offsets which may be factored
@@ -244,6 +246,7 @@ class _Algo:
 	@ti.pyfunc
 	def x2ix(self,x):
 		"""Convert a discrete point to an index"""
+		if not self.indomain(x): print("x2ix",x)
 		assert self.indomain(x)
 		ix = x[0]
 		for i in ti.static(range(1,self.ndim)):
@@ -262,6 +265,7 @@ class _Algo:
 		- x (ivec) : position 
 		- e (ivec) : offset (can have i8 coords)
 		"""
+		if not self.indomain(x): print("visible",x,e)
 		assert self.indomain(x) # Assumption : start point lies in the domain
 		if visible := self.indomain(x+e): # check that endpoint lies in the domain
 			if ti.static(self.true_wall):
@@ -271,6 +275,8 @@ class _Algo:
 					if not visible: break 
 					f = self.Traits.ivec_t(0)
 					for i in range(self.ndim): f[i] = div_round_closest(k*E[i],linf_e)
+					if not self.indomain(x+f):
+						print("visible",x,e,k,linf_e,f,x+e,x+f)
 					if self.walls[self.x2ix(x+f)]==ti.static(wall_code['wall']): visible=False #; break
 		return visible
 
@@ -477,13 +483,12 @@ class _Algo:
 				while not seeds.empty():
 					seed = seeds.top(); seeds.pop()
 					pq.push(self_pq,-self.values[seed],seed)
-					frozen[seed]=False # We want to see the seeds once
+					frozen[seed] = ti.i8(False) # We want to see the seeds once
 		set_seeds(pq)
 
 		@ti.func # Update neighbors of last frozen point in FMM
 		def FMM_update_and_push(ix,iy,self_pq:ti.template()):
 			if not frozen[iy]:
-				#print("updating",iy,self.ix2x(iy),self.update(iy))
 				self.set_value(iy,self.update(iy))
 				pq.push(self_pq,-self.values[iy],iy)
 
@@ -495,17 +500,14 @@ class _Algo:
 					mval,ix = pq.top(self_pq) # mval = -values[ix] at insertion
 					pq.pop(self_pq)
 					if frozen[ix]: continue # Outdated seed value # Note m self.values[ix]!=-mval is an invalid test
-					frozen[ix] = True
-					#print("Freezing",ix,self.ix2x(ix),-mval)
+					frozen[ix] = ti.i8(True)
 					if ti.static(stopping_criterion!=None): # Optional stopping criterion
 						stop[None] = stopping_criterion(ix)
 						if stop[None]: break
 					self.rneigh(ix,FMM_update_and_push,self_pq)
 		FMM(pq)
 		while not pq.empty(pq) and not stop[None]: 
-			#print(pq.size(pq),pq.capacity(pq),"before doubling")
 			pq = pq.with_capacity(pq) # Double the capacity
-			#print(pq.size(pq),pq.capacity(pq),"after doubling")
 			FMM(pq)
 		return stop[None] # Return stopping criterion code
 
@@ -638,38 +640,65 @@ class Domain:
 		"""Returns a (broadcasted) grid of the domain"""
 		return tuple(np.broadcast_to(s,self.shape) for s in self.sgrid())
 	
-	def build_scheme(self,costs=None,walls=None,**kwargs):
+	def build_scheme(self,costs=None,walls=None,seeds_capacity=128,**kwargs):
+		"""
+		- Cost  (field, full shape): a scalar field which multiplies the metric.
+		- walls (field, full shape): obstacles in the domain
+		- seeds_capacity (int) : max number of seeds to be inserted
+		- kwargs : passed to metric.set_defaults, and then to metric.hfm_scheme
+		"""
 		Traits = self.Traits
 		# Broadcast the data appropriately
-		data = self.metric.set_defaults(self.sgrid(),**kwargs)
-		datashapes = [a.shape for a in data if a.shape!=tuple()]
+		data,datatype = self.metric.set_defaults(self.sgrid(),**kwargs)
+		#datashapes = [a.shape for a in data if a.shape!=tuple()]
+		datashapes = [val.shape for key,val in data.items if val.shape!=tuple()]
 		bshape = (1,)*Traits.ndim if len(datashapes)==0 else tuple(np.max(datashapes,axis=0))
 
 		# TODO : would make more sense to have costs and walls as ti.ndarray (for easy input)
-		if costs is None: costs = ti.field(Traits.float_t,self.shape); costs.fill(1)
-		if walls is None: walls = ti.field(Traits.wall_t,self.shape); walls.fill(0)
+		if costs is None: costs = ti.ndarray(Traits.float_t,self.shape); costs.fill(1)
+		if walls is None: walls = ti.ndarray(Traits.wall_t,self.shape); walls.fill(0)
 
 		# Generate the weights and offsets
-		weights = ti.field(Traits.float_t,shape=bshape+(Traits.nactx,))
-		offsets = ti.Vector.field(Traits.ndim,self.offset_t,shape=weights.shape)
+		weights = ti.ndarray(Traits.float_t,shape=bshape+(Traits.nactx,))
+		offsets = ti.Vector.ndarray(Traits.ndim,self.offset_t,shape=weights.shape)
+
+		@ti.kernel
+		def decomp(weights:ti.types.ndarray(),offsets:ti.types.ndarray(),data:datatype):
+			#dcosts:ti.types.ndarray()):
+			for x in ti.grouped(ti.ndrange(*bshape)):
+				self.metric.hfm_scheme(x,self.ih,weights,offsets,data)
+
+		#dcosts = data[0]
+		#print(dcosts,dcosts.shape)
+		#return
+		decomp(weights,offsets,data)
+		return 
+
 		@ti.kernel
 		def decomp():
 			for x in ti.grouped(ti.ndrange(*bshape)):
 				self.metric.hfm_scheme(x,self.ih,weights,offsets,*data)
 		decomp()
+		# print(offsets.to_numpy()[0,0,16]) 
+		# print(weights.to_numpy()[0,0,16]) 
+		# print(offsets.shape)
+
+		return
 		
-		if not self.periodic: self.Algo = _Algo(costs,weights,offsets,Traits,walls)
+		if not self.periodic: self.Algo = _Algo(costs,weights,offsets,Traits,walls,0,seeds_capacity)
 		else:  # Padding the weights and offsets with zeros in the periodic case
 			per_ax = self.periodic_axis
 			self.periodic_pad = np.max(np.abs(offsets.to_numpy()[...,per_ax]))
 			per_pad = self.periodic_pad
+			#print(f"{per_pad=}")
 			if bshape[per_ax]>1:
 				bshape_pad = list(bshape)
 				bshape_pad[per_ax] += 2*per_pad
 				bshape_pad = tuple(bshape_pad)
-				weights_pad = ti.field(Traits.float_t,shape=self.bshape_pad + (Traits.nactx,))
-				offsets_pad = ti.Vector.field(Traits.ndim,Traits.float_t,shape=weights_pad.shape)
+				weights_pad = ti.field(Traits.float_t,shape=bshape_pad + (Traits.nactx,))
+				offsets_pad = ti.Vector.field(Traits.ndim,Traits.offset_t,shape=weights_pad.shape)
 				weights_pad.fill(0); offsets_pad.fill(0)
+				#print(f"{bshape_pad=}")
 				@ti.kernel
 				def scheme_pad():
 					for x in ti.grouped(weights):
@@ -682,8 +711,9 @@ class Domain:
 			shape_pad = list(self.shape)
 			shape_pad[per_ax] += 2*per_pad
 			self.shape_pad = tuple(shape_pad)
+			wall_t = Traits.wall_t
 			costs_pad = ti.field(Traits.float_t,shape_pad)
-			walls_pad = ti.field(Traits.wall_t,shape_pad)
+			walls_pad = ti.field(wall_t,shape_pad)
 			wc = wall_code
 			@ti.kernel
 			def coef_pad():
@@ -695,15 +725,16 @@ class Domain:
 					x = y; x[per_ax]+=per_pad
 					if y[per_ax]<per_pad:
 						xper=x; xper[per_ax]+=self.shape[per_ax]
-						if walls[y]==wc['normal']: walls_pad[x]=wc['normal +nper']; walls_pad[xper]=wc['dummy -nper']
-						elif walls[y]==wc['wall']: walls_pad[x]=wc['wall']; walls_pad[xper]=wc['wall']
+						if walls[y]==wc['normal']: walls_pad[x]=wall_t(wc['normal +nper']); walls_pad[xper]=wall_t(wc['dummy -nper'])
+						elif walls[y]==wc['wall']: walls_pad[x]=wall_t(wc['wall']);         walls_pad[xper]=wall_t(wc['wall'])
 					elif y[per_ax]>=self.shape[per_ax]-per_pad:
 						xper=x; xper[per_ax]-=self.shape[per_ax]
-						if walls[y]==wc['normal']: walls_pad[x]=wc['normal -nper']; walls_pad[xper]=wc['dummy +nper']
-						elif walls[y]==wc['wall']: walls_pad[x]=wc['wall']; walls_pad[xper]=wc['wall']
+						if walls[y]==wc['normal']: walls_pad[x]=wall_t(wc['normal -nper']); walls_pad[xper]=wall_t(wc['dummy +nper'])
+						elif walls[y]==wc['wall']: walls_pad[x]=wall_t(wc['wall']);         walls_pad[xper]=wall_t(wc['wall'])
 					else: walls_pad[x]=walls[y]
 			coef_pad()
-			self.Algo = _Algo(costs_pad,weights_pad,offsets_pad,Traits,walls_pad)
+			nper=np.prod(self.shape[per_ax:])
+			self.Algo = _Algo(costs_pad,weights_pad,offsets_pad,Traits,walls_pad,nper,seeds_capacity)
 
 	@property
 	def Traits(self): return self.metric.HFMTraits
@@ -817,7 +848,8 @@ class Domain:
 				for i in ti.static(range(self.Traits.ndim)):
 					y = x; y[i]+=1; 
 					if ti.static(self.periodic) and self.periodic_axis==i and y[i]==self.shape[i]: y[i]=0
-					if y[i]<self.shape[i]:  distL1[x] = min(distL1[x],1+distL1[y])
+					# Taichi 1.7.4 compiler bug : min of ti.i8 variables not supported
+					if y[i]<self.shape[i]:  distL1[x] = min(distL1[x],1+distL1[y]) 
 					y = x; y[i]-=1; 
 					if ti.static(self.periodic) and self.periodic_axis==i and y[i]==-1: y[i]=self.shape[i]-1
 					if y[i]>=0:  distL1[x] = min(distL1[x],1+distL1[y])
@@ -874,7 +906,7 @@ class GeodesicODE:
 		self.geodesicStep = 0.25    # How much to advance at each step
 		self.weightThreshold = 0.5/2**self.ndim  # Used in interpolation pruning
 		self.causalityTolerance = 4
-		self.seeds_top = 1000 # Some arbitrary upper bound for the seeds field
+		self.seeds_top = np.iinfo(convert_dtype['np'][seeds.dtype]).max #1000 # Some arbitrary upper bound for the seeds field #np.iinfo(convert_dtype['np'][seeds.dtype]).max 
 		
 	@property
 	@ti.pyfunc
@@ -921,7 +953,7 @@ class GeodesicODE:
 			xe = self.crop_periodize(x0+e)
 			w = Linalg.product(1-ti.abs(e-e0)) # Interpolation weight
 			if w >= self.weightThreshold: # minimum seed,val, based on points with substantial weight
-				min_seed = min(min_seed,self.seeds[xe])
+				min_seed = min(min_seed,self.seeds[xe]) # Taichi 1.7.4 compiler bug : min of ti.i8 vars unsupported
 				if (val:=self.values[*xe]) < min_val:
 					min_val = val
 					minx = xe
