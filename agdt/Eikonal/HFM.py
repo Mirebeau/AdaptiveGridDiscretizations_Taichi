@@ -170,8 +170,6 @@ class _Algo:
 		pq = CappedQueue.priority_queue(ti.i32,ti.i32,capacity=self.factored_size*ntotx)
 		roffsets = ti.field(dtype=ti.i32,shape=self.factored_size*ntotx) 
 		boffsets = ti.field(dtype=ti.i32,shape=self.factored_size+1); boffsets[0]=0
-		#print(f"{self.factored_size=}, {ioffsets_factored.shape}, {ioffsets.shape}")
-		#print(f"ioffsets_factored, basic :{ioffsets_factored},{ioffsets}")
 		@ti.kernel
 		def set_roffsets():
 			factored_size = ti.static(self.factored_size)
@@ -372,7 +370,7 @@ class _Algo:
 			# TODO : deal with first value separately
 			# TODO : shift using first value, to avoid "large-large = small" roundoff error issue
 			for iact in range(nact):
-				w = weights[fx,iact]
+				w = weights[fx,ivals[iact]]
 				if w==0.: continue
 				λ = vals[ivals[iact]]
 				if λ==np.inf: break
@@ -484,9 +482,9 @@ class _Algo:
 					self.rneigh(ix,FMM_update_and_push,self_pq)
 		FMM(pq)
 		while not pq.empty(pq) and not stop[None]: 
-			print(pq.size(pq),pq.capacity(pq),"before doubling")
-			pq = pq.with_capacity() # Double the capacity
-			print(pq.size(pq),pq.capacity(pq),"after doubling")
+			#print(pq.size(pq),pq.capacity(pq),"before doubling")
+			pq = pq.with_capacity(pq) # Double the capacity
+			#print(pq.size(pq),pq.capacity(pq),"after doubling")
 			FMM(pq)
 		return stop[None] # Return stopping criterion code
 
@@ -528,9 +526,6 @@ class _Algo:
 					self.set_value(ix,value)
 					self.rneigh(ix,push_neighbors,None)
 		AGSI()
-		# while not fifo.empty():
-		# 	fifo.set_capacity() # Double the capacity
-		# 	AGSI()
 		if niter[None]>=nitermax: 
 			print(f"AGSI completed niter={niter[None]} iterations, without reaching tolerance {tol=}")
 		return niter[None]
@@ -618,6 +613,9 @@ class Domain:
 		return tuple(o+h*np.arange(s,dtype=convert_dtype['np'][self.Traits.float_t]
 							  ).reshape((1,)*i+(s,)+(1,)*(len(self.shape)-i-1))
 				for i,(s,h,o) in enumerate(zip(self.shape,self.h,self.origin)))
+	def grid(self):
+		"""Returns a (broadcasted) grid of the domain"""
+		return tuple(np.broadcast_to(s,self.shape) for s in self.sgrid())
 	
 	def build_scheme(self,costs=None,walls=None,**kwargs):
 		Traits = self.Traits
@@ -625,6 +623,8 @@ class Domain:
 		data = self.metric.set_defaults(self.sgrid(),**kwargs)
 		datashapes = [a.shape for a in data if a.shape!=tuple()]
 		bshape = (1,)*Traits.ndim if len(datashapes)==0 else tuple(np.max(datashapes,axis=0))
+
+		# TODO : would make more sense to have costs and walls as ti.ndarray (for easy input)
 		if costs is None: costs = ti.field(Traits.float_t,self.shape); costs.fill(1)
 		if walls is None: walls = ti.field(Traits.wall_t,self.shape); walls.fill(0)
 
@@ -636,7 +636,6 @@ class Domain:
 			for x in ti.grouped(ti.ndrange(*bshape)):
 				self.metric.hfm_scheme(x,self.ih,weights,offsets,*data)
 		decomp()
-
 		
 		if not self.periodic: self.Algo = _Algo(costs,weights,offsets,Traits,walls)
 		else:  # Padding the weights and offsets with zeros in the periodic case
@@ -695,9 +694,11 @@ class Domain:
 	def periodic(self): return self.periodic_axis is not None
 
 	@ti.pyfunc
-	def PointFromIndex(self,index): return index*self.h+self.origin
-	@ti.pyfunc
 	def IndexFromPoint(self,point): return (point-self.origin)*self.ih
+	@ti.pyfunc
+	def PointFromIndex(self,index,to:ti.template()=False):
+		if ti.static(to): return self.IndexFromPoint(index)
+		return index*self.h+self.origin
 	@ti.func
 	def Interpolate(self,field,point):
 		"""
@@ -719,9 +720,9 @@ class Domain:
 			value += getitem_broadcast(field,y) * weight
 		return value
 
-	def values(self,as_ndarray=False):
+	def values(self,as_numpy=False):
 		"""The numerical solution of the eikonal equation"""
-		if as_ndarray:
+		if as_numpy:
 			if self.periodic: return self.Algo.values.to_numpy().reshape(self.shape_pad)[
 				(slice(None),)*self.periodic_axis+(slice(self.periodic_pad,-self.periodic_pad),)]
 			else: return self.Algo.values.to_numpy().reshape(self.shape)
@@ -806,7 +807,7 @@ class Domain:
 		"""Returns the geodesic ODE solver based on the scheme data"""
 		periodic = [False]*self.Traits.ndim
 		if self.periodic: periodic[self.periodic_axis]=True
-		return GeodesicODE(self.seeds_distL1(),self.values(),*self.flows(adim=True),tuple(periodic))
+		return GeodesicODE(self.seeds_distL1(),self.values(),*self.flows(adim=True),tuple(periodic),self.PointFromIndex)
 
 
 
@@ -839,11 +840,12 @@ class GeodesicODE:
 	"""
 	# Note : computing the full gradient field is unnecessary and computationally and memory expensive
 
-	def __init__(self,seeds,values,flows,diffs,periodic=None):
+	def __init__(self,seeds,values,flows,diffs,periodic,PointFromIndex):
 		self.seeds = seeds
 		self.values = values
 		self.flows = flows
 		self.diffs = diffs
+		self.PointFromIndex = PointFromIndex
 		assert seeds.shape==values.shape==self.shape
 		assert len(self.shape) == self.ndim
 
@@ -935,8 +937,8 @@ class GeodesicODE:
 
 		geo_code = ti.field(ti.i32,ntips)
 		geo_size = ti.field(ti.i32,ntips)
-		@ti.kernel
-		def ode(geo:ti.template(),geo_old:ti.template()):
+		@ti.kernel # TODO : I should use ti.ndarray for geo,geo_old, would make more sense here
+		def ode(geo:ti.types.ndarray(self.vec_t,2),geo_old:ti.types.ndarray(self.vec_t,2)):
 			geo_begin = geo_old.shape[1]
 			geo_end  =  geo.shape[1]
 			dt = self.geodesicStep
@@ -972,16 +974,23 @@ class GeodesicODE:
 					elif all(recent_minx[igeo,(k+1)%delay_minx]==minx1): code = geodesic_code['StationnaryPosition']
 					elif recent_seeds[igeo,   (k+1)%delay_seeds]<seed1:  code = geodesic_code['PastSeed']
 				geo_code[igeo]=code
-		
-		geo = ti.field(self.vec_t, shape = (ntips,256))
-		geo_old = ti.field(self.vec_t, shape = (ntips,1))
-		print(geo_old.shape,tips.shape)
+
+		@ti.kernel
+		def PointFromIndex_ker(geo:ti.types.ndarray(self.vec_t,2),to:ti.template()):
+			for x in ti.grouped(geo): geo[x] = self.PointFromIndex(geo[x],to)
+
+		geo = ti.ndarray(self.vec_t, shape = (ntips,256))
+		geo_old = ti.ndarray(self.vec_t, shape = (ntips,1))
 		geo_old.from_numpy(tips[:,None,:])
+		PointFromIndex_ker(geo_old,True)
+
 		ode(geo,geo_old)
 		while any(geo_code.to_numpy()==0) and geo.shape[1]<max_len:
 			geo_old = geo
-			geo = ti.field(self.vec_t, shape=(ntips,min(2*geo_old.shape[1],max_len)))
+			geo = ti.ndarray(self.vec_t, shape=(ntips,min(2*geo_old.shape[1],max_len)))
+			ode(geo,geo_old)
 
+		PointFromIndex_ker(geo,False)
 		geo_np = geo.to_numpy()
 		geodesics = [geo_np[i,:geo_size[i]] for i in range(ntips)]
 		geodesic_rcodes = [geodesic_rcode[c] for c in geo_code.to_numpy()]
