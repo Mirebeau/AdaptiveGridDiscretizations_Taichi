@@ -10,8 +10,20 @@ import numpy as np
 from dataclasses import dataclass
 from . import Queue,CappedQueue
 from .. import Sort 
-from ..GetArrayModule import convert_dtype,reshape_field,getitem_broadcast
+from ..GetArrayModule import convert_dtype,reshape_ndarray,reshape_field,getitem_broadcast,ti_debug
 from .. import Linalg
+
+# Shorthands for ti.func and ti.kernel annotations
+arr_t = ti.types.ndarray() 
+tpl_t = ti.template() 
+
+# Collects all ndarray members of class _Algo. Must be passed as parameter to Taichi kernels
+_Algo_ti_t = ti.types.argpack(
+	**{key:arr_t for key in ('weights','offsets','values','costs','walls',
+						  'ioffsets','voffsets','roffsets','boffsets')})
+
+# Collects all ndarray members of class Domain. Must be passed as parameter to Taichi kernels
+Domain_ti_t = _Algo_ti_t
 
 @dataclass
 class TraitsType:
@@ -81,14 +93,14 @@ class _Algo:
 		weights, offsets : scheme coefficients, shape (a1,...,ad) with ai in (1,ni)
 		walls (array, dtype=i8): node type, see wall code, shape (n1,...,nd)
 		"""
-		self._shape = costs.shape 
+		self._shape = ti.field(Traits.ivec_t,tuple()); self._shape[None] = costs.shape
 		self.Traits = Traits
 		self.ioffset_t = ti.i32 # Type used for scheme offsets converted to indices
 		assert Traits.nactx == weights.shape[-1]
 		assert Traits.ntotx <= 8*convert_dtype['np'][self.Traits.voffset_t]().nbytes
-		self.nper = nper
-		
+
 		self.seeds = CappedQueue.lifo(self.Traits.int_t,capacity=seeds_capacity)
+		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
 
 		# Compute the index conversion modulus for the weights and offsets
 		shape = self.shape; ndim = self.ndim
@@ -105,14 +117,24 @@ class _Algo:
 				if factored_stop==-1: factored_stop=i
 		if factored_start==-1: factored_start=ndim
 		if factored_stop==-1:  factored_stop=ndim
-		self._factored_start=factored_start
-		self._factored_stop=factored_stop
+		self._factored_start=factored_start # OK to template 
+		self._factored_stop=factored_stop # OK to template
+
+		self._sizes = ti.field(Traits.int_t,5)
+		shape = tuple(self.shape)
+		self._sizes.from_numpy(np.array((
+			np.prod(shape), # Domain size
+			np.prod(shape[self.factored_start:self.factored_stop],dtype=int), # Factored size
+			np.prod(shape[self.factored_stop:],dtype=int), # Factored div
+			np.iinfo(convert_dtype['np'][Traits.int_t]).min, # Will be set to roffsets_max
+			nper, # Shift to access other size of the domain in the periodic setting
+			)))
 
 		# --- Convert the offsets vectors into integers ---
-		ioffsets = ti.field(dtype=self.ioffset_t,shape=weights.shape) # i32 needed for 3D
-		ioffsets_factored = ti.field(dtype=self.ioffset_t,shape=weights.shape) if self.factored else ioffsets
 		@ti.kernel
-		def set_ioffsets():
+		def set_ioffsets(weights:arr_t,offsets:arr_t, # IN
+				   ioffsets:arr_t,ioffsets_factored:arr_t): #OUT 
+			if ti.static(ti_debug()): compiling[None]=0 # set_ioffsets
 			for xe in ti.grouped(weights):
 				ioffset:self.ioffset_t = offsets[xe][0]
 				for i in ti.static(range(1,ndim)):
@@ -125,20 +147,19 @@ class _Algo:
 							ioffset = self.shape[i]*ioffset + offsets[xe][i]
 						ioffsets_factored[xe] = ioffset
 					else: ioffsets_factored[xe] = 0
-		set_ioffsets()
+		
+		ioffsets = ti.ndarray(self.ioffset_t,weights.shape) # i32 needed for 3D
+		ioffsets_factored = ti.ndarray(self.ioffset_t,weights.shape) if self.factored else ioffsets
+		set_ioffsets(weights,offsets,ioffsets,ioffsets_factored)
 
 		# --- Compute the masks for valid offsets, corresponding to visible pair points ---
-		if walls is None: walls = ti.field(dtype=Traits.wall_t,shape=self.shape); walls.fill(0)
-		self.true_wall = np.any(walls.to_numpy()==wall_code['wall']) # Is there a true wall, or only periodic bc ? 
-		self.walls = reshape_field(walls,(self.size,))
-		walls = None		
-
-		voffsets = ti.field(dtype=self.Traits.voffset_t,shape=self.shape)
 		nmix,nrev,nfwd,nactx,ntotx = Traits.nmix,Traits.nrev,Traits.nfwd,Traits.nactx,Traits.ntotx
 		#print(f"{self.factored=}, {self.shape=}, {factored_start=}, {factored_stop=}, {ndim=}")
 		@ti.kernel # TODO : accelerate by precomputing the distance to the walls ? 
-		def set_voffsets():
-			for x in ti.grouped(costs):
+		def set_voffsets(offsets:arr_t,walls:arr_t, # IN
+				   voffsets:arr_t): # OUT
+			if ti.static(ti_debug()): compiling[None]=0 # set_voffsets
+			for x in ti.grouped(voffsets):
 				bx=x # Broadcasted x, used for the offsets which may be factored
 				for i in ti.static(range(factored_start)): bx[i]=0
 				for i in ti.static(range(factored_stop,ndim)): bx[i]=0
@@ -147,36 +168,40 @@ class _Algo:
 				voffset = 0
 				for mix in ti.static(range(nmix)):
 					for e in ti.static(range(nrev)):
-						if self.visible(x, offsets[*bx,bact]): voffset |= 1<<btot
+						if self.visible(x, offsets[*bx,bact],walls): voffset |= 1<<btot
 						btot+=1
-						if self.visible(x,-offsets[*bx,bact]): voffset |= 1<<btot
+						if self.visible(x,-offsets[*bx,bact],walls): voffset |= 1<<btot
 						btot+=1; bact+=1
 					for e in ti.static(range(nfwd)):
-						if self.visible(x, offsets[*bx,bact]): voffset |= 1<<btot
+						if self.visible(x, offsets[*bx,bact],walls): voffset |= 1<<btot
 						btot+=1; bact+=1
 				voffsets[x] = voffset
-		set_voffsets()
+		voffsets = ti.ndarray(dtype=self.Traits.voffset_t,shape=self.shape)
+		if walls is None: walls = ti.ndarray(dtype=Traits.wall_t,shape=self.shape); walls.fill(0)
+		self.true_wall = np.any(walls.to_numpy()==wall_code['wall']) # Is there a true wall, or only periodic bc ? 
+		self.walls = reshape_ndarray(walls,(self.size,))
+		walls = None
+		set_voffsets(offsets,self.walls,voffsets)
 
-		# Flattening, and save
-		ioffsets = reshape_field(ioffsets,(self.factored_size,nactx))
-		ioffsets_factored = reshape_field(ioffsets_factored,(self.factored_size,nactx)) if ioffsets_factored else ioffsets
+		# Flattening, and saving
+		ioffsets = reshape_ndarray(ioffsets,(self.factored_size,nactx))
+		ioffsets_factored = reshape_ndarray(ioffsets_factored,(self.factored_size,nactx)) if ioffsets_factored else ioffsets
 
-		self.offsets = reshape_field(offsets,(self.factored_size,nactx),ti.lang.matrix.VectorType(ndim,offsets.dtype))
+		self.offsets = reshape_ndarray(offsets,(self.factored_size,nactx),ti.lang.matrix.VectorType(ndim,offsets.dtype))
 		self.ioffsets = ioffsets # Offsets converted to integer
-		self.voffsets = reshape_field(voffsets,(self.size,)) # Visibility mask
-		self.weights = reshape_field(weights,(self.factored_size,nactx))
-		self.values = ti.field(dtype=self.float_t,shape=self.size); self.values.fill(np.inf)
-		self.costs = reshape_field(costs,(self.size,))
+		self.voffsets = reshape_ndarray(voffsets,(self.size,)) # Visibility mask
+		self.weights = reshape_ndarray(weights,(self.factored_size,nactx))
+		self.values = ti.ndarray(dtype=self.float_t,shape=self.size); self.values.fill(np.inf)
+		self.costs = reshape_ndarray(costs,(self.size,))
 
 		# ---- Compute the reversed offsets. Only needed for FMM. -----
 		pq = CappedQueue.priority_queue(ti.i32,ti.i32,capacity=self.factored_size*ntotx)
-		roffsets = ti.field(dtype=ti.i32,shape=self.factored_size*ntotx) 
-		boffsets = ti.field(dtype=ti.i32,shape=self.factored_size+1); boffsets[0]=0
 		@ti.kernel
-		def set_roffsets():
-			factored_size = ti.static(self.factored_size)
+		def set_roffsets(ioffsets:arr_t,ioffsets_factored:arr_t, # IN
+				   roffsets:arr_t,boffsets:arr_t): # OUT
+			if ti.static(ti_debug()): compiling[None]=0 # set_roffsets
 			for _ in range(1): # Sequential code
-				for x in ti.ndrange(factored_size):
+				for x in range(self.factored_size):
 					bact = 0
 					btot = 0
 					for mix in ti.static(range(nmix)):
@@ -189,7 +214,7 @@ class _Algo:
 					if pq.top()[0]>0: pq.pop()
 					else: break
 				boffset=0
-				for x in range(factored_size):
+				for x in range(self.factored_size):
 					# while (not pq.empty()) and pq.top()[0]==-x: # Fails : no early branch in while
 					while not pq.empty():
 						if pq.top()[0]!=-x: break
@@ -197,43 +222,62 @@ class _Algo:
 						pq.pop()
 						boffset+=1
 					boffsets[x+1]=boffset
-		set_roffsets()
-		self._roffsets = roffsets # Reversed offsets of all points, concatenated
-		self.boffsets = boffsets # Start and stop of reversed offsets for any given point
-		boff_np = boffsets.to_numpy()
-		self.roffsets_max = np.max(boff_np[1:]-boff_np[:-1]) # Maximum number of reversed offests
+		# Reversed offsets of all points, concatenated
+		self.roffsets = ti.ndarray(dtype=ti.i32,shape=self.factored_size*ntotx) 
+		# Start and stop of reversed offsets for any given point
+		self.boffsets = ti.ndarray(dtype=ti.i32,shape=self.factored_size+1); self.boffsets[0]=0
+		set_roffsets(ioffsets,ioffsets_factored,self.roffsets,self.boffsets)
+
+		# The next three lines set the constant roffsets_max (Maximum number of reversed offests)
+		boff_np = self.boffsets.to_numpy() 
+		self._sizes[3] = np.max(boff_np[1:]-boff_np[:-1]) # = self.roffsets_max
 		boff_np = None
 
-	# Domain dimensions
-	# TODO : for now, these are python functions, which means that taichi will recompile if they change.
-	# Turn shape,size,factored_size,factored_div into pyfuncs ? 
+		self.self_ti_t = _Algo_ti_t # argpack gathering all ndarrays
+		self.self_ti = _Algo_ti_t(self.weights,self.offsets,self.values,self.costs,self.walls,
+							   self.ioffsets,self.voffsets,self.roffsets,self.boffsets)
+		
+
+	# The following quantities are compile time constants
 	@property
-	def shape(self): return self._shape
+	def float_t(self): return self.Traits.float_t
 	@property
-	def size(self): return np.prod(self.shape)
-	@property
-	def ndim(self): return len(self.shape)
+	def ndim(self): return self.shape.n
 	@property
 	def periodic(self):
 		"""Wether periodic boundary conditions apply"""
 		return self.Traits.periodic_axis is not None
-	@property
-	def float_t(self): return self.Traits.float_t
-
-	# Factored dimension, used when the stencil is shared between points
-	@property
+	@property # Factored dimension, used when the stencil is shared between points
 	def factored_start(self): return self._factored_start
 	@property
 	def factored_stop(self):  return self._factored_stop
 	@property
-	def factored(self): return self.factored_start!=0 or self.factored_stop!=self.ndim
+	def factored(self): 
+		"""Wether the weights and offsets are broadcasted"""
+		return self.factored_start!=0 or self.factored_stop!=self.ndim
+
+	# The following quantities can change without triggering a kernel recompilation
 	@property
-	def factored_size(self): return np.prod(self.shape[self.factored_start:self.factored_stop],dtype=int)
+	@ti.pyfunc
+	def shape(self): return self._shape[None]
 	@property
-	def factored_div(self): return np.prod(self.shape[self.factored_stop:],dtype=int)
+	@ti.pyfunc
+	def size(self): return self._sizes[0]
+	@property
+	@ti.pyfunc
+	def factored_size(self): return self._sizes[1]
+	@property
+	@ti.pyfunc
+	def factored_div(self): return self._sizes[2]
+	@property
+	@ti.pyfunc
+	def roffsets_max(self): return self._sizes[3]
+	@property
+	@ti.pyfunc
+	def nper(self): return self._sizes[4]
 
 	@ti.pyfunc
-	def ix2x(self,ix):
+	def ix2x(self, ix):
 		"""Convert an index to a discrete point"""
 		assert 0<=ix and ix<self.size
 		x = self.Traits.ivec_t(0)
@@ -244,9 +288,9 @@ class _Algo:
 		return x
 	
 	@ti.pyfunc
-	def x2ix(self,x):
+	def x2ix(self, x):
 		"""Convert a discrete point to an index"""
-		if not self.indomain(x): print("x2ix",x)
+		if ti.static(ti_debug()) and not self.indomain(x): print("x2ix out of domain : ",x)
 		assert self.indomain(x)
 		ix = x[0]
 		for i in ti.static(range(1,self.ndim)):
@@ -254,12 +298,12 @@ class _Algo:
 		return ix
 
 	@ti.pyfunc
-	def indomain(self,x):
+	def indomain(self, x):
 		"""Wether the point x lies in the domain"""
 		return all(x>=0) and all(x<self.shape)
 
 	@ti.pyfunc
-	def visible(self,x,e):
+	def visible(self, x, e, walls:tpl_t):
 		"""
 		Check that the path [x,x+e] is contained within the domain
 		- x (ivec) : position 
@@ -277,11 +321,11 @@ class _Algo:
 					for i in range(self.ndim): f[i] = div_round_closest(k*E[i],linf_e)
 					if not self.indomain(x+f):
 						print("visible",x,e,k,linf_e,f,x+e,x+f)
-					if self.walls[self.x2ix(x+f)]==ti.static(wall_code['wall']): visible=False #; break
+					if walls[self.x2ix(x+f)]==ti.static(wall_code['wall']): visible=False #; break
 		return visible
 
 	@ti.pyfunc
-	def factored_index(self,ix):
+	def factored_index(self, ix):
 		"""
 		Returns the index in the factored shape (for access to weights, offsets)
 		"""
@@ -290,7 +334,7 @@ class _Algo:
 		return ix
 	
 	@ti.pyfunc
-	def rneigh(self,ix,callback:ti.template(),arg:ti.template()):
+	def rneigh(self, self_ti:tpl_t, ix, callback:tpl_t, arg:tpl_t):
 		"""
 		Enumerate the reverse neighbors of x.
 		- ix : index of x
@@ -298,60 +342,66 @@ class _Algo:
 		"""
 		assert 0<=ix<self.size, "Out of domain ix in rneigh"
 		fx = self.factored_index(ix)
-		begin = self.boffsets[fx] 
-		end = self.boffsets[fx+1]
+		begin = self_ti.boffsets[fx] 
+		end = self_ti.boffsets[fx+1]
 		for i in range(begin,end): 
-			iy = ix - self._roffsets[i]
+			iy = ix - self_ti.roffsets[i]
 			if 0<=iy<self.size: # If the offsets are factored, we may get out of domain values
 				if ti.static(self.periodic): # Replace dummy periodic neighbor with normal neighbor
-					wall = self.walls[iy]
+					wall = self_ti.walls[iy]
 					if wall==ti.static(wall_code['dummy +nper']):iy+=self.nper
 					if wall==ti.static(wall_code['dummy -nper']):iy-=self.nper
 				callback(ix,iy,arg)
 
 	@ti.pyfunc
-	def set_seed(self,ix,value):
+	def set_seed(self, self_ti, ix, value):
 		"""
 		Set a seed, with the given value. 
+		- ix : linear index of the grid position
+		- value : seed value for front propagation initialization
 		Note : seeds_capacity is fixed at construction
 		"""
-		values,walls,nper = ti.static(self.values,self.walls,self.nper)
+		#values,walls = ti.static(self_ti.values,self_ti.walls) # Does not work in ti.pyfunc
 		assert 0<=ix<self.size
 		assert self.seeds.size() < self.seeds.capacity()-3
-		if (wall:=walls[ix])<=0: # Positive wall[ix] => immutable values[ix]. 
+		if (wall:=self_ti.walls[ix])<=0: # Positive wall[ix] => immutable values[ix]. 
 			# One cannot insert a see if wall>0. We silently fail, in view of spreadseeds.
-			values[ix] = value
+			self_ti.values[ix] = value
 			self.seeds.push(ix)
-			walls[ix] = wall_code['seed']
+			self_ti.walls[ix] = wall_code['seed']
 			if ti.static(self.periodic): # Create dummy seeds in padding region
+				nper = self.nper
 				if wall == wall_code['normal +nper']:
-					values[ix+nper] = value
-					walls[ ix+nper] = wall_code['dummy seed']
+					self_ti.values[ix+nper] = value
+					self_ti.walls[ ix+nper] = wall_code['dummy seed']
 				if wall == wall_code['normal -nper']:
-					values[ix-nper] = value
-					walls[ ix-nper] = wall_code['dummy seed']
+					self_ti.values[ix-nper] = value
+					self_ti.walls[ ix-nper] = wall_code['dummy seed']
 
 	@ti.pyfunc
-	def set_value(self,ix,value):
-		"""Set a distance map value. Usually called internally. Returns true if success."""
-		values,nper = ti.static(self.values,self.nper)
-		wall = self.walls[ix]
+	def set_value(self, self_ti:tpl_t, ix, value):
+		"""
+		Set a distance map value. Usually called internally. Returns true if success.
+		"""
+		values = ti.static(self_ti.values)
+		wall = self_ti.walls[ix]
 		is_mutable = wall<=0
 		if is_mutable:
 			# Save at the position, and possibly duplicate places in case of periodicity
 			values[ix] = value
 			if ti.static(self.periodic):
+				nper = self.nper
 				if wall==ti.static(wall_code['normal -nper']): values[ix-nper]=value
 				if wall==ti.static(wall_code['normal +nper']): values[ix+nper]=value
 		return is_mutable
 
 	@ti.pyfunc
-	def update(self,ix,ret_mix:ti.template()=False):
+	def update(self, self_ti:tpl_t, ix, ret_mix:tpl_t=False):
 		"""Compute the HFM update value at ix. (no side effect)"""
 		nmix,nrev,nfwd,nact,mix_is_min = ti.static(self.Traits.nmix,self.Traits.nrev,
 											self.Traits.nfwd,self.Traits.nact,self.Traits.mix_is_min)
-		ioffsets,values,weights = ti.static(self.ioffsets,self.values,self.weights)
-		voffset = self.voffsets[ix]
+		ioffsets,values,weights = ti.static(self_ti.ioffsets,self_ti.values,self_ti.weights)
+		voffset = self_ti.voffsets[ix]
 		bact = 0
 		btot = 0
 		fx = self.factored_index(ix)
@@ -370,7 +420,7 @@ class _Algo:
 				btot+=1; bact+=1
 			# Solve the piecewise quadratic equation, to find the update value
 			ivals = Sort.argsort(vals)
-			cost = self.costs[ix]
+			cost = self_ti.costs[ix]
 
 			λ0 = vals[ivals[0]]
 			updt = np.inf
@@ -418,7 +468,7 @@ class _Algo:
 		else: return updtx
 
 	@ti.pyfunc
-	def flow(self,ix):
+	def flow(self, self_ti:tpl_t, ix):
 		"""
 		Geodesic flow vector, adimensionized, extracted from the scheme.
 		(Prefer the user facing Domain.flow)
@@ -428,12 +478,12 @@ class _Algo:
 		 - the average value of the finite differences used 
 		"""
 		nrev,nfwd,nact,ntot = ti.static(self.Traits.nrev,self.Traits.nfwd,self.Traits.nact,self.Traits.ntot)
-		values,ioffsets,offsets,weights = ti.static(self.values,self.ioffsets,self.offsets,self.weights)
+		values,ioffsets,offsets,weights = ti.static(self_ti.values,self_ti.ioffsets,self_ti.offsets,self_ti.weights)
 		# Note that self.update(ix) == self.values[ix] after solver is run, except at seed points
-		λ,mix = self.update(ix,ret_mix=True) 
-		λ = min(λ,self.values[ix]) # Get null gradient at the seed center
+		λ,mix = self.update(self_ti, ix, ret_mix=True) 
+		λ = min(λ,values[ix]) # Get null gradient at the seed center
 		bact = mix*nact; btot = mix*ntot
-		voffset = self.voffsets[ix]
+		voffset = self_ti.voffsets[ix]
 		fx = self.factored_index(ix)
 		flow = self.Traits.vec_t(0.)
 		wsum : self.float_t = 0.
@@ -472,40 +522,47 @@ class _Algo:
 		seeds = self.seeds
 		# Hard to predict the max number of items in pq, so using variable capacity
 		pq = Queue.priority_queue.init(self.float_t,self.Traits.int_t,capacity=
-							max(200+seeds.size(),self.size//np.max(self.shape)))
-		frozen = ti.field(dtype=ti.i8,shape=self.size)
+							max(200+seeds.size(),self.size//np.max(tuple(self.shape))))
+		frozen = ti.ndarray(dtype=ti.i8,shape=self.size)
 		frozen.from_numpy(self.walls.to_numpy()>0) # Non mutable points are already frozen
 		stop = ti.field(dtype=ti.i32,shape=()); stop.fill(0) # True if stopping criterion is active
+		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
+
+		pack_t = ti.types.argpack(algo=self.self_ti_t, pq=pq.argtype, frozen=arr_t)
+		pack = pack_t(self.self_ti,pq,frozen)
 
 		@ti.kernel # Set the seeds
-		def set_seeds(self_pq:pq.argtype):
+		def set_seeds(pack:pack_t):
+			if ti.static(ti_debug()): compiling[None]=0 # set_roffsets
+			#values = ti.static(pack.algo.values) # Fails. Rename needed (vals, _values, ...) ???
 			for _ in range(1):
 				while not seeds.empty():
 					seed = seeds.top(); seeds.pop()
-					pq.push(self_pq,-self.values[seed],seed)
-					frozen[seed] = ti.i8(False) # We want to see the seeds once
-		set_seeds(pq)
+					pq.push(pack.pq,-pack.algo.values[seed],seed)
+					pack.frozen[seed] = ti.i8(False) # We want to see the seeds once
+		set_seeds(pack)
 
 		@ti.func # Update neighbors of last frozen point in FMM
-		def FMM_update_and_push(ix,iy,self_pq:ti.template()):
-			if not frozen[iy]:
-				self.set_value(iy,self.update(iy))
-				pq.push(self_pq,-self.values[iy],iy)
+		def FMM_update_and_push(ix, iy, pack:tpl_t):
+			if not pack.frozen[iy]:
+				self.set_value(pack.algo, iy,self.update(pack.algo, iy))
+				pq.push(pack.pq, -pack.algo.values[iy],iy)
 
 		@ti.kernel
-		def FMM(self_pq:pq.argtype): # Early stop if queue capacity is exceeded
+		def FMM(pack:pack_t): # Early stop if queue capacity is exceeded
+			if ti.static(ti_debug()): compiling[None]=0 # set_roffsets
 			for _ in range(1):
-				maxsize = pq.capacity(self_pq)-self.roffsets_max
-				while not pq.empty(self_pq) and pq.size(self_pq)<maxsize:
-					mval,ix = pq.top(self_pq) # mval = -values[ix] at insertion
-					pq.pop(self_pq)
-					if frozen[ix]: continue # Outdated seed value # Note m self.values[ix]!=-mval is an invalid test
-					frozen[ix] = ti.i8(True)
+				maxsize = pq.capacity(pack.pq)-self.roffsets_max
+				while not pq.empty(pack.pq) and pq.size(pack.pq)<maxsize:
+					mval,ix = pq.top(pack.pq) # mval = -values[ix] at insertion
+					pq.pop(pack.pq)
+					if pack.frozen[ix]: continue # Outdated seed value # Note m self.values[ix]!=-mval is an invalid test
+					pack.frozen[ix] = ti.i8(True)
 					if ti.static(stopping_criterion!=None): # Optional stopping criterion
-						stop[None] = stopping_criterion(ix)
+						stop[None] = stopping_criterion(pack.algo,ix)
 						if stop[None]: break
-					self.rneigh(ix,FMM_update_and_push,self_pq)
-		FMM(pq)
+					self.rneigh(pack.algo, ix, FMM_update_and_push, pack)
+		FMM(pack)
 		while not pq.empty(pq) and not stop[None]: 
 			pq = pq.with_capacity(pq) # Double the capacity
 			FMM(pq)
@@ -519,36 +576,42 @@ class _Algo:
 		if nitermax is None: nitermax=5*max(self.shape)*self.size
 		seeds = self.seeds
 		# We now that each index can appear at most once in fifo
-		fifo = CappedQueue.fifo(self.Traits.int_t,capacity=self.size)
-		infifo = ti.field(dtype=ti.i8,shape=self.values.shape) 
+		fifo = Queue.fifo.init(self.Traits.int_t, capacity=self.size)
+		infifo = ti.ndarray(dtype=ti.i8, shape=self.size)
 		infifo.from_numpy(self.walls.to_numpy()>0) # Non mutable points cannot enter the queue
 
+		pack_t = ti.types.argpack(algo=self.self_ti_t, fifo=fifo.argtype, infifo=arr_t)
+		pack = pack_t(self.self_ti, fifo, infifo)
+		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
+
 		@ti.func
-		def push_neighbors(ix,iy,_):
-			if not infifo[iy]: fifo.push(iy); infifo[iy]=True
+		def push_neighbors(ix,iy,pack:tpl_t):
+			if not pack.infifo[iy]: fifo.push(pack.fifo,iy); pack.infifo[iy]=True
 
 		@ti.kernel # The AGSI requires inserting the neighbors of all seeds
-		def set_seeds(): 
+		def set_seeds(pack:pack_t): 
+			if ti.static(ti_debug()): compiling[None]=0 # set_seeds
 			for _ in range(1):
 				while not seeds.empty(): 
 					seed = seeds.top(); seeds.pop()
-					self.rneigh(seed,push_neighbors,None)
-		set_seeds()
+					self.rneigh(pack.algo,seed,push_neighbors,pack)
+		set_seeds(pack)
 
 		niter = ti.field(dtype=ti.i64,shape=()); niter.fill(0)
 		@ti.kernel
-		def AGSI(): # Early stop if queue capacity is exceeded
+		def AGSI(pack:pack_t,nitermax:ti.i64):
+			if ti.static(ti_debug()): compiling[None]=0 # AGSI
 			for _ in range(1):
-				while not fifo.empty() and niter[None]<nitermax:
-					ix = fifo.front()
-					fifo.pop()
-					infifo[ix] = False
-					value = self.update(ix)
+				while not fifo.empty(pack.fifo) and niter[None]<nitermax:
+					ix = fifo.front(pack.fifo)
+					fifo.pop(pack.fifo)
+					pack.infifo[ix] = False
+					value = self.update(pack.algo,ix)
 					niter[None]+=1
-					if value>=self.values[ix]-tol: continue
-					self.set_value(ix,value)
-					self.rneigh(ix,push_neighbors,None)
-		AGSI()
+					if value>=pack.algo.values[ix]-tol: continue
+					self.set_value(pack.algo, ix, value)
+					self.rneigh(pack.algo, ix, push_neighbors, pack)
+		AGSI(pack,nitermax)
 		if niter[None]>=nitermax: 
 			print(f"AGSI completed niter={niter[None]} iterations, without reaching tolerance {tol=}")
 		return niter[None]
@@ -560,30 +623,37 @@ class _Algo:
 		- return : number of sweeps
 		"""
 		if nitermax is None: nitermax=5*max(self.shape)
-		cache = ti.field(self.float_t,self.size)
+		cache = ti.ndarray(self.float_t,self.size)
 		updated = ti.field(dtype=ti.i32,shape=())
+
+		pack_t = ti.types.argpack(algo=self.self_ti_t, cache=arr_t)
+		pack = pack_t(self.self_ti,cache)
+		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
+
 		@ti.kernel
-		def SweepingUpdate(i:ti.template(),n_i:self.Traits.int_t,shape_i:ti.template()):
+		def SweepingUpdate(pack:pack_t, i:ti.template(), n_i:self.Traits.int_t, 
+					 shape_i:self.Traits.ivec_t, tol:self.float_t):
+			if ti.static(ti_debug()): compiling[None]=0 # SweepingUpdate
 			for x in ti.grouped(ti.ndrange(*shape_i)): # Get all indices associated with slice n_i along axis i
 				x[i] = n_i
 				ix = self.x2ix(x)
-				if self.walls[ix]<=0:
-					value=self.update(ix)
-					if value<self.values[ix]-tol: updated[None]=True # Test for termination
+				if pack.algo.walls[ix]<=0:
+					value=self.update(pack.algo, ix)
+					if value<pack.algo.values[ix]-tol: updated[None]=True # Test for termination
 					if ti.static(deterministic): cache[ix] = value
-					else: self.set_value(ix,value)
+					else: self.set_value(pack.algo, ix,value)
 			for x in ti.grouped(ti.ndrange(*shape_i)):
 				if ti.static(deterministic): 
 					x[i] = n_i
 					ix = self.x2ix(x) 
-					self.set_value(ix,cache[ix])
-		shape = self.shape
+					self.set_value(pack.algo, ix, pack.cache[ix])
+		shape = tuple(self.shape)
 		shape_ = [shape[:i]+(1,)+shape[i+1:] for i in range(self.ndim)]
 		for niter in range(nitermax):
 			updated[None]=False
 			for i,shape_i in enumerate(shape_):
-				for n_i in range(shape[i]):           SweepingUpdate(i,n_i,shape_i)
-				for n_i in reversed(range(shape[i])): SweepingUpdate(i,n_i,shape_i)
+				for n_i in range(shape[i]):           SweepingUpdate(pack, i, n_i, shape_i, tol)
+				for n_i in reversed(range(shape[i])): SweepingUpdate(pack, i, n_i, shape_i, tol)
 			if not updated[None]: break
 		else: print(f"Fast Sweeping completed {niter=} iterations, without reaching tolerance {tol=}")
 		return niter # Multiply by 2*ndim*size to get number of elementary updates
@@ -594,18 +664,24 @@ class _Algo:
 		PARALLEL, embarrasingly
 		"""
 		if nitermax is None: nitermax=5*max(self.shape)
-		cache = ti.field(self.float_t,self.size)
+		cache = ti.ndarray(self.float_t,self.size)
 		updated = ti.field(dtype=ti.i8,shape=())
+
+		pack_t = ti.types.argpack(algo=self.self_ti_t, cache=arr_t)
+		pack = pack_t(self.self_ti, cache)
+		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
+
 		@ti.kernel
-		def GlobalUpdate():
+		def GlobalUpdate(pack:pack_t, tol:self.float_t):
+			if ti.static(ti_debug()): compiling[None]=0 # GlobalUpdate
 			updated[None] = False
 			for ix in range(self.size): 
-				if self.walls[ix]<=0: # Compute update at each mutable points
-					cache[ix]=self.update(ix)
-					if cache[ix]<=self.values[ix]-tol: updated[None]=True # Test for termination
-			for ix in range(self.size): self.set_value(ix,cache[ix]) # Copy updates
+				if pack.algo.walls[ix]<=0: # Compute update at each mutable points
+					pack.cache[ix]=self.update(pack.algo, ix)
+					if pack.cache[ix] <= pack.algo.values[ix]-tol: updated[None]=True # Test for termination
+			for ix in range(self.size): self.set_value(pack.algo, ix, pack.cache[ix]) # Copy updates
 		for niter in range(nitermax):
-			GlobalUpdate()
+			GlobalUpdate(pack, tol)
 			if not updated[None]: break
 		else: print(f'Global iteration completed {nitermax=} iterations, without reaching tolerance {tol=}')
 		return niter # Multiply by size to get number of elementary updates
@@ -625,10 +701,14 @@ class Domain:
 		self.metric = metric
 
 		Traits = self.Traits
-		self.h = Traits.vec_t( [ (b[1]-b[0])/s for b,s in zip(bounds,self.shape) ] )
-		self.ih = 1/self.h
-		self.origin = Traits.vec_t([b[0]+h/2 for b,h in zip(bounds,self.h)]) # ! Take periodicity into account
-		if (per_ax:=self.periodic_axis) is not None: self.origin[per_ax] -= self.h[per_ax]/2
+		self._h = ti.field(Traits.vec_t, tuple()) # Gridscale
+		self._h[None] = Traits.vec_t( [ (b[1]-b[0])/s for b,s in zip(bounds,self.shape) ] ) 
+		self._ih = ti.field(Traits.vec_t, tuple()) # Inverse gridscale
+		self._ih[None] = 1/self.h
+		self._origin = ti.field(Traits.vec_t, tuple()) # Domain origin
+		self._origin[None] = Traits.vec_t([b[0]+h/2 for b,h in zip(bounds,self.h)]) # ! Takes periodicity into account
+		if (per_ax:=self.periodic_axis) is not None: self._origin[None][per_ax] -= self.h[per_ax]/2
+
 
 
 	def sgrid(self):
@@ -649,74 +729,57 @@ class Domain:
 		"""
 		Traits = self.Traits
 		# Broadcast the data appropriately
-		data,datatype = self.metric.set_defaults(self.sgrid(),**kwargs)
-		#datashapes = [a.shape for a in data if a.shape!=tuple()]
+		data,data_t = self.metric.set_defaults(self.sgrid(),**kwargs)
 		datashapes = [val.shape for key,val in data.items if val.shape!=tuple()]
 		bshape = (1,)*Traits.ndim if len(datashapes)==0 else tuple(np.max(datashapes,axis=0))
+		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
 
-		# TODO : would make more sense to have costs and walls as ti.ndarray (for easy input)
 		if costs is None: costs = ti.ndarray(Traits.float_t,self.shape); costs.fill(1)
 		if walls is None: walls = ti.ndarray(Traits.wall_t,self.shape); walls.fill(0)
 
 		# Generate the weights and offsets
+		@ti.kernel
+		def decomp(ih:Traits.vec_t,weights:arr_t,offsets:arr_t,data:data_t):
+			if ti.static(ti_debug()): compiling[None]=0 # decomp
+			for x in ti.grouped(ti.ndrange(*weights.shape[:-1])):
+				self.metric.hfm_scheme(x,ih,weights,offsets,data)
 		weights = ti.ndarray(Traits.float_t,shape=bshape+(Traits.nactx,))
 		offsets = ti.Vector.ndarray(Traits.ndim,self.offset_t,shape=weights.shape)
+		decomp(self.ih,weights,offsets,data)
 
-		@ti.kernel
-		def decomp(weights:ti.types.ndarray(),offsets:ti.types.ndarray(),data:datatype):
-			#dcosts:ti.types.ndarray()):
-			for x in ti.grouped(ti.ndrange(*bshape)):
-				self.metric.hfm_scheme(x,self.ih,weights,offsets,data)
-
-		#dcosts = data[0]
-		#print(dcosts,dcosts.shape)
-		#return
-		decomp(weights,offsets,data)
-		return 
-
-		@ti.kernel
-		def decomp():
-			for x in ti.grouped(ti.ndrange(*bshape)):
-				self.metric.hfm_scheme(x,self.ih,weights,offsets,*data)
-		decomp()
-		# print(offsets.to_numpy()[0,0,16]) 
-		# print(weights.to_numpy()[0,0,16]) 
-		# print(offsets.shape)
-
-		return
-		
 		if not self.periodic: self.Algo = _Algo(costs,weights,offsets,Traits,walls,0,seeds_capacity)
 		else:  # Padding the weights and offsets with zeros in the periodic case
 			per_ax = self.periodic_axis
 			self.periodic_pad = np.max(np.abs(offsets.to_numpy()[...,per_ax]))
 			per_pad = self.periodic_pad
-			#print(f"{per_pad=}")
 			if bshape[per_ax]>1:
 				bshape_pad = list(bshape)
 				bshape_pad[per_ax] += 2*per_pad
 				bshape_pad = tuple(bshape_pad)
-				weights_pad = ti.field(Traits.float_t,shape=bshape_pad + (Traits.nactx,))
-				offsets_pad = ti.Vector.field(Traits.ndim,Traits.offset_t,shape=weights_pad.shape)
+				weights_pad = ti.ndarray(Traits.float_t,shape=bshape_pad + (Traits.nactx,))
+				offsets_pad = ti.Vector.ndarray(Traits.ndim,Traits.offset_t,shape=weights_pad.shape)
 				weights_pad.fill(0); offsets_pad.fill(0)
-				#print(f"{bshape_pad=}")
 				@ti.kernel
-				def scheme_pad():
+				def scheme_pad(weights:arr_t,offsets:arr_t, # IN
+				   weights_pad:arr_t,offsets_pad:arr_t): # OUT
 					for x in ti.grouped(weights):
 						y = x; y[per_ax] += per_pad
 						weights_pad[y] = weights[x]
 						offsets_pad[y] = offsets[x]
-				scheme_pad()
+				scheme_pad(weights,offsets,weights_pad,offsets_pad)
 			else: weights_pad=weights; offsets_pad=offsets
 
 			shape_pad = list(self.shape)
 			shape_pad[per_ax] += 2*per_pad
 			self.shape_pad = tuple(shape_pad)
 			wall_t = Traits.wall_t
-			costs_pad = ti.field(Traits.float_t,shape_pad)
-			walls_pad = ti.field(wall_t,shape_pad)
+			costs_pad = ti.ndarray(Traits.float_t,shape_pad)
+			walls_pad = ti.ndarray(wall_t,shape_pad)
 			wc = wall_code
 			@ti.kernel
-			def coef_pad():
+			def coef_pad(costs:arr_t,walls:arr_t, # IN
+				costs_pad:arr_t, walls_pad:arr_t): # OUT 
+				if ti.static(ti_debug()): compiling[None]=0 # coef_pad
 				for x in ti.grouped(costs_pad):
 					y = x; y[per_ax]-=per_pad
 					if 0 <= y[per_ax] < self.shape[per_ax]: costs_pad[x] = costs[y]
@@ -732,9 +795,13 @@ class Domain:
 						if walls[y]==wc['normal']: walls_pad[x]=wall_t(wc['normal -nper']); walls_pad[xper]=wall_t(wc['dummy +nper'])
 						elif walls[y]==wc['wall']: walls_pad[x]=wall_t(wc['wall']);         walls_pad[xper]=wall_t(wc['wall'])
 					else: walls_pad[x]=walls[y]
-			coef_pad()
+			coef_pad(costs,walls,costs_pad,walls_pad)
 			nper=np.prod(self.shape[per_ax:])
 			self.Algo = _Algo(costs_pad,weights_pad,offsets_pad,Traits,walls_pad,nper,seeds_capacity)
+
+		# Type and argument for ti.kernel
+		self.self_ti_t = self.Algo.self_ti_t
+		self.self_ti = self.Algo.self_ti
 
 	@property
 	def Traits(self): return self.metric.HFMTraits
@@ -745,10 +812,20 @@ class Domain:
 	@property
 	def periodic(self): return self.periodic_axis is not None
 
+	@property
+	@ti.pyfunc
+	def h(self): return self._h[None]
+	@property
+	@ti.pyfunc
+	def ih(self): return self._ih[None]
+	@property
+	@ti.pyfunc
+	def origin(self): return self._origin[None]
+
 	@ti.pyfunc
 	def IndexFromPoint(self,point): return (point-self.origin)*self.ih
 	@ti.pyfunc
-	def PointFromIndex(self,index,to:ti.template()=False):
+	def PointFromIndex(self,index,to:tpl_t=False):
 		if ti.static(to): return self.IndexFromPoint(index)
 		return index*self.h+self.origin
 	@ti.func
@@ -784,13 +861,13 @@ class Domain:
 			return values
 
 	@ti.pyfunc
-	def set_seed(self,point,value=0):
+	def set_seed(self,self_ti,point,value=0):
 		index = self.IndexFromPoint(point)
 		x = Linalg.cast_vec(ti.round(index),self.Traits.ivec_t)
-		self.Algo.set_seed(self.Algo.x2ix(x),value)
+		self.Algo.set_seed(self_ti,self.Algo.x2ix(x),value)
 	
 	@ti.pyfunc
-	def spread_seed(self,point,norm:ti.template(),radius=1.5,value=0):
+	def spread_seed(self,self_ti,point,norm:tpl_t,radius=1.5,value=0):
 		"""
 		Sets several seed points for the eikonal equation
 		- point : seed position
@@ -809,12 +886,13 @@ class Domain:
 				y[self.periodic_axis] = y[self.periodic_axis]%self.shape[self.periodic_axis]
 				y[self.periodic_axis] += self.periodic_pad
 			iy = self.Algo.x2ix(y)
-			self.Algo.set_seed(iy,val)
+			self.Algo.set_seed(self_ti,iy,val)
 	
 	@ti.pyfunc
-	def flow(self,x,adim:ti.template()=False):
+	def flow(self, self_ti:tpl_t, x, adim:tpl_t=False):
 		"""
 		Returns the geodesic flow vector at the given index
+		- self_ti : must be self.self_ti
 		- x : index, with integer coordinates
 		- adim : if true, the adimensionized flow is returned (true_flow = adim_flow * h)
 		Output :  
@@ -822,45 +900,52 @@ class Domain:
 		- diff : the averaged value of the finite differences used to compute the flow
 		"""
 		if ti.static(self.periodic): x[self.periodic_axis]+=self.periodic_pad # Note : may erase x in python mode
-		flow,diff = self.Algo.flow(self.Algo.x2ix(x)) # The algorithm returns the adimensionized flow
+		flow,diff = self.Algo.flow(self_ti,self.Algo.x2ix(x)) # The algorithm returns the adimensionized flow
 		return ti.select(ti.static(adim),flow,flow*self.h),diff
 
-	def flows(self,adim:ti.template()=False):
+	def flows(self,adim:tpl_t=False):
 		"""Returns the geodesic flow field"""
-		flows = ti.field(self.Traits.vec_t,  self.shape)
-		diffs = ti.field(self.Traits.float_t,self.shape)
+		flows = ti.ndarray(self.Traits.vec_t,  self.shape)
+		diffs = ti.ndarray(self.Traits.float_t,self.shape)
+		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
 		@ti.kernel
-		def evalflows():
-			for x in ti.grouped(flows): flows[x],diffs[x] = self.flow(x,adim)
-		evalflows()
+		def evalflows(self_ti:self.self_ti_t, flows:arr_t, diffs:arr_t):
+			if ti.static(ti_debug()): compiling[None]=0 # evalflows
+			for x in ti.grouped(flows): flows[x],diffs[x] = self.flow(self_ti,x,adim)
+		evalflows(self.self_ti, flows, diffs)
 		return flows,diffs
 	
 	def seeds_distL1(self,maxL1=7):
-		"L1 distance to the seeds, up to maxL1. Used for PastSeed backtracking stopping criterion."
+		"""
+		L1 distance to the seeds, up to maxL1. Used for PastSeed backtracking stopping criterion."
+		"""
 		walls = self.Algo.walls.to_numpy().reshape(self.Algo.shape)
 		if self.periodic: walls = walls[
 			(slice(None),)*self.periodic_axis+(slice(self.periodic_pad,-self.periodic_pad),)]
-		distL1=ti.field(ti.i8,self.shape)
+		distL1=ti.ndarray(ti.i8,self.shape)
 		distL1.from_numpy((maxL1+1)*(walls!=wall_code['seed']))
-		@ti.kernel
-		def globaliter():
+		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
+
+		@ti.kernel # TODO : propagation should be blocked by walls
+		def GlobalIterL1(distL1:arr_t,shape:self.Traits.ivec_t):
+			if ti.static(ti_debug()): compiling[None]=0 # GlobalIterL1
 			for x in ti.grouped(distL1):
 				for i in ti.static(range(self.Traits.ndim)):
 					y = x; y[i]+=1; 
-					if ti.static(self.periodic) and self.periodic_axis==i and y[i]==self.shape[i]: y[i]=0
-					# Taichi 1.7.4 compiler bug : min of ti.i8 variables not supported
-					if y[i]<self.shape[i]:  distL1[x] = min(distL1[x],1+distL1[y]) 
+					if ti.static(self.periodic) and self.periodic_axis==i and y[i]==shape[i]: y[i]=0
+					# Taichi 1.7.4 compiler bug, on macOS : min of ti.i8 variables not supported
+					if y[i]<shape[i]:  distL1[x] = min(distL1[x],1+distL1[y]) 
 					y = x; y[i]-=1; 
-					if ti.static(self.periodic) and self.periodic_axis==i and y[i]==-1: y[i]=self.shape[i]-1
+					if ti.static(self.periodic) and self.periodic_axis==i and y[i]==-1: y[i]=shape[i]-1
 					if y[i]>=0:  distL1[x] = min(distL1[x],1+distL1[y])
-		for k in range(maxL1): globaliter()
+		for k in range(maxL1): GlobalIterL1(distL1,self.shape)
 		return distL1
 	
 	def ode(self):
 		"""Returns the geodesic ODE solver based on the scheme data"""
 		periodic = [False]*self.Traits.ndim
 		if self.periodic: periodic[self.periodic_axis]=True
-		return GeodesicODE(self.seeds_distL1(),self.values(),*self.flows(adim=True),tuple(periodic),self.PointFromIndex)
+		return GeodesicODE(self.seeds_distL1(),self.values(True),*self.flows(adim=True),tuple(periodic),self.PointFromIndex)
 
 
 
@@ -877,7 +962,6 @@ geodesic_code = {
 	'OutOfDomain' :       6, # Error : Backtracking left the domain
 }
 geodesic_rcode = dict(zip(geodesic_code.values(),geodesic_code.keys()))
-
 
 
 @ti.data_oriented
@@ -903,14 +987,29 @@ class GeodesicODE:
 		assert len(self.shape) == self.ndim
 
 		self.periodic = periodic
-		self.geodesicStep = 0.25    # How much to advance at each step
-		self.weightThreshold = 0.5/2**self.ndim  # Used in interpolation pruning
-		self.causalityTolerance = 4
+		self._params = ti.field(self.float_t,3)
+		self._params.from_numpy(np.array((
+			0.25, # geodesicStep : how much to advance at each step
+			0.5/2**self.ndim, # weightThreshold : used in interpolation pruning
+			4, # causalityTolerance : likewise
+		)))
 		self.seeds_top = np.iinfo(convert_dtype['np'][seeds.dtype]).max #1000 # Some arbitrary upper bound for the seeds field #np.iinfo(convert_dtype['np'][seeds.dtype]).max 
-		
+	
+	# Runtime parameters
 	@property
 	@ti.pyfunc
 	def shape(self): return self.flows.shape
+	@property
+	@ti.pyfunc
+	def geodesicStep(self): return self._params[0]
+	@property
+	@ti.pyfunc
+	def weightThreshold(self): return self._params[1]
+	@property
+	@ti.pyfunc
+	def causalityTolerance(self): return self._params[2]
+
+	# Compilation time constants
 	@property
 	def ndim(self): return self.flows.n
 	@property
@@ -939,7 +1038,7 @@ class GeodesicODE:
 		return res
 
 	@ti.func
-	def flow(self,x):
+	def flow(self, self_ti:tpl_t, x):
 		"""
 		Computes the interpolated flow at x. (Not genuine interpolation : we do pruning, etc)
 		"""
@@ -953,22 +1052,22 @@ class GeodesicODE:
 			xe = self.crop_periodize(x0+e)
 			w = Linalg.product(1-ti.abs(e-e0)) # Interpolation weight
 			if w >= self.weightThreshold: # minimum seed,val, based on points with substantial weight
-				min_seed = min(min_seed,self.seeds[xe]) # Taichi 1.7.4 compiler bug : min of ti.i8 vars unsupported
-				if (val:=self.values[*xe]) < min_val:
+				min_seed = min(min_seed, self_ti.seeds[xe]) # Taichi 1.7.4 compiler bug : min of ti.i8 vars unsupported
+				if (val:=self_ti.values[*xe]) < min_val:
 					min_val = val
 					minx = xe
 
-		thres_val = min_val + self.diffs[minx] * self.causalityTolerance
+		thres_val = min_val + self_ti.diffs[minx] * self.causalityTolerance
 		wsum = 0.; val = 0. # wsum = self.float_t(0); val = self.float_t(0) # Error ??
 		flow = self.vec_t(0)
 
 		for e in ti.grouped(ti.ndrange(*(2,)*self.ndim)):
 			xe = self.crop_periodize(x0+e)
-			if self.values[xe]<=thres_val: # Disregard too large values
+			if self_ti.values[xe]<=thres_val: # Disregard too large values
 				w = Linalg.product(1-ti.abs(e-e0)) # Interpolation weight
 				wsum += w
-				val  += w*self.values[xe]
-				flow += w*self.flows[xe]
+				val  += w*self_ti.values[xe]
+				flow += w*self_ti.flows[xe]
 		
 		val /= wsum; flow /= wsum # Due to pruning, weights may not sum to one
 		return flow,val,minx,min_seed
@@ -984,14 +1083,20 @@ class GeodesicODE:
 		assert len(tips.shape)==2
 		assert tips.shape[1]==self.ndim
 		ntips = tips.shape[0]
-		recent_values = ti.field(self.float_t,shape=(ntips,delay_values)); recent_values.fill(np.nan)
-		recent_minx   = ti.field(self.ivec_t,shape=(ntips,delay_minx)); recent_minx.fill(-1)
-		recent_seeds  = ti.field(self.seeds.dtype,shape=(ntips,delay_seeds)); recent_seeds.fill(127)
+		recent_values = ti.ndarray(self.float_t,shape=(ntips,delay_values)); recent_values.fill(np.nan)
+		recent_minx   = ti.ndarray(self.ivec_t,shape=(ntips,delay_minx)); recent_minx.fill(-1)
+		recent_seeds  = ti.ndarray(self.seeds.dtype,shape=(ntips,delay_seeds)); recent_seeds.fill(127)
 
 		geo_code = ti.field(ti.i32,ntips)
 		geo_size = ti.field(ti.i32,ntips)
+		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
+		pack_t = ti.types.argpack(seeds=arr_t, values=arr_t, flows=arr_t, diffs=arr_t,
+							recent_values=arr_t, recent_minx=arr_t, recent_seeds=arr_t)
+		pack = pack_t(self.seeds, self.values, self.flows, self.diffs, recent_values, recent_minx, recent_seeds)
+
 		@ti.kernel # Using ndarray, instead of field, to avoid recompilation in case of multiple calls
-		def ode(geo:ti.types.ndarray(self.vec_t,2),geo_old:ti.types.ndarray(self.vec_t,2)):
+		def ode(pack:pack_t, geo:ti.types.ndarray(self.vec_t,2), geo_old:ti.types.ndarray(self.vec_t,2)):
+			if ti.static(ti_debug()): compiling[None]=0 # ode
 			geo_begin = geo_old.shape[1]
 			geo_end  =  geo.shape[1]
 			dt = self.geodesicStep
@@ -1002,12 +1107,12 @@ class GeodesicODE:
 					if code!=0: break
 					# Second order Euler scheme
 					x = geo[igeo,k-1]
-					v0,_,_,_ = self.flow(x)
+					v0,_,_,_ = self.flow(pack,x)
 					if (norm_sqr:=v0.norm_sqr()) > 0: v0 /= ti.math.sqrt(norm_sqr)
 					else: code = geodesic_code['VanishingFlow']
 					x1 = x + v0 * dt/2 # Approximate midpoint 
 
-					v1,val1,minx1,seed1 = self.flow(x1) 
+					v1,val1,minx1,seed1 = self.flow(pack, x1) 
 					if (norm_sqr:=v1.norm_sqr()) > 0: v1 /= ti.math.sqrt(norm_sqr)
 					else: code = geodesic_code['VanishingFlow']
 					x2 = x + v1 * dt # Second order accurate step
@@ -1015,21 +1120,22 @@ class GeodesicODE:
 					# Store data
 					geo_size[igeo]=k+1
 					geo[igeo,k] = x2
-					recent_values[igeo,k%delay_values] = val1
-					recent_minx[igeo,  k%delay_minx] = minx1
-					recent_seeds[igeo, k%delay_seeds] = seed1
+					pack.recent_values[igeo,k%delay_values] = val1
+					pack.recent_minx[igeo,  k%delay_minx] = minx1
+					pack.recent_seeds[igeo, k%delay_seeds] = seed1
 
 					# Check stopping criteria
 					if seed1==0: code = geodesic_code['AtSeed']
 					elif not self.indomain(x2): code = geodesic_code['OutOfDomain']
 					elif val1==np.inf: code = geodesic_code['InWall']
-					elif recent_values[igeo,  (k+1)%delay_values]<val1:  code = geodesic_code['StationnaryValue']
-					elif all(recent_minx[igeo,(k+1)%delay_minx]==minx1): code = geodesic_code['StationnaryPosition']
-					elif recent_seeds[igeo,   (k+1)%delay_seeds]<seed1:  code = geodesic_code['PastSeed']
+					elif pack.recent_values[igeo,  (k+1)%delay_values]<val1:  code = geodesic_code['StationnaryValue']
+					elif all(pack.recent_minx[igeo,(k+1)%delay_minx]==minx1): code = geodesic_code['StationnaryPosition']
+					elif pack.recent_seeds[igeo,   (k+1)%delay_seeds]<seed1:  code = geodesic_code['PastSeed']
 				geo_code[igeo]=code
 
 		@ti.kernel
 		def PointFromIndex_ker(geo:ti.types.ndarray(self.vec_t,2),to:ti.template()):
+			if ti.static(ti_debug()): compiling[None]=0 # PointFromIndex_ker
 			for x in ti.grouped(geo): geo[x] = self.PointFromIndex(geo[x],to)
 
 		geo = ti.ndarray(self.vec_t, shape = (ntips,256))
@@ -1037,11 +1143,11 @@ class GeodesicODE:
 		geo_old.from_numpy(tips[:,None,:])
 		PointFromIndex_ker(geo_old,True)
 
-		ode(geo,geo_old)
+		ode(pack, geo, geo_old)
 		while any(geo_code.to_numpy()==0) and geo.shape[1]<max_len:
 			geo_old = geo
 			geo = ti.ndarray(self.vec_t, shape=(ntips,min(2*geo_old.shape[1],max_len)))
-			ode(geo,geo_old)
+			ode(pack, geo, geo_old)
 
 		PointFromIndex_ker(geo,False)
 		geo_np = geo.to_numpy()

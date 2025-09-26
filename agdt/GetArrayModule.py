@@ -7,6 +7,7 @@ import taichi as ti
 import numpy as np
 import numbers
 
+def ti_debug(): return ti.lang.impl.default_cfg().debug
 
 # -------------------- Numpy / Pytorch generic programming ----------------------
 def get_array_module(arr):
@@ -103,6 +104,23 @@ def reshape_field(arr,shape,dtype=None): # Unclear how to do this properly in Ta
 	res.from_numpy(arr.to_numpy().reshape(shape+ishape))
 	return res
 
+def reshape_ndarray(arr,shape,dtype=None):
+	"""
+	Reshapes a ti.ndarray
+	- arr : ti.ndarray
+	- shape : the new shape
+	- dtype (optional) : target element type 
+	"""
+	# Unclear how to do this properly in Taichi ...
+	# This function is also quite silly, since the data is contiguous (no need to copy ...)
+	# One could avoid it by using np tensors (cpu only...), or pytorch tensors (heavy...)
+	if dtype is None: dtype=arr.dtype; ishape=tuple()
+	elif dtype.m==1: ishape = (dtype.n,) 
+	else: ishape = (dtype.n,dtype.m)
+	res = ti.ndarray(dtype,shape) # arr.dtype only retains the float/int type (ex : vec2->float)
+	res.from_numpy(arr.to_numpy().reshape(shape+ishape))
+	return res
+
 def tofield(x,dtype):
 	"""
 	Turns a number, tuple, list into a ti.field singleton. (Leaves an actual field untouched.)
@@ -127,8 +145,8 @@ def tofield(x,dtype):
 		return x
 
 
-
 def to_ndarray(x,dtype):
+	import numbers
 	if isinstance(x,numbers.Number) or isinstance(x,tuple) or isinstance(x,list):
 		xf = ti.ndarray(dtype=dtype,shape=tuple())
 		xf.fill(x)

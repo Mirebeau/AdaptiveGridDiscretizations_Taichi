@@ -50,7 +50,10 @@ def f(n):
   taichi.lang.impl.default_cfg().default_fp / default_ip
 
 ### ti.field vs ti.ndarray
-- (Access in kernels) A ti.ndarray needs to be passed as a kernel parameter, a ti.field can be declared in global/surrounding scope.
+- (Access in kernels) 
+  A ti.ndarray needs to be passed as a kernel parameter, a ti.field can be declared in global/surrounding scope.
+  In particular, in a class method, the ti.field can be accessed as self.myfield, whereas the ti.ndarray must be 
+  passed as an argument. (SILLY. v 1.7.4)
 - (Recompilation) Changing a ti.field passed to a kernel leads to recompilation, but not a ti.ndarray.
 
 ### Known issues with Taichi
@@ -64,4 +67,8 @@ def f(n):
 
 - argpack 
   - Two different argpack, passed to a kernel, may not have elements with identical names.
-  - !! An argpack CANNOT be passed to a taichi function !!
+  - The names used in the argpack are forbidden in the function code
+
+- static
+ - cannot use it to declare types, e.g. vec_t = ti.static(self.vec_t)
+ - Inconsistency for pyfunc and ti.ndarray : a = self.a in python, a = ti.static(self.a) in taichi

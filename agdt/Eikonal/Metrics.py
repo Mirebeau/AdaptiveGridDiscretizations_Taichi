@@ -5,31 +5,12 @@ eikonal solvers
 
 import taichi as ti
 import numpy as np
-from ..GetArrayModule import broadcasts,convert_dtype
+from ..GetArrayModule import broadcasts,convert_dtype,to_ndarray
 #from ..GetArrayModule import getitem_broadcast as getb
 from .. import Selling
 from . import HFM
 
 # Computes the decompositions of various metrics and models, suitable for the HFM method
-
-def to_ndarray(x,dtype):
-	import numbers
-	if isinstance(x,numbers.Number) or isinstance(x,tuple) or isinstance(x,list):
-		xf = ti.ndarray(dtype=dtype,shape=tuple())
-		xf.fill(x)
-		return xf
-	elif isinstance(x,np.ndarray):
-		shape = x.shape
-		if hasattr(dtype,'m') and dtype.m==shape[-1]: shape = shape[:-1]
-		if hasattr(dtype,'n') and dtype.n==shape[-1]: shape = shape[:-1]
-		field = ti.ndarray(dtype,shape)
-		field.from_numpy(x) 
-		return field
-	else:
-		assert x.dtype==dtype or x.dtype==dtype.dtype 
-		assert not (hasattr(x,'n') or hasattr(dtype,'n')) or x.n==dtype.n
-		assert not (hasattr(x,'m') or hasattr(dtype,'m')) or x.m==dtype.m
-		return x
 	
 @ti.pyfunc
 def getb(a:ti.template(),x):
@@ -74,12 +55,12 @@ class Diagonal:
 				offsets[*x,i][j] = (i==j)
 	
 	def set_defaults(self,sgrid,dcosts=1):
-		dcosts = to_ndarray(dcosts,self.HFMTraits.vec_t)
+		Traits = self.HFMTraits
+		dcosts = to_ndarray(dcosts,Traits.vec_t)
 		shape = tuple(g.shape[i] for i,g in enumerate(sgrid)) 
 		assert broadcasts(dcosts.shape,shape)
-		argtype = ti.types.argpack(dcosts=ti.types.ndarray())
+		argtype = ti.types.argpack(dcosts=ti.types.ndarray(Traits.vec_t))
 		return argtype(dcosts),argtype
-		return (dcosts,)
 	
 @ti.data_oriented
 class Riemann:
@@ -109,8 +90,10 @@ class Riemann:
 		for i in ti.static(range(nactx)): weights[*x,i] = λ[i]; offsets[*x,i] = e[i,:]
 
 	def set_defaults(self,sgrid,m=None):
+		Traits= self.HFMTraits
 		if m is None: m = ti.math.eye(self.HFMTraits.ndim).tolist()
-		return (tofield(m,self.HFMTraits.mat_t),)
+		argtype = ti.types.argpack(m=ti.types.ndarray(Traits.mat_t))
+		return (to_ndarray(m,self.HFMTraits.mat_t),)
 
 # --------- Non-holonomic models ---------
 
@@ -146,8 +129,8 @@ def decomp_v(v,ε=0.01,ε_cosmin2=0.67):
 def _default_trigo(θ,cθ=None,sθ=None):
 	"""Returns cθ and sθ, or cos(θ) and sin(θ) if they are None"""
 	float_t = convert_dtype['ti'][θ.dtype]
-	if cθ is None: cθ = ti.field(float_t,θ.shape); cθ.from_numpy(np.cos(θ))
-	if sθ is None: sθ = ti.field(float_t,θ.shape); sθ.from_numpy(np.sin(θ))
+	if cθ is None: cθ = ti.ndarray(float_t,θ.shape); cθ.from_numpy(np.cos(θ))
+	if sθ is None: sθ = ti.ndarray(float_t,θ.shape); sθ.from_numpy(np.sin(θ))
 	return cθ,sθ
 
 @ti.data_oriented
@@ -177,7 +160,9 @@ class ReedsSheppForward2:
 
 	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,ε=0.01,ε_cosmin2=0.67):
 		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ)
-		return tuple(tofield(_,self.HFMTraits.float_t) for _ in (ξ,cθ,sθ,κ,ε,ε_cosmin2))
+		float_t = self.HFMTraits.float_t
+		argtype = ti.types.argpack(**{key:ti.types.ndarray(float_t) for key in ('ξ','cθ','sθ','κ','ε','ε_cosmin2')})
+		return argtype(to_ndarray(val,float_t) for val in (ξ,cθ,sθ,κ,ε,ε_cosmin2) ), argtype
 
 @ti.data_oriented
 class ReedsShepp2:
@@ -193,9 +178,11 @@ class ReedsShepp2:
 		self.HFMTraits = HFM.TraitsType(3,float_t,nrev=Selling.symdim(3),periodic_axis=2)
 
 	@ti.pyfunc
-	def hfm_scheme(self,x,ih,weights,offsets,
-			   ξ_,cθ_,sθ_,κ_,ε_,ε_cosmin2_): # Note : iξ := 1/ξ would be a more natural parameter
-		ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(ξ_,x),getb(cθ_,x),getb(sθ_,x),getb(κ_,x),getb(ε_,x),getb(ε_cosmin2_,x)
+	def hfm_scheme(self,x,ih,weights:ti.types.ndarray(),offsets:ti.types.ndarray(),data:ti.template()): 
+			   #ξ_,cθ_,sθ_,κ_,ε_,ε_cosmin2_): # Note : iξ := 1/ξ would be a more natural parameter
+		#ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(ξ_,x),getb(cθ_,x),getb(sθ_,x),getb(κ_,x),getb(ε_,x),getb(ε_cosmin2_,x)
+		#ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(data.ξ,x),getb(data.cθ,x),getb(data.sθ,x),getb(data.κ,x),getb(data.ε,x),getb(data.ε_cosmin2,x)
+		return
 		v = self.HFMTraits.vec_t([cθ,sθ,κ]) * ih # Horizontal control
 		m = self_outer_relax(v,ε) # Relaxation to allow a bit of orthogonal control
 		m[2,2] = max(m[2,2],v[2]*v[2]+(ih[2]/ξ)**2) # Angular control
@@ -209,7 +196,9 @@ class ReedsShepp2:
 
 	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,ε=0.01,ε_cosmin2=0.67):
 		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ)
-		return tuple(tofield(_,self.HFMTraits.float_t) for _ in (ξ,cθ,sθ,κ,ε,ε_cosmin2))
+		float_t = self.HFMTraits.float_t
+		argtype = ti.types.argpack(**{key:ti.types.ndarray(float_t) for key in ('ξ','cθ','sθ','κ','ε','ε_cosmin2')})
+		return argtype(*[to_ndarray(val,float_t) for val in (ξ,cθ,sθ,κ,ε,ε_cosmin2)] ), argtype
 
 
 fejerWeights = [
