@@ -60,14 +60,6 @@ class Diagonal:
 	
 	def set_defaults(self,sgrid,dcosts=1):
 		return make_argpack(dcosts=(dcosts,self.HFMTraits.vec_t))
-
-
-		Traits = self.HFMTraits
-		dcosts = to_ndarray(dcosts,Traits.vec_t)
-		shape = tuple(g.shape[i] for i,g in enumerate(sgrid)) 
-		assert broadcasts(dcosts.shape,shape)
-		data_t = ti.types.argpack(dcosts=ti.types.ndarray(Traits.vec_t))
-		return data_t(dcosts),data_t
 	
 @ti.data_oriented
 class Riemann:

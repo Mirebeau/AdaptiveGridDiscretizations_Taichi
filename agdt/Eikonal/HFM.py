@@ -731,9 +731,9 @@ class Domain:
 		# Broadcast the data appropriately
 		data,data_t = self.metric.set_defaults(self.sgrid(),**kwargs)
 		datashapes = [getattr(val, 'shape', (1,)*Traits.ndim) for key,val in data.items]
+		for shape in datashapes: # Check broadcasting validity
+			for s,sref in zip(shape,self.shape): assert s in (1,sref) 
 		bshape = tuple(np.max(datashapes,axis=0))
-		#datashapes = [val.shape for key,val in data.items if val.shape!=tuple()]
-		#bshape = (1,)*Traits.ndim if len(datashapes)==0 else tuple(np.max(datashapes,axis=0))
 		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
 
 		if costs is None: costs = ti.ndarray(Traits.float_t,self.shape); costs.fill(1)
