@@ -1091,19 +1091,20 @@ class GeodesicODE:
 		geo_size = ti.ndarray(ti.i32,ntips)
 		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
 		pack_t = ti.types.argpack(seeds=arr_t, values=arr_t, flows=arr_t, diffs=arr_t,
-							recent_values=arr_t, recent_minx=arr_t, recent_seeds=arr_t)
-		pack = pack_t(self.seeds, self.values, self.flows, self.diffs, recent_values, recent_minx, recent_seeds)
+							recent_values=arr_t, recent_minx=arr_t, recent_seeds=arr_t,
+							geo_size=arr_t, geo_code=arr_t, ntips=ti.i32)
+		pack = pack_t(self.seeds, self.values, self.flows, self.diffs, 
+				recent_values, recent_minx, recent_seeds, geo_size, geo_code, ntips)
 
 		@ti.kernel # Using ndarray, instead of field, to avoid recompilation in case of multiple calls
-		def ode(pack:pack_t, geo:ti.types.ndarray(self.vec_t,2), geo_old:ti.types.ndarray(self.vec_t,2),
-		  geo_size:arr_t, geo_code:arr_t, ntips:ti.i32):
+		def ode(pack:pack_t, geo:ti.types.ndarray(self.vec_t,2), geo_old:ti.types.ndarray(self.vec_t,2)):
 			if ti.static(ti_debug()): compiling[None]=0 # ode
 			geo_begin = geo_old.shape[1]
 			geo_end  =  geo.shape[1]
 			dt = self.geodesicStep
-			for igeo in range(ntips): # Runs in parallel the backtracking for all geodesics
+			for igeo in range(pack.ntips): # Runs in parallel the backtracking for all geodesics
 				for k in range(geo_begin): geo[igeo,k] = geo_old[igeo,k] # Copy previous data
-				code = geo_code[igeo] # Exit code
+				code = pack.geo_code[igeo] # Exit code
 				for k in range(geo_begin,geo_end):
 					if code!=0: break
 					# Second order Euler scheme
@@ -1119,7 +1120,7 @@ class GeodesicODE:
 					x2 = x + v1 * dt # Second order accurate step
 					
 					# Store data
-					geo_size[igeo]=k+1
+					pack.geo_size[igeo]=k+1
 					geo[igeo,k] = x2
 					pack.recent_values[igeo,k%delay_values] = val1
 					pack.recent_minx[igeo,  k%delay_minx] = minx1
@@ -1132,7 +1133,7 @@ class GeodesicODE:
 					elif pack.recent_values[igeo,  (k+1)%delay_values]<val1:  code = geodesic_code['StationnaryValue']
 					elif all(pack.recent_minx[igeo,(k+1)%delay_minx]==minx1): code = geodesic_code['StationnaryPosition']
 					elif pack.recent_seeds[igeo,   (k+1)%delay_seeds]<seed1:  code = geodesic_code['PastSeed']
-				geo_code[igeo]=code
+				pack.geo_code[igeo]=code
 
 		@ti.kernel
 		def PointFromIndex_ker(geo:ti.types.ndarray(self.vec_t,2),to:ti.template()):
@@ -1144,11 +1145,11 @@ class GeodesicODE:
 		geo_old.from_numpy(tips[:,None,:])
 		PointFromIndex_ker(geo_old,True)
 
-		ode(pack, geo, geo_old, geo_size, geo_code, ntips)
+		ode(pack, geo, geo_old)
 		while any(geo_code.to_numpy()==0) and geo.shape[1]<max_len:
 			geo_old = geo
 			geo = ti.ndarray(self.vec_t, shape=(ntips,min(2*geo_old.shape[1],max_len)))
-			ode(pack, geo, geo_old, geo_size, geo_code, ntips)
+			ode(pack, geo, geo_old)
 
 		PointFromIndex_ker(geo,False)
 		geo_np = geo.to_numpy()
