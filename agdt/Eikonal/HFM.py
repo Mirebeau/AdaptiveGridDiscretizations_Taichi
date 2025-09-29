@@ -1087,15 +1087,16 @@ class GeodesicODE:
 		recent_minx   = ti.ndarray(self.ivec_t,shape=(ntips,delay_minx)); recent_minx.fill(-1)
 		recent_seeds  = ti.ndarray(self.seeds.dtype,shape=(ntips,delay_seeds)); recent_seeds.fill(127)
 
-		geo_code = ti.field(ti.i32,ntips)
-		geo_size = ti.field(ti.i32,ntips)
+		geo_code = ti.ndarray(ti.i32,ntips)
+		geo_size = ti.ndarray(ti.i32,ntips)
 		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
 		pack_t = ti.types.argpack(seeds=arr_t, values=arr_t, flows=arr_t, diffs=arr_t,
 							recent_values=arr_t, recent_minx=arr_t, recent_seeds=arr_t)
 		pack = pack_t(self.seeds, self.values, self.flows, self.diffs, recent_values, recent_minx, recent_seeds)
 
 		@ti.kernel # Using ndarray, instead of field, to avoid recompilation in case of multiple calls
-		def ode(pack:pack_t, geo:ti.types.ndarray(self.vec_t,2), geo_old:ti.types.ndarray(self.vec_t,2)):
+		def ode(pack:pack_t, geo:ti.types.ndarray(self.vec_t,2), geo_old:ti.types.ndarray(self.vec_t,2),
+		  geo_size:arr_t, geo_code:arr_t, ntips:ti.i32):
 			if ti.static(ti_debug()): compiling[None]=0 # ode
 			geo_begin = geo_old.shape[1]
 			geo_end  =  geo.shape[1]
@@ -1143,11 +1144,11 @@ class GeodesicODE:
 		geo_old.from_numpy(tips[:,None,:])
 		PointFromIndex_ker(geo_old,True)
 
-		ode(pack, geo, geo_old)
+		ode(pack, geo, geo_old, geo_size, geo_code, ntips)
 		while any(geo_code.to_numpy()==0) and geo.shape[1]<max_len:
 			geo_old = geo
 			geo = ti.ndarray(self.vec_t, shape=(ntips,min(2*geo_old.shape[1],max_len)))
-			ode(pack, geo, geo_old)
+			ode(pack, geo, geo_old, geo_size, geo_code, ntips)
 
 		PointFromIndex_ker(geo,False)
 		geo_np = geo.to_numpy()
