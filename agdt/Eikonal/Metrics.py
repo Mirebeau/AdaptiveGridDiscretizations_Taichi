@@ -5,26 +5,30 @@ eikonal solvers
 
 import taichi as ti
 import numpy as np
-from ..GetArrayModule import broadcasts,convert_dtype,to_ndarray
-#from ..GetArrayModule import getitem_broadcast as getb
+from ..GetArrayModule import broadcasts,convert_dtype,to_ndarray,make_argpack
+from ..GetArrayModule import getitem_broadcast as getb
 from .. import Selling
 from . import HFM
 
+# Shorthands for ti.func and ti.kernel annotations
+arr_t = ti.types.ndarray() 
+tpl_t = ti.template() 
+
 # Computes the decompositions of various metrics and models, suitable for the HFM method
 	
-@ti.pyfunc
-def getb(a:ti.template(),x):
-	"""
-	Get an array element at a given index, with implicit broadcasting. (Singletons field accepted.)
-	- a : ti.field
-	- x : position to extract
-	"""
-	print(ti.static(len(a.shape)),x.n)
-	if ti.static(len(a.shape)==0): return a[None]
-	else: ti.static_assert(len(a.shape)==x.n)
-	for i in ti.static(range(x.n)):
-		if a.shape[i]==1: x[i]=0 # Currently, this is a runtime test
-	return a[*x]
+# @ti.pyfunc
+# def getb(a:ti.template(),x):
+# 	"""
+# 	Get an array element at a given index, with implicit broadcasting. (Singletons field accepted.)
+# 	- a : ti.field
+# 	- x : position to extract
+# 	"""
+# 	print(ti.static(len(a.shape)),x.n)
+# 	if ti.static(len(a.shape)==0): return a[None]
+# 	else: ti.static_assert(len(a.shape)==x.n)
+# 	for i in ti.static(range(x.n)):
+# 		if a.shape[i]==1: x[i]=0 # Currently, this is a runtime test
+# 	return a[*x]
 
 # --------------------
 
@@ -46,7 +50,7 @@ class Diagonal:
 		self.NormType = NormType
 
 	@ti.pyfunc
-	def hfm_scheme(self,x,ih,weights:ti.types.ndarray(),offsets:ti.types.ndarray(),data:ti.template()):#dcosts:ti.types.ndarray()):
+	def hfm_scheme(self, x, ih, weights:arr_t, offsets:arr_t, data:tpl_t):#dcosts:ti.types.ndarray()):
 		ndim = ti.static(self.HFMTraits.ndim)
 		dcost = getb(data.dcosts,x)
 		for i in ti.static(range(ndim)):
@@ -55,12 +59,15 @@ class Diagonal:
 				offsets[*x,i][j] = (i==j)
 	
 	def set_defaults(self,sgrid,dcosts=1):
+		return make_argpack(dcosts=(dcosts,self.HFMTraits.vec_t))
+
+
 		Traits = self.HFMTraits
 		dcosts = to_ndarray(dcosts,Traits.vec_t)
 		shape = tuple(g.shape[i] for i,g in enumerate(sgrid)) 
 		assert broadcasts(dcosts.shape,shape)
-		argtype = ti.types.argpack(dcosts=ti.types.ndarray(Traits.vec_t))
-		return argtype(dcosts),argtype
+		data_t = ti.types.argpack(dcosts=ti.types.ndarray(Traits.vec_t))
+		return data_t(dcosts),data_t
 	
 @ti.data_oriented
 class Riemann:
@@ -79,12 +86,12 @@ class Riemann:
 		self.NormType = NormType
 
 	@ti.pyfunc
-	def hfm_scheme(self,x,ih,weights,offsets,ms):
+	def hfm_scheme(self, x, ih, weights:arr_t, offsets:arr_t, data:tpl_t):
 		ndim,nactx = ti.static(self.HFMTraits.ndim,self.HFMTraits.nactx)
 		ti.static_assert(weights.shape[-1]==nactx); ti.static_assert(offsets.shape[-1]==nactx)
 		ti.static_assert(offsets.n==ndim); ti.static_assert(ih.n==ndim); ti.static_assert(ms.n==ms.m==ndim)
 		# Rescale the metric based on the grid scale
-		D = getb(ms,x).inverse() # Compute the dual of the metric, take grid scales into account
+		D = getb(data.m,x).inverse() # Compute the dual of the metric, take grid scales into account
 		Dh = self.HFMTraits.mat_t([[D[i,j]*ih[i]*ih[j] for i in ti.static(range(ndim))] for j in ti.static(range(ndim))])
 		λ,e = Selling.decomp(Dh) # Selling decomposition of the dual metric tensor
 		for i in ti.static(range(nactx)): weights[*x,i] = λ[i]; offsets[*x,i] = e[i,:]
@@ -92,8 +99,8 @@ class Riemann:
 	def set_defaults(self,sgrid,m=None):
 		Traits= self.HFMTraits
 		if m is None: m = ti.math.eye(self.HFMTraits.ndim).tolist()
-		argtype = ti.types.argpack(m=ti.types.ndarray(Traits.mat_t))
-		return (to_ndarray(m,self.HFMTraits.mat_t),)
+		data_t = ti.types.argpack(m=ti.types.ndarray(Traits.mat_t))
+		return data_t(to_ndarray(m,self.HFMTraits.mat_t)), data_t #(to_ndarray(m,self.HFMTraits.mat_t),)
 
 # --------- Non-holonomic models ---------
 
@@ -147,10 +154,10 @@ class ReedsSheppForward2:
 		self.HFMTraits = HFM.TraitsType(3,float_t,nrev=1,nfwd=Selling.symdim(3),periodic_axis=2)
 	
 	@ti.pyfunc
-	def hfm_scheme(self,x,ih,weights,offsets,
-			   ξ_,cθ_,sθ_,κ_,ε_,ε_cosmin2_): # Note : iξ := 1/ξ would be a more natural parameter
-		ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(ξ_,x),getb(cθ_,x),getb(sθ_,x),getb(κ_,x),getb(ε_,x),getb(ε_cosmin2_,x)
-		weights[*x,0] = (ih[2]/ξ)**2 # Angular control
+	def hfm_scheme(self, x, ih, weights:arr_t, offsets: arr_t, data:tpl_t): 
+		#	   ξ_,cθ_,sθ_,κ_,ε_,ε_cosmin2_): # Note : iξ := 1/ξ would be a more natural parameter
+		ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(data.ξ,x),getb(data.cθ,x),getb(data.sθ,x),getb(data.κ,x),getb(data.ε,x),getb(data.ε_cosmin2,x)
+		weights[*x,0] = (ih[2]/ξ)**2 # Angular control # Note : iξ := 1/ξ would be a more natural parameter
 		offsets[*x,0][0] = 0; offsets[*x,0][1] = 0; offsets[*x,0][2] = 1
 		# Possible improvement : slightly more efficient scheme in the case where κ==0 everywhere, 
 		# using the two-dimensional Selling decomposition
@@ -159,10 +166,10 @@ class ReedsSheppForward2:
 		for i in range(self.HFMTraits.nfwd): weights[*x,1+i] = λ[i]; offsets[*x,1+i] = e[i,:]
 
 	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,ε=0.01,ε_cosmin2=0.67):
-		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ)
-		float_t = self.HFMTraits.float_t
-		argtype = ti.types.argpack(**{key:ti.types.ndarray(float_t) for key in ('ξ','cθ','sθ','κ','ε','ε_cosmin2')})
-		return argtype(to_ndarray(val,float_t) for val in (ξ,cθ,sθ,κ,ε,ε_cosmin2) ), argtype
+		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ) 
+		float_t = self.HFMTraits.float_t # TODO : Pass by value some parameters if constant over domain ?
+		data_t = ti.types.argpack(**{key:ti.types.ndarray(float_t) for key in ('ξ','cθ','sθ','κ','ε','ε_cosmin2')})
+		return data_t(to_ndarray(val,float_t) for val in (ξ,cθ,sθ,κ,ε,ε_cosmin2) ), data_t
 
 @ti.data_oriented
 class ReedsShepp2:

@@ -72,17 +72,51 @@ def ticplx(arr):
 # ----------------------- ti.field reshaping and broadcasting -----------------------
 
 @ti.pyfunc
-def getitem_broadcast(a,x):
+def getitem_broadcast(a:ti.template(),x):
 	"""
-	Get an array element at a given index, with implicit broadcasting. (Singletons field accepted.)
-	- a : ti.field
-	- x : position to extract
+	If a is an ndarray, extract the value at position x, with broadcasting. Otherwise, return a.
 	"""
-	if ti.static(a.shape==tuple()): return a[None]
-	ti.static_assert(len(a.shape)==x.n)
-	for i in ti.static(range(x.n)):
-		if a.shape[i]==1: x[i]=0
-	return a[*x]
+	if ti.static(isinstance(a,(ti.lang.any_array.AnyArray,ti.lang._ndarray.Ndarray))): 
+		ti.static_assert(len(a.shape)==x.n)
+		for i in ti.static(range(x.n)):
+			if a.shape[i]==1: x[i]=0 # Broadcast # TODO : make this a compile time test ? 
+		return a[*x]
+	else: return a # A single value is passed
+
+def make_argpack(**kwargs):
+	"""
+	Create an argument pack type and instance, whose elements may be ndarrays (passed by reference), 
+	or low-dimensional variables (passed by value) 
+	Input : 
+	- **kwargs : dictionary of key:(value,dtype), where value is either an ndarray of dtype, or a dtype.
+	Output : 
+	- pack : argpack instance
+	- pack_t : argpack type
+	"""
+	pack_t = []
+	for key,(value,dtype) in kwargs.items():
+		if isinstance(value,ti.lang._ndarray.Ndarray):
+			pack_t.append( (key,ti.types.ndarray(dtype,len(value.shape))) )
+			assert value.dtype==dtype or value.dtype==dtype.dtype # Check dtype and dimensions
+			assert getattr(value,'n',1)==getattr(dtype,'n',1)
+			assert getattr(value,'m',1)==getattr(dtype,'m',1)
+		else: pack_t.append( (key,dtype) )
+	pack_t = ti.types.argpack(**{key:dtype for key,dtype in pack_t})
+	return pack_t(*[val for key,(val,dtype) in kwargs.items()]), pack_t # Some implicit type conversions
+
+
+# @ti.pyfunc
+# def getitem_broadcast(a,x):
+# 	"""
+# 	Get an array element at a given index, with implicit broadcasting. (Singletons field accepted.)
+# 	- a : ti.field
+# 	- x : position to extract
+# 	"""
+# 	if ti.static(a.shape==tuple()): return a[None]
+# 	ti.static_assert(len(a.shape)==x.n)
+# 	for i in ti.static(range(x.n)):
+# 		if a.shape[i]==1: x[i]=0
+# 	return a[*x]
 
 def broadcasts(shape,rshape):
 	"""

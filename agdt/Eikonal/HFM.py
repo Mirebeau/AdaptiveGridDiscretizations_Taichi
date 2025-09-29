@@ -730,8 +730,10 @@ class Domain:
 		Traits = self.Traits
 		# Broadcast the data appropriately
 		data,data_t = self.metric.set_defaults(self.sgrid(),**kwargs)
-		datashapes = [val.shape for key,val in data.items if val.shape!=tuple()]
-		bshape = (1,)*Traits.ndim if len(datashapes)==0 else tuple(np.max(datashapes,axis=0))
+		datashapes = [getattr(val, 'shape', (1,)*Traits.ndim) for key,val in data.items]
+		bshape = tuple(np.max(datashapes,axis=0))
+		#datashapes = [val.shape for key,val in data.items if val.shape!=tuple()]
+		#bshape = (1,)*Traits.ndim if len(datashapes)==0 else tuple(np.max(datashapes,axis=0))
 		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
 
 		if costs is None: costs = ti.ndarray(Traits.float_t,self.shape); costs.fill(1)
@@ -983,6 +985,9 @@ class GeodesicODE:
 		self.flows = flows
 		self.diffs = diffs
 		self.PointFromIndex = PointFromIndex
+
+		self._shape = ti.field(ti.lang.matrix.VectorType(self.ndim,ti.i32), shape=tuple()) 
+		self._shape[None] = flows.shape
 		assert seeds.shape==values.shape==self.shape
 		assert len(self.shape) == self.ndim
 
@@ -998,7 +1003,7 @@ class GeodesicODE:
 	# Runtime parameters
 	@property
 	@ti.pyfunc
-	def shape(self): return self.flows.shape
+	def shape(self): return self._shape[None]
 	@property
 	@ti.pyfunc
 	def geodesicStep(self): return self._params[0]
