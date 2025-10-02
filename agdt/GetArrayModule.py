@@ -104,6 +104,16 @@ def make_argpack(**kwargs):
 	pack_t = ti.types.argpack(**{key:dtype for key,dtype in pack_t})
 	return pack_t(*[val for key,(val,dtype) in kwargs.items()]), pack_t # Some implicit type conversions
 
+def get_dtype(a):
+	"""
+	Consider a = ti.ndarray(dtype,shape)
+	then a.dtype is not dtype for vectors or matrix fields.
+	We try to reconstruct the correct dtype using a.m, a.n, if available
+	"""
+	if hasattr(a,'m'): return ti.lang.matrix.MatrixType(a.n,a.m,2,a.dtype)
+	elif hasattr(a,'n'): return ti.lang.matrix.VectorType(a.n,a.dtype)
+	else: return a.dtype
+
 
 # @ti.pyfunc
 # def getitem_broadcast(a,x):
@@ -118,25 +128,25 @@ def make_argpack(**kwargs):
 # 		if a.shape[i]==1: x[i]=0
 # 	return a[*x]
 
-def broadcasts(shape,rshape):
-	"""
-	Checks wether shape broadcasts to reference shape. (Allors singleton shape.)
-	- shape
-	"""
-	return shape==tuple() or len(shape)==len(rshape) and all([s in (1,rs) for s,rs in zip(shape,rshape)])
+# def broadcasts(shape,rshape):
+# 	"""
+# 	Checks wether shape broadcasts to reference shape. (Allors singleton shape.)
+# 	- shape
+# 	"""
+# 	return shape==tuple() or len(shape)==len(rshape) and all([s in (1,rs) for s,rs in zip(shape,rshape)])
 
-def reshape_field(arr,shape,dtype=None): # Unclear how to do this properly in Taichi ...
-	"""
-	Reshapes a ti.field.
-	- arr : ti.field
-	- shape : the new shape
-	- dtype (optional) : target element type 
-	"""
-	if dtype is None: dtype=arr.dtype; ishape=tuple()
-	else: ishape = (dtype.n,dtype.m)
-	res = ti.field(dtype,shape) # arr.dtype only retains the float/int type (ex : vec2->float)
-	res.from_numpy(arr.to_numpy().reshape(shape+ishape))
-	return res
+# def reshape_field(arr,shape,dtype=None): # Unclear how to do this properly in Taichi ...
+# 	"""
+# 	Reshapes a ti.field.
+# 	- arr : ti.field
+# 	- shape : the new shape
+# 	- dtype (optional) : target element type 
+# 	"""
+# 	if dtype is None: dtype=arr.dtype; ishape=tuple()
+# 	else: ishape = (dtype.n,dtype.m)
+# 	res = ti.field(dtype,shape) # arr.dtype only retains the float/int type (ex : vec2->float)
+# 	res.from_numpy(arr.to_numpy().reshape(shape+ishape))
+# 	return res
 
 def reshape_ndarray(arr,shape,dtype=None):
 	"""
@@ -155,37 +165,37 @@ def reshape_ndarray(arr,shape,dtype=None):
 	res.from_numpy(arr.to_numpy().reshape(shape+ishape))
 	return res
 
-def tofield(x,dtype):
-	"""
-	Turns a number, tuple, list into a ti.field singleton. (Leaves an actual field untouched.)
-	- x : ti.field, or number,tuple,list
-	- dtype : data type of target field
-	"""
-	if isinstance(x,numbers.Number) or isinstance(x,tuple) or isinstance(x,list):
-		xf = ti.field(dtype=dtype,shape=tuple())
-		xf.fill(x)
-		return xf
-	elif isinstance(x,np.ndarray):
-		shape = x.shape
-		if hasattr(dtype,'m') and dtype.m==shape[-1]: shape = shape[:-1]
-		if hasattr(dtype,'n') and dtype.n==shape[-1]: shape = shape[:-1]
-		field = ti.field(dtype,shape)
-		field.from_numpy(x) 
-		return field
-	else:
-		assert x.dtype==dtype or x.dtype==dtype.dtype 
-		assert not (hasattr(x,'n') or hasattr(dtype,'n')) or x.n==dtype.n
-		assert not (hasattr(x,'m') or hasattr(dtype,'m')) or x.m==dtype.m
-		return x
+# def tofield(x,dtype):
+# 	"""
+# 	Turns a number, tuple, list into a ti.field singleton. (Leaves an actual field untouched.)
+# 	- x : ti.field, or number,tuple,list
+# 	- dtype : data type of target field
+# 	"""
+# 	if isinstance(x,numbers.Number) or isinstance(x,tuple) or isinstance(x,list):
+# 		xf = ti.field(dtype=dtype,shape=tuple())
+# 		xf.fill(x)
+# 		return xf
+# 	elif isinstance(x,np.ndarray):
+# 		shape = x.shape
+# 		if hasattr(dtype,'m') and dtype.m==shape[-1]: shape = shape[:-1]
+# 		if hasattr(dtype,'n') and dtype.n==shape[-1]: shape = shape[:-1]
+# 		field = ti.field(dtype,shape)
+# 		field.from_numpy(x) 
+# 		return field
+# 	else:
+# 		assert x.dtype==dtype or x.dtype==dtype.dtype 
+# 		assert not (hasattr(x,'n') or hasattr(dtype,'n')) or x.n==dtype.n
+# 		assert not (hasattr(x,'m') or hasattr(dtype,'m')) or x.m==dtype.m
+# 		return x
 
 
 def to_ndarray(x,dtype):
-	import numbers
-	if isinstance(x,numbers.Number) or isinstance(x,tuple) or isinstance(x,list):
-		xf = ti.ndarray(dtype=dtype,shape=tuple())
-		xf.fill(x)
-		return xf
-	elif isinstance(x,np.ndarray):
+	# import numbers
+	# if isinstance(x,numbers.Number) or isinstance(x,tuple) or isinstance(x,list):
+	# 	xf = ti.ndarray(dtype=dtype,shape=tuple())
+	# 	xf.fill(x)
+	# 	return xf
+	if isinstance(x,np.ndarray):
 		shape = x.shape
 		if hasattr(dtype,'m') and dtype.m==shape[-1]: shape = shape[:-1]
 		if hasattr(dtype,'n') and dtype.n==shape[-1]: shape = shape[:-1]

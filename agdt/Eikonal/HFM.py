@@ -10,7 +10,7 @@ import numpy as np
 from dataclasses import dataclass
 from . import Queue,CappedQueue
 from .. import Sort 
-from ..GetArrayModule import convert_dtype,reshape_ndarray,reshape_field,getitem_broadcast,ti_debug
+from ..GetArrayModule import convert_dtype,reshape_ndarray,getitem_broadcast,ti_debug
 from .. import Linalg
 
 # Shorthands for ti.func and ti.kernel annotations
@@ -154,7 +154,6 @@ class _Algo:
 
 		# --- Compute the masks for valid offsets, corresponding to visible pair points ---
 		nmix,nrev,nfwd,nactx,ntotx = Traits.nmix,Traits.nrev,Traits.nfwd,Traits.nactx,Traits.ntotx
-		#print(f"{self.factored=}, {self.shape=}, {factored_start=}, {factored_stop=}, {ndim=}")
 		@ti.kernel # TODO : accelerate by precomputing the distance to the walls ? 
 		def set_voffsets(offsets:arr_t,walls:arr_t, # IN
 				   voffsets:arr_t): # OUT
@@ -290,8 +289,7 @@ class _Algo:
 	@ti.pyfunc
 	def x2ix(self, x):
 		"""Convert a discrete point to an index"""
-		if ti.static(ti_debug()) and not self.indomain(x): print("x2ix out of domain : ",x)
-		assert self.indomain(x)
+		assert self.indomain(x), "x2ix out of domain" # Taichi 1.7.4. Can put x[0] in fstring, but not x
 		ix = x[0]
 		for i in ti.static(range(1,self.ndim)):
 			ix = ix*self.shape[i] + x[i]
@@ -319,8 +317,6 @@ class _Algo:
 					if not visible: break 
 					f = self.Traits.ivec_t(0)
 					for i in range(self.ndim): f[i] = div_round_closest(k*E[i],linf_e)
-					if not self.indomain(x+f):
-						print("visible",x,e,k,linf_e,f,x+e,x+f)
 					if walls[self.x2ix(x+f)]==ti.static(wall_code['wall']): visible=False #; break
 		return visible
 
@@ -507,7 +503,7 @@ class _Algo:
 				if λ>val: 
 					weight = weights[fx,bact]; wsum += weight
 					coef = (λ-val)*weight;     csum += coef
-					flow += coef*sign*offsets[fx,bact]
+					flow += coef*offsets[fx,bact]
 			btot+=1; bact+=1
 		#flow /= self.costs[ix] # Optional normalization, w.r.t. costless metric (bof)
 		if wsum>0: csum/=wsum # Average of the finite differences used
@@ -565,7 +561,8 @@ class _Algo:
 		FMM(pack)
 		while not pq.empty(pq) and not stop[None]: 
 			pq = pq.with_capacity(pq) # Double the capacity
-			FMM(pq)
+			pack.pq = pq
+			FMM(pack)
 		return stop[None] # Return stopping criterion code
 
 	def solve_AGSI(self,tol,nitermax=None):
@@ -749,7 +746,7 @@ class Domain:
 		offsets = ti.Vector.ndarray(Traits.ndim,self.offset_t,shape=weights.shape)
 		decomp(self.ih,weights,offsets,data)
 
-		if not self.periodic: self.Algo = _Algo(costs,weights,offsets,Traits,walls,0,seeds_capacity)
+		if not self.periodic: self.algo = _Algo(costs,weights,offsets,Traits,walls,0,seeds_capacity)
 		else:  # Padding the weights and offsets with zeros in the periodic case
 			per_ax = self.periodic_axis
 			self.periodic_pad = np.max(np.abs(offsets.to_numpy()[...,per_ax]))
@@ -799,11 +796,11 @@ class Domain:
 					else: walls_pad[x]=walls[y]
 			coef_pad(costs,walls,costs_pad,walls_pad)
 			nper=np.prod(self.shape[per_ax:])
-			self.Algo = _Algo(costs_pad,weights_pad,offsets_pad,Traits,walls_pad,nper,seeds_capacity)
+			self.algo = _Algo(costs_pad,weights_pad,offsets_pad,Traits,walls_pad,nper,seeds_capacity)
 
 		# Type and argument for ti.kernel
-		self.self_ti_t = self.Algo.self_ti_t
-		self.self_ti = self.Algo.self_ti
+		self.self_ti_t = self.algo.self_ti_t
+		self.self_ti = self.algo.self_ti
 
 	@property
 	def Traits(self): return self.metric.HFMTraits
@@ -854,11 +851,11 @@ class Domain:
 	def values(self,as_numpy=False):
 		"""The numerical solution of the eikonal equation"""
 		if as_numpy:
-			if self.periodic: return self.Algo.values.to_numpy().reshape(self.shape_pad)[
+			if self.periodic: return self.algo.values.to_numpy().reshape(self.shape_pad)[
 				(slice(None),)*self.periodic_axis+(slice(self.periodic_pad,-self.periodic_pad),)]
-			else: return self.Algo.values.to_numpy().reshape(self.shape)
+			else: return self.algo.values.to_numpy().reshape(self.shape)
 		else: 
-			values = ti.field(self.Traits.float_t,self.shape)
+			values = ti.ndarray(self.Traits.float_t,self.shape)
 			values.from_numpy(self.values(True))
 			return values
 
@@ -866,7 +863,7 @@ class Domain:
 	def set_seed(self,self_ti,point,value=0):
 		index = self.IndexFromPoint(point)
 		x = Linalg.cast_vec(ti.round(index),self.Traits.ivec_t)
-		self.Algo.set_seed(self_ti,self.Algo.x2ix(x),value)
+		self.algo.set_seed(self_ti,self.algo.x2ix(x),value)
 	
 	@ti.pyfunc
 	def spread_seed(self,self_ti,point,norm:tpl_t,radius=1.5,value=0):
@@ -887,8 +884,8 @@ class Domain:
 			if ti.static(self.periodic): 
 				y[self.periodic_axis] = y[self.periodic_axis]%self.shape[self.periodic_axis]
 				y[self.periodic_axis] += self.periodic_pad
-			iy = self.Algo.x2ix(y)
-			self.Algo.set_seed(self_ti,iy,val)
+			iy = self.algo.x2ix(y)
+			self.algo.set_seed(self_ti,iy,val)
 	
 	@ti.pyfunc
 	def flow(self, self_ti:tpl_t, x, adim:tpl_t=False):
@@ -902,7 +899,7 @@ class Domain:
 		- diff : the averaged value of the finite differences used to compute the flow
 		"""
 		if ti.static(self.periodic): x[self.periodic_axis]+=self.periodic_pad # Note : may erase x in python mode
-		flow,diff = self.Algo.flow(self_ti,self.Algo.x2ix(x)) # The algorithm returns the adimensionized flow
+		flow,diff = self.algo.flow(self_ti,self.algo.x2ix(x)) # The algorithm returns the adimensionized flow
 		return ti.select(ti.static(adim),flow,flow*self.h),diff
 
 	def flows(self,adim:tpl_t=False):
@@ -921,7 +918,7 @@ class Domain:
 		"""
 		L1 distance to the seeds, up to maxL1. Used for PastSeed backtracking stopping criterion."
 		"""
-		walls = self.Algo.walls.to_numpy().reshape(self.Algo.shape)
+		walls = self.algo.walls.to_numpy().reshape(self.algo.shape)
 		if self.periodic: walls = walls[
 			(slice(None),)*self.periodic_axis+(slice(self.periodic_pad,-self.periodic_pad),)]
 		distL1=ti.ndarray(ti.i8,self.shape)
@@ -947,7 +944,7 @@ class Domain:
 		"""Returns the geodesic ODE solver based on the scheme data"""
 		periodic = [False]*self.Traits.ndim
 		if self.periodic: periodic[self.periodic_axis]=True
-		return GeodesicODE(self.seeds_distL1(),self.values(True),*self.flows(adim=True),tuple(periodic),self.PointFromIndex)
+		return GeodesicODE(self.seeds_distL1(),self.values(),*self.flows(adim=True),tuple(periodic),self.PointFromIndex)
 
 
 
@@ -958,10 +955,10 @@ geodesic_code = {
 	'Continue':           0, # Error : Unfinished work, consider increasing maxlen
 	'InWall' :            2, # Error : Went out of domain
 	'StationnaryValue' :  3, # Error : Stall in ODE process, eikonal solution values do not decrease
-	'StationnaryPosition':3, # Error : Stall in ODE process, positions do not change
-	'PastSeed' :          4, # Error : Moving away from target
-	'VanishingFlow' :     5, # Error : Vanishing flow
-	'OutOfDomain' :       6, # Error : Backtracking left the domain
+	'StationnaryPosition':4, # Error : Stall in ODE process, positions do not change
+	'PastSeed' :          5, # Error : Moving away from target
+	'VanishingFlow' :     6, # Error : Vanishing flow
+	'OutOfDomain' :       7, # Error : Backtracking left the domain
 }
 geodesic_rcode = dict(zip(geodesic_code.values(),geodesic_code.keys()))
 
@@ -1077,7 +1074,7 @@ class GeodesicODE:
 		val /= wsum; flow /= wsum # Due to pruning, weights may not sum to one
 		return flow,val,minx,min_seed
 	
-	def backtrack(self,tips,delay_values=30,delay_minx=30,delay_seeds=6,max_len=2000):
+	def backtrack(self,tips,delay_values=50,delay_minx=30,delay_seeds=6,max_len=2000):
 		"""Backtrack geodesics from the given tips.
 		- delay_values : delay before stopping if values increase (StationnaryValues criterion)
 		- delay_minx : delay before stopping if values increase (StationnaryPosition criterion)

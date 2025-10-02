@@ -153,7 +153,7 @@ class fifo:
 		self = self_t(elem,begin,end,capacity)
 		self.argtype = self_t
 		self.init = partial(fifo.init,elem_type)
-		for attr in ['front','pop','push','empty','_container_size','capacity','size','with_capacity']: 
+		for attr in ['front','pop','push','empty','_container_size','capacity','size','clear','with_capacity']: 
 			setattr(self,attr,getattr(fifo,attr))
 		return self
 
@@ -193,6 +193,10 @@ class fifo:
 	def size(self):
 		s = self.end[None]-self.begin[None]
 		return ti.select(s>=0,s,s+fifo._container_size(self))
+	
+	@staticmethod
+	@ti.pyfunc
+	def clear(self): self.end[None]=0; self.begin[None]=0
 
 	@staticmethod
 	def with_capacity(self,capacity=None):
@@ -234,7 +238,7 @@ class lifo:
 		self = self_t(elem,_size)
 		self.argtype = self_t
 		self.init = partial(lifo.init,elem_type)
-		for attr in ['capacity','size','empty','push','top','pop','with_capacity']: 
+		for attr in ['capacity','size','empty','clear','push','top','pop','with_capacity']: 
 			setattr(self,attr,getattr(lifo,attr))
 		return self
 
@@ -249,6 +253,10 @@ class lifo:
 	@staticmethod
 	@ti.pyfunc
 	def empty(self): return lifo.size(self)==0
+
+	@staticmethod
+	@ti.pyfunc
+	def clear(self): self._size[None]=0
 
 	@staticmethod
 	@ti.pyfunc

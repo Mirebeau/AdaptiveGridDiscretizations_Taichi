@@ -5,7 +5,7 @@ eikonal solvers
 
 import taichi as ti
 import numpy as np
-from ..GetArrayModule import broadcasts,convert_dtype,to_ndarray,make_argpack
+from ..GetArrayModule import convert_dtype,to_ndarray,make_argpack
 from ..GetArrayModule import getitem_broadcast as getb
 from .. import Selling
 from . import HFM
@@ -14,26 +14,9 @@ from . import HFM
 arr_t = ti.types.ndarray() 
 tpl_t = ti.template() 
 
-# Computes the decompositions of various metrics and models, suitable for the HFM method
-	
-# @ti.pyfunc
-# def getb(a:ti.template(),x):
-# 	"""
-# 	Get an array element at a given index, with implicit broadcasting. (Singletons field accepted.)
-# 	- a : ti.field
-# 	- x : position to extract
-# 	"""
-# 	print(ti.static(len(a.shape)),x.n)
-# 	if ti.static(len(a.shape)==0): return a[None]
-# 	else: ti.static_assert(len(a.shape)==x.n)
-# 	for i in ti.static(range(x.n)):
-# 		if a.shape[i]==1: x[i]=0 # Currently, this is a runtime test
-# 	return a[*x]
+# Computes the decompositions of various metrics and models, suitable for the HFM method, NB method
 
 # --------------------
-
-
-@ti.data_oriented
 class Diagonal:
 	"""
 	Eikonal discretization scheme for a diagonal metric
@@ -47,10 +30,11 @@ class Diagonal:
 			dcost:self.HFMTraits.vec_t 
 			@ti.pyfunc
 			def norm(self,v): return (self.dcost*v).norm()
+			# TODO : source factorization fact(self,v,e)
 		self.NormType = NormType
 
 	@ti.pyfunc
-	def hfm_scheme(self, x, ih, weights:arr_t, offsets:arr_t, data:tpl_t):#dcosts:ti.types.ndarray()):
+	def hfm_scheme(self, x, ih, weights:arr_t, offsets:arr_t, data:tpl_t):
 		ndim = ti.static(self.HFMTraits.ndim)
 		dcost = getb(data.dcosts,x)
 		for i in ti.static(range(ndim)):
@@ -61,7 +45,6 @@ class Diagonal:
 	def set_defaults(self,sgrid,dcosts=1):
 		return make_argpack(dcosts=(dcosts,self.HFMTraits.vec_t))
 	
-@ti.data_oriented
 class Riemann:
 	"""
 	Eikonal discretization scheme for a Riemannian metric
@@ -95,8 +78,6 @@ class Riemann:
 		return data_t(to_ndarray(m,self.HFMTraits.mat_t)), data_t #(to_ndarray(m,self.HFMTraits.mat_t),)
 
 # --------- Non-holonomic models ---------
-
-
 @ti.pyfunc
 def self_outer_relax(v,ε):
 	"""Constructs the matrix (1-ε) v v^T + ε |v|^2 Id"""
@@ -118,11 +99,11 @@ def decomp_v(v,ε=0.01,ε_cosmin2=0.67):
 	m = self_outer_relax(v,ε)
 	λ,e = Selling.decomp(m)
 	for i in ti.static(range(λ.n)):
-		e = e[i,:]; ve = v@e
+		ei = e[i,:]; ve = v@ei
 		# Eliminate offsets which deviate too much from the direction of v
-		if ve**2 < (v@v) * (e@e) * ε_cosmin2: λ[i] = 0
+		if ve**2 < (v@v) * (ei@ei) * ε_cosmin2: λ[i] = 0
 		# Redirect offsets in the direction of v
-		if ve<0: e[i,:] = -e
+		if ve<0: e[i,:] = -ei
 	return λ,e
 
 def _default_trigo(θ,cθ=None,sθ=None):
@@ -132,7 +113,6 @@ def _default_trigo(θ,cθ=None,sθ=None):
 	if sθ is None: sθ = ti.ndarray(float_t,θ.shape); sθ.from_numpy(np.sin(θ))
 	return cθ,sθ
 
-@ti.data_oriented
 class ReedsSheppForward2:
 	"""
 	Eikonal discretization scheme for the Reeds-Shepp forward model, which penalizes sqrt(1+ξ^2(curv-κ)^2)
@@ -147,23 +127,20 @@ class ReedsSheppForward2:
 	
 	@ti.pyfunc
 	def hfm_scheme(self, x, ih, weights:arr_t, offsets: arr_t, data:tpl_t): 
-		#	   ξ_,cθ_,sθ_,κ_,ε_,ε_cosmin2_): # Note : iξ := 1/ξ would be a more natural parameter
 		ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(data.ξ,x),getb(data.cθ,x),getb(data.sθ,x),getb(data.κ,x),getb(data.ε,x),getb(data.ε_cosmin2,x)
 		weights[*x,0] = (ih[2]/ξ)**2 # Angular control # Note : iξ := 1/ξ would be a more natural parameter
 		offsets[*x,0][0] = 0; offsets[*x,0][1] = 0; offsets[*x,0][2] = 1
 		# Possible improvement : slightly more efficient scheme in the case where κ==0 everywhere, 
 		# using the two-dimensional Selling decomposition
-		v = self.Traits.vect_t([cθ,sθ,κ]) * ih # Horizontal control
+		v = self.HFMTraits.vec_t([cθ,sθ,κ]) * ih # Horizontal control
 		λ,e = decomp_v(v,ε,ε_cosmin2)
 		for i in range(self.HFMTraits.nfwd): weights[*x,1+i] = λ[i]; offsets[*x,1+i] = e[i,:]
 
 	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,ε=0.01,ε_cosmin2=0.67):
-		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ) 
-		float_t = self.HFMTraits.float_t # TODO : Pass by value some parameters if constant over domain ?
-		data_t = ti.types.argpack(**{key:ti.types.ndarray(float_t) for key in ('ξ','cθ','sθ','κ','ε','ε_cosmin2')})
-		return data_t(to_ndarray(val,float_t) for val in (ξ,cθ,sθ,κ,ε,ε_cosmin2) ), data_t
+		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ) # Note : iξ := 1/ξ would be a more natural parameter
+		return make_argpack(**{key : (value, self.HFMTraits.float_t) for key,value in
+						(('ξ',ξ),('cθ',cθ),('sθ',sθ),('κ',κ),('ε',ε),('ε_cosmin2',ε_cosmin2))})
 
-@ti.data_oriented
 class ReedsShepp2:
 	"""
 	Reversible Reeds-Shepp sub-Riemannian model, penalizes sqrt( 1+ξ^2(curv-κ)^2 )
@@ -177,11 +154,8 @@ class ReedsShepp2:
 		self.HFMTraits = HFM.TraitsType(3,float_t,nrev=Selling.symdim(3),periodic_axis=2)
 
 	@ti.pyfunc
-	def hfm_scheme(self,x,ih,weights:ti.types.ndarray(),offsets:ti.types.ndarray(),data:ti.template()): 
-			   #ξ_,cθ_,sθ_,κ_,ε_,ε_cosmin2_): # Note : iξ := 1/ξ would be a more natural parameter
-		#ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(ξ_,x),getb(cθ_,x),getb(sθ_,x),getb(κ_,x),getb(ε_,x),getb(ε_cosmin2_,x)
-		#ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(data.ξ,x),getb(data.cθ,x),getb(data.sθ,x),getb(data.κ,x),getb(data.ε,x),getb(data.ε_cosmin2,x)
-		return
+	def hfm_scheme(self, x, ih, weights:arr_t, offsets:arr_t, data:tpl_t): 
+		ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(data.ξ,x),getb(data.cθ,x),getb(data.sθ,x),getb(data.κ,x),getb(data.ε,x),getb(data.ε_cosmin2,x)
 		v = self.HFMTraits.vec_t([cθ,sθ,κ]) * ih # Horizontal control
 		m = self_outer_relax(v,ε) # Relaxation to allow a bit of orthogonal control
 		m[2,2] = max(m[2,2],v[2]*v[2]+(ih[2]/ξ)**2) # Angular control
@@ -194,11 +168,9 @@ class ReedsShepp2:
 			if (w@ei)**2 >= (ei@ei) * (w@w) * (1-ε_cosmin2): λ[i]=0
 
 	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,ε=0.01,ε_cosmin2=0.67):
-		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ)
-		float_t = self.HFMTraits.float_t
-		argtype = ti.types.argpack(**{key:ti.types.ndarray(float_t) for key in ('ξ','cθ','sθ','κ','ε','ε_cosmin2')})
-		return argtype(*[to_ndarray(val,float_t) for val in (ξ,cθ,sθ,κ,ε,ε_cosmin2)] ), argtype
-
+		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ)  # Note : iξ := 1/ξ would be a more natural parameter
+		return make_argpack(**{key : (value, self.HFMTraits.float_t) for key,value in 
+						 (('ξ',ξ),('cθ',cθ),('sθ',sθ),('κ',κ),('ε',ε),('ε_cosmin2',ε_cosmin2))})
 
 fejerWeights = [
 	tuple(),
@@ -213,7 +185,6 @@ fejerWeights = [
 	(0.0527366, 0.179189, 0.264037, 0.330845, 0.346384, 0.330845, 0.264037, 0.179189, 0.0527366)
 ]
 
-@ti.data_oriented
 class Elastica2:
 	"""
 	The Euler Elastica geodesic model, which penalizes 1+ξ^2(curv-κ)^2
@@ -230,10 +201,9 @@ class Elastica2:
 		self.convex_curvature = convex_curvature
 
 	@ti.pyfunc
-	def hfm_scheme(self,x,ih,weights,offsets,
-			   ξ_,cθ_,sθ_,κ_,φmax_,ε_,ε_cosmin2_): # Note : iξ := 1/ξ would be a more natural parameter
+	def hfm_scheme(self, x, ih, weights:arr_t, offsets:arr_t, data:tpl_t): 
 		Traits = ti.static(self.HFMTraits)
-		ξ,cθ,sθ,κ,φmax,ε,ε_cosmin2 = getb(ξ_,x),getb(cθ_,x),getb(sθ_,x),getb(κ_,x),getb(φmax_,x),getb(ε_,x),getb(ε_cosmin2_,x)
+		ξ,cθ,sθ,κ,φmax,ε,ε_cosmin2 = getb(data.ξ,x),getb(data.cθ,x),getb(data.sθ,x),getb(data.κ,x),getb(data.φmax,x),getb(data.ε,x),getb(data.ε_cosmin2,x)
 		nFejer = ti.static(Traits.nfwd//6)
 		for l in ti.static(range(nFejer)):
 			φ = φmax*((l+0.5)/nFejer-0.5); cφ = ti.cos(φ); sφ = ti.sin(φ) 
@@ -247,9 +217,9 @@ class Elastica2:
 
 	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,φmax=np.pi/2,ε=0.01,ε_cosmin2=0.67):
 		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ)
-		return tuple(tofield(_,self.HFMTraits.float_t) for _ in (ξ,cθ,sθ,κ,φmax,ε,ε_cosmin2))
+		return make_argpack(**{key : (value, self.HFMTraits.float_t) for key,value in 
+				 (('ξ',ξ),('cθ',cθ),('sθ',sθ),('κ',κ),('φmax',φmax),('ε',ε),('ε_cosmin2',ε_cosmin2))})
 
-@ti.data_oriented
 class Dubins2:
 	"""
 	The Dubins geodesic model, which constraints curvature ξ |curv - κ| <=1
@@ -262,10 +232,9 @@ class Dubins2:
 		self.HFMTraits = HFM.TraitsType(3,float_t,nfwd=2*6,periodic_axis=2)
 
 	@ti.pyfunc
-	def hfm_scheme(self,x,ih,weights,offsets,
-			   ξ_,cθ_,sθ_,κ_,ε_,ε_cosmin2_): # Note : iξ := 1/ξ would be a more natural parameter
+	def hfm_scheme(self, x, ih, weights:arr_t, offsets:arr_t, data:tpl_t): 
 		Traits = ti.static(self.HFMTraits)
-		ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(ξ_,x),getb(cθ_,x),getb(sθ_,x),getb(κ_,x),getb(ε_,x),getb(ε_cosmin2_,x)
+		ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(data.ξ,x),getb(data.cθ,x),getb(data.sθ,x),getb(data.κ,x),getb(data.ε,x),getb(data.ε_cosmin2,x)
 		for s in range(2):
 			sign = 1-2*s
 			v = Traits.vec_t([cθ,sθ,κ+sign/ξ]) * ih
@@ -274,4 +243,5 @@ class Dubins2:
 
 	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,ε=0.01,ε_cosmin2=0.67):
 		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ)
-		return tuple(tofield(_,self.HFMTraits.float_t) for _ in (ξ,cθ,sθ,κ,ε,ε_cosmin2))
+		return make_argpack(**{key : (value, self.HFMTraits.float_t) for key,value in 
+						 (('ξ',ξ),('cθ',cθ),('sθ',sθ),('κ',κ),('ε',ε),('ε_cosmin2',ε_cosmin2))})

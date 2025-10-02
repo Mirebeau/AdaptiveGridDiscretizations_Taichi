@@ -60,6 +60,8 @@ class fifo:
 	def capacity(self): return Queue.fifo.capacity(self)
 	@ti.pyfunc
 	def size(self): return Queue.fifo.size(self)
+	@ti.pyfunc
+	def clear(self): return Queue.fifo.clear(self)
 
 class lifo:
 	def __init__(self,elem_type,capacity):
@@ -77,3 +79,5 @@ class lifo:
 	def top(self): return Queue.lifo.top(self)
 	@ti.pyfunc
 	def pop(self): return Queue.lifo.pop(self)
+	@ti.pyfunc
+	def clear(self): return Queue.lifo.clear(self)
