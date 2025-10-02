@@ -167,11 +167,11 @@ def solve(a,b:ti.template()):
         i2j[iMax]=j
         j2i[j]=iMax
 
-        invcMax = one_like(b[0])/cMax;
+        invcMax = one_like(b[0])/cMax
         # Remove line iMax from other lines, while performing likewise on b
         for i in range(ndim):
             if i2j[i]>=0: continue
-            r = a[i,j]*invcMax;
+            r = a[i,j]*invcMax
             for k in range(j+1,ndim): a[i,k]-=a[iMax,k]*r # Modifies a
             b[i]-=b[iMax]*r
     # Solve the remaining triangular system

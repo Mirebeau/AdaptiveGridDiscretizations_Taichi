@@ -1,5 +1,9 @@
 import taichi as ti
 
+"""This file implements efficient sorts of low-dimensional vectors"""
+
+# ------------- Network sort -------------
+
 NetworkGates = [ # Minimal network sorts up to 16 elements
 tuple(), # 0 element to sort
 tuple(), # 1 element to sort
@@ -41,4 +45,12 @@ def sort(x):
 			x[j],x[i]=x[i],x[j]
 	return x
 
+# --------- Utilities ---------
 
+@ti.pyfunc
+def argmin(x):
+	xmin = x[0]
+	imin = 0
+	for i in ti.static(range(1,x.n)):
+		if x[i]<xmin: xmin = x[i]; imin=i
+	return imin

@@ -7,6 +7,7 @@ from ..GetArrayModule import convert_dtype,reshape_ndarray,ti_debug,make_argpack
 from ..GetArrayModule import getitem_broadcast as getb
 from .. import GetArrayModule
 from . import CappedQueue
+from .. import Sort
 
 # Design principles.
 # - One pixel of padding/periodization in each dimension
@@ -136,8 +137,13 @@ class DistL1:
 	def set_defaults(self,sgrid,ih): return {'dummy':(1,self.NBTraits.float_t)}
 	@ti.pyfunc
 	def Update(self,nvals,data:tpl_t,ind): return nvals.min()+1
-
-
+	@ti.pyfunc
+	def Flow(self,nvals,data:tpl_t,ind):
+		flow = self.NBTraits.ivec_t(0)
+		k = Sort.argmin(nvals)
+		flow[k//2] = 2*(k%2)-1
+		return flow
+	
 # -------------- Narrow band core algorithm --------------
 
 @ti.data_oriented
@@ -339,11 +345,14 @@ class _Algo:
 
 		# Alternatively : sufficient to record seed block positions ? (In that case, no need to limit/guess capacity) 
 		self.seeds = CappedQueue.lifo(self.Traits.int_t,capacity=seeds_capacity)
+		self.noflow = ti.ndarray(Traits.vec_t,tuple())
+		#self.flow = ti.ndarray(Traits.vec_t,(0,)*ndim) # Empty array for now, we'll allocate when needed
 
 		self.self_ti, self.self_ti_t = make_argpack(
 		values = (self.values,Traits.float_t), 
 		new_values = (self.new_values,Traits.float_t),
 		walls = (self.walls,ti.i8), # Location of mmutable values
+		#flow = (self.flow,Traits.vec_t), # Optimal control flow
 		tol = (0,Traits.float_t), # Tolerance for the iterative methods
 		data = make_argpack(**data_oi), # Data for the metric update
 		cprods_o = make_argpack(**{key:(value,Traits.ivec_t) for key,value in cprods_o.items()})
@@ -383,7 +392,7 @@ class _Algo:
 		@ti.kernel # We cannot define it as a member kernel, because self_ti_t is only known after __init__
 		def update(self_ti:self.self_ti_t, 
 			 ixs_o:ti.types.ndarray(ti.i32,1), improved:ti.types.ndarray(ti.i8,1),
-			 ixs_o_begin:ti.i32, ixs_o_end:ti.i32):
+			 ixs_o_begin:ti.i32, ixs_o_end:ti.i32, flow:ti.types.ndarray(Traits.vec_t)):
 			"""
 			- self_ti : dat
 			"""
@@ -416,10 +425,6 @@ class _Algo:
 						if x[k]==self.shape[k]+1: ix_per -= self.periodic_shift[k]	
 				values_i[ix_i] = self_ti.values[ix_per]
 				value_old = values_i[ix_i] # Save the value to compare with update
-
-				# A temporary array is needed with strict_iter_i
-				new_values_i = ti.simt.block.SharedArray((size_i if Traits.strict_iter_i else 0,), Traits.float_t)
-				#new_values_i[ix_i] = values_i[ix_i] # Copy intended for immutable values (seeds, walls, b.c.)
 				ti.simt.block.sync()
 
 				# Prepare to fetch the neighbor values
@@ -432,33 +437,45 @@ class _Algo:
 				wall = self_ti.walls[ix] # wall : immutable value
 				nvalues = Traits.nvalues_t(np.nan) # NaN is a dummy neighbor value, will be replaced (becomes inf ??)
 
-				for iter_i in ti.static(range(Traits.niter_i)): # Inner loop for scheme evaluations
-					if not wall:  # wall : immutable value
+				if ti.static(len(flow.shape)>0): # Not actually an update : compute flow and exit
+					if wall: flow[ix] = ti.select(values_i[ix_i]<np.inf,0,np.nan) # Null at seed, NaN in wall
+					else: # Get the neighbor values, and compute the flow
 						for i in ti.static(range(Traits.nstencil)): # Get required neighbor values
-							if inner[i]: nvalues[i] = values_i[iy[i]] # Local values are updated along iterations
-							elif ti.static(iter_i==0): nvalues[i] = self_ti.values[iy[i]] # Global values are immutable along iterations
-						λ = self.metric.Update(nvalues,self_ti.data,data_ind)
-						if ti.static(Traits.strict_iter_i): # Use temporary variable to separate updates
-							new_values_i[ix_i]=λ
-							ti.simt.block.sync() # Wait until all thread finish using values_i
-							# It would be more efficient to swap values_i with new_values_i, but failed to make it work
-							values_i[ix_i] = new_values_i[ix_i] 
-						else: values_i[ix_i] = λ
-						if ti.static(iter_i < Traits.niter_i)-1: ti.simt.block.sync()
+							nvalues[i] = ti.select(inner[i],values_i[iy[i]],self_ti.values[iy[i]])
+							# Get required neighbor values
+							#if inner[i]: nvalues[i] = values_i[iy[i]] # Local values are updated along iterations
+							#else: nvalues[i] = self_ti.values[iy[i]] # Global values are immutable along iterations						
+						flow[ix] = self.metric.Flow(nvalues,self_ti.data,data_ind)
+				else: 
+					# A temporary array is needed with strict_iter_i
+					new_values_i = ti.simt.block.SharedArray((size_i if Traits.strict_iter_i else 0,), Traits.float_t)
+					for iter_i in ti.static(range(Traits.niter_i)): # Inner loop for scheme evaluations
+						if not wall:  # wall : immutable value
+							for i in ti.static(range(Traits.nstencil)): # Get required neighbor values
+								if inner[i]: nvalues[i] = values_i[iy[i]] # Local values are updated along iterations
+								elif ti.static(iter_i==0): nvalues[i] = self_ti.values[iy[i]] # Global values are immutable along iterations						
+							λ = self.metric.Update(nvalues,self_ti.data,data_ind)
+							if ti.static(Traits.strict_iter_i): # Use temporary variable to separate updates
+								new_values_i[ix_i]=λ
+								ti.simt.block.sync() # Wait until all thread finish using values_i
+								# It would be more efficient to swap values_i with new_values_i, but failed to make it work
+								values_i[ix_i] = new_values_i[ix_i] 
+							else: values_i[ix_i] = λ
+							if ti.static(iter_i < Traits.niter_i)-1: ti.simt.block.sync()
+					
+					# Diagnostic : did we improve the value ? (TODO : narrowband exponential criterion.)
+					value_new = values_i[ix_i]
+					if not(value_new >= value_old + self_ti.tol): 
+						improved[_ix_o] = True # All threads the write to same place
+						self_ti.new_values[ix] = values_i[ix_i] # Write back to global memory, if improved.
 
-				
-				# Diagnostic : did we improve the value ? (TODO : narrowband exponential criterion.)
-				value_new = values_i[ix_i]
-				if not(value_new >= value_old + self_ti.tol): 
-					improved[_ix_o] = True # All threads the write to same place
-					self_ti.new_values[ix] = values_i[ix_i] # Write back to global memory, if improved.
-
-			if ti.static(Traits.strict_iter_o):
-				# It would be more efficient to swap values with new_values, but failed to make it work
-				ti.loop_config(block_dim=size_i)
-				for _ix_o,ix_i in ti.ndrange(ixs_o.shape[0],size_i):
-					ix = ix_i + ixs_o[_ix_o] * Traits.size_i
-					self_ti.values[ix] = self_ti.new_values[ix]
+			if ti.static(Traits.strict_iter_o and len(flow.shape)==0):
+				for ix in range(self.size): self_ti.values[ix] = self_ti.new_values[ix]
+				# It would be more efficient to swap values with new_values, but I failed to make it work
+				# ti.loop_config(block_dim=size_i)
+				# for _ix_o,ix_i in ti.ndrange(ixs_o.shape[0],size_i):
+				# 	ix = ix_i + ixs_o[_ix_o] * Traits.size_i
+				# 	self_ti.values[ix] = self_ti.new_values[ix]
 
 		self.update = update # Save the kernel
 	
@@ -577,11 +594,11 @@ class _Algo:
 			return ixs_end
 		ixs_end = set_seeds(ixs,tag)
 
-		print(f"{self.seeds.size()=}, {self.seeds.elem[0]=}")
+		#print(f"{self.seeds.size()=}, {self.seeds.elem[0]=}")
 		self.seeds.clear()
 
 		for iter in range(nitermax):
-			self.update(self_ti, ixs, improved, 0, ixs_end)
+			self.update(self_ti, ixs, improved, 0, ixs_end, self.noflow)
 			#if not any(improved): break
 			#print(ixs_end,ixs.to_numpy()[:ixs_end],"\n", improved.to_numpy().reshape(self.shape_o))
 			ixs_end = self.tag_neighbors(ixs,improved,ixs_end,ixs_new,tag,tag_count)
@@ -633,7 +650,7 @@ class _Algo:
 				# Loop over index along the current axis, then in reverse
 				for r in itertools.chain(range(self.shape_o[k]), reversed(range(self.shape_o[k]))): 
 					beg = k*self.size_o + r*ksize_o
-					self.update(self_ti, ixs_o, improved, beg, beg+ksize_o)
+					self.update(self_ti, ixs_o, improved, beg, beg+ksize_o, self.noflow)
 			if not any(improved): break
 		else: print(f"Fast Sweeping completed {nitermax=} iterations, without reaching tolerance {tol=}")
 		return iter
@@ -650,16 +667,34 @@ class _Algo:
 
 		for iter in range(nitermax):
 			improved.fill(False)
-			self.update(self_ti, ixs_o, improved, 0, self.size_o)
+			self.update(self_ti, ixs_o, improved, 0, self.size_o, self.noflow)
 			#print(f"{iter=}",improved.to_numpy())
 			if not any(improved): break # Update until no-one improves
 			#self_ti.values,self_ti.new_values = self_ti.new_values,self_ti.values # Swap fails ??
 		else: print(f'Global iteration completed {nitermax=} iterations, without reaching tolerance {tol=}')
 		return iter
 
-	def ode(self):
-		pass
+	def flow(self):
+		"""
+		Extracts the geodesic flow from the solution of the eikonal equation (which must be computed before)
+		"""
+		self_ti = self.self_ti; Traits = self.Traits; size_o = self.size_o
+		ixs_o = ti.ndarray(ti.i32,size_o)
+		ixs_o.from_numpy(np.arange(size_o)) # Compute the flow in all blocks (we could consider a selection instead)
+		#if self.flow.shape[0]==0: 
+		#	self.flow = ti.ndarray(Traits.vec_t, self.size)
+		#	self_ti.flow = self.flow
+		flow = ti.ndarray(Traits.vec_t, self.size)
+		improved = ti.ndarray(ti.i8,1) # Dummy variable 
+		self.update(self_ti,ixs_o,improved,0,size_o,flow) # Set the flow at mutable points
 
+		# @ti.kernel # By convention, flow at seeds is zero, and flow at walls is NaN
+		# def wall_flow(values:arr_t,walls:arr_t,flow:arr_t):
+		# 	for ix in range(self.size):
+		# 		if walls[ix]: flow[ix] = ti.select(values[ix]<np.inf,0,np.nan)
+		# wall_flow(self.values,self.walls,flow)
+		return flow
+	
 # ------------- Narrow band external interface ---------
 
 class Domain:
@@ -733,3 +768,6 @@ class Domain:
 		"""
 		data_dict = self.metric.set_defaults(self.sgrid(),self.ih,**kwargs)
 		self.algo.build_scheme(data_dict,walls)
+
+	def ode(self):
+		pass
