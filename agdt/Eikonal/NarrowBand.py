@@ -17,7 +17,7 @@ from .. import Sort
 # And fetch data depending on this ? 
 # - We make our own two-level hierarchy, not using ti.field so as to :
 #  - avoid incessant recompilations
-#  - decide exactly what we cache
+#  - decide exactly what we cache in shared memory
 
 arr_t = ti.types.ndarray()
 tpl_t = ti.types.template()
@@ -164,8 +164,6 @@ class _Algo:
 		size_o = np.prod(shape_o)
 		self._sizes.from_numpy(np.array([size_o, size_o*Traits.size_i]))
 		
-		# Periodicity. Which axes are periodic is regarded a compile time constant
-		#self.periodic = (False,)*Traits.ndim if Traits.periodic is None else Traits.periodic
 		self._periodic_shift = ti.field(Traits.ivec_t,tuple())
 		self._periodic_shift[None] = tuple( 
 			(s//s_i) * c_o * Traits.size_i + (s%s_i) * c_i for s,s_i,c_o,c_i in 
@@ -280,7 +278,6 @@ class _Algo:
 			if bshape is None: bshape = shape_oi
 			for bs,s in zip(bshape,shape_oi): assert bs in (1,s)
 		if dtype is None: dtype = GetArrayModule.get_dtype(arr_oi)
-		#bshape = tuple(self.shape[i] if cprod_o[i]!=0 else 1 for i in range(ndim))
 		bshape_o = tuple(s_o if bs>1 else 1 for bs,s_o in zip(bshape,self.shape_o))
 		bshape_i = tuple(s_i if bs>1 else 1 for bs,s_i in zip(bshape,Traits.shape_i))
 		cprod_o = Traits.ivec_t(cprod(bshape_o))
@@ -325,8 +322,6 @@ class _Algo:
 			for y in ti.grouped(ti.ndrange(*self.shape)):
 				walls_oi[self.x2ix(1+y)] = walls[y*bmask]
 		copy_walls(self.walls,walls)
-		#print(self.walls.to_numpy())
-		#print(self.block_squeeze(self.walls,self.cprod_o,ti.i8).to_numpy())
 
 		# block_expand ndarray data. Other data is left untouched.
 		cprods_i = {} # Cumulative products of dimensions, for accessing entries
@@ -338,7 +333,7 @@ class _Algo:
 				data_oi[key]=(value_oi,dtype)
 			else:
 				cprods_o[key] = (0,)*self.Traits.ndim
-				cprods_i[key] = None #(0,)*self.Traits.ndim #None
+				cprods_i[key] = None 
 				data_oi[key]=(value,dtype)		
 		self.cprods_i = {key:(None if val is None else Traits.ivec_t(val)) for key,val in cprods_i.items()}
 		self.data_ind_t = ti.lang.matrix.VectorType(len(cprods_i),Traits.int_t) 
@@ -346,13 +341,11 @@ class _Algo:
 		# Alternatively : sufficient to record seed block positions ? (In that case, no need to limit/guess capacity) 
 		self.seeds = CappedQueue.lifo(self.Traits.int_t,capacity=seeds_capacity)
 		self.noflow = ti.ndarray(Traits.vec_t,tuple())
-		#self.flow = ti.ndarray(Traits.vec_t,(0,)*ndim) # Empty array for now, we'll allocate when needed
 
 		self.self_ti, self.self_ti_t = make_argpack(
 		values = (self.values,Traits.float_t), 
 		new_values = (self.new_values,Traits.float_t),
 		walls = (self.walls,ti.i8), # Location of mmutable values
-		#flow = (self.flow,Traits.vec_t), # Optimal control flow
 		tol = (0,Traits.float_t), # Tolerance for the iterative methods
 		data = make_argpack(**data_oi), # Data for the metric update
 		cprods_o = make_argpack(**{key:(value,Traits.ivec_t) for key,value in cprods_o.items()})
@@ -442,9 +435,6 @@ class _Algo:
 					else: # Get the neighbor values, and compute the flow
 						for i in ti.static(range(Traits.nstencil)): # Get required neighbor values
 							nvalues[i] = ti.select(inner[i],values_i[iy[i]],self_ti.values[iy[i]])
-							# Get required neighbor values
-							#if inner[i]: nvalues[i] = values_i[iy[i]] # Local values are updated along iterations
-							#else: nvalues[i] = self_ti.values[iy[i]] # Global values are immutable along iterations						
 						flow[ix] = self.metric.Flow(nvalues,self_ti.data,data_ind)
 				else: 
 					# A temporary array is needed with strict_iter_i
@@ -469,13 +459,10 @@ class _Algo:
 						improved[_ix_o] = True # All threads the write to same place
 						self_ti.new_values[ix] = values_i[ix_i] # Write back to global memory, if improved.
 
+			# Copy back data. It would be more efficient to swap values with new_values,
+			# but I failed to make it work. (The global pointers in self_ti are regarded as constants at compilation)
 			if ti.static(Traits.strict_iter_o and len(flow.shape)==0):
 				for ix in range(self.size): self_ti.values[ix] = self_ti.new_values[ix]
-				# It would be more efficient to swap values with new_values, but I failed to make it work
-				# ti.loop_config(block_dim=size_i)
-				# for _ix_o,ix_i in ti.ndrange(ixs_o.shape[0],size_i):
-				# 	ix = ix_i + ixs_o[_ix_o] * Traits.size_i
-				# 	self_ti.values[ix] = self_ti.new_values[ix]
 
 		self.update = update # Save the kernel
 	
@@ -593,17 +580,11 @@ class _Algo:
 			for i in range(self.seeds.size()): tag[self.seeds.elem[i]//Traits.size_i]=-1 # Cleanup
 			return ixs_end
 		ixs_end = set_seeds(ixs,tag)
-
-		#print(f"{self.seeds.size()=}, {self.seeds.elem[0]=}")
 		self.seeds.clear()
 
 		for iter in range(nitermax):
 			self.update(self_ti, ixs, improved, 0, ixs_end, self.noflow)
-			#if not any(improved): break
-			#print(ixs_end,ixs.to_numpy()[:ixs_end],"\n", improved.to_numpy().reshape(self.shape_o))
 			ixs_end = self.tag_neighbors(ixs,improved,ixs_end,ixs_new,tag,tag_count)
-			#print(f"{ixs_end=}",ixs_new.to_numpy()[:ixs_end])
-			#print("tag=",tag.to_numpy().reshape(self.shape_o),"tag_count=",tag_count.to_numpy()[:ixs_end])
 			if ixs_end==0: break # No improvement, no new neighbors tagged
 			ixs,ixs_new = ixs_new,ixs # Swap the two arrays. Hope it works here
 		else: print(f"AGSI completed {nitermax=} iterations, without reaching tolerance {tol=}")
@@ -668,7 +649,6 @@ class _Algo:
 		for iter in range(nitermax):
 			improved.fill(False)
 			self.update(self_ti, ixs_o, improved, 0, self.size_o, self.noflow)
-			#print(f"{iter=}",improved.to_numpy())
 			if not any(improved): break # Update until no-one improves
 			#self_ti.values,self_ti.new_values = self_ti.new_values,self_ti.values # Swap fails ??
 		else: print(f'Global iteration completed {nitermax=} iterations, without reaching tolerance {tol=}')
@@ -681,18 +661,9 @@ class _Algo:
 		self_ti = self.self_ti; Traits = self.Traits; size_o = self.size_o
 		ixs_o = ti.ndarray(ti.i32,size_o)
 		ixs_o.from_numpy(np.arange(size_o)) # Compute the flow in all blocks (we could consider a selection instead)
-		#if self.flow.shape[0]==0: 
-		#	self.flow = ti.ndarray(Traits.vec_t, self.size)
-		#	self_ti.flow = self.flow
 		flow = ti.ndarray(Traits.vec_t, self.size)
 		improved = ti.ndarray(ti.i8,1) # Dummy variable 
 		self.update(self_ti,ixs_o,improved,0,size_o,flow) # Set the flow at mutable points
-
-		# @ti.kernel # By convention, flow at seeds is zero, and flow at walls is NaN
-		# def wall_flow(values:arr_t,walls:arr_t,flow:arr_t):
-		# 	for ix in range(self.size):
-		# 		if walls[ix]: flow[ix] = ti.select(values[ix]<np.inf,0,np.nan)
-		# wall_flow(self.values,self.walls,flow)
 		return flow
 	
 # ------------- Narrow band external interface ---------
