@@ -24,17 +24,34 @@ tuple(), # 1 element to sort
 ((0,1),(2,3),(4,5),(6,7),(8,9),(10,11),(12,13),(14,15),(0,2),(4,6),(8,10),(12,14),(1,3),(5,7),(9,11),(13,15),(0,4),(8,12),(1,5),(9,13),(2,6),(10,14),(3,7),(11,15),(0,8),(1,9),(2,10),(3,11),(4,12),(5,13),(6,14),(7,15),(5,10),(6,9),(3,12),(13,14),(7,11),(1,2),(4,8),(1,4),(7,13),(2,8),(11,14),(5,6),(9,10),(2,4),(11,13),(3,8),(7,12),(6,8),(10,12),(3,5),(7,9),(3,4),(5,6),(7,8),(9,10),(11,12),(6,7),(8,9)),
 ]
 
+# TODO : remove the dtype argument, and try to do everything in place to avoid multiple
+# TODO : improve the long compilation times, due to Taichi inlining and unrolling everything ...
 @ti.pyfunc
-def argsort(x,int_t:ti.template()=int):
-	gates = ti.static(NetworkGates[x.n])
-	r = ti.lang.matrix.VectorType(x.n,int_t)(0)
-	for i in ti.static(range(r.n)): r[i]=int_t(i)
-	for i,j in ti.static(gates):
-		_i = r[i]
-		_j = r[j]
-		if x[_i]>x[_j]:
-			r[i]=_j
-			r[j]=_i
+def argsort(x,int_t:ti.template()=int,dtype=None):
+	"""Fixed size sort, intended for small sizes, on a single thread"""
+	n = ti.static(x.n)
+	r = ti.lang.matrix.VectorType(n,int_t)(0)
+	if ti.static(n>16): # Large dimension : divide and conquer (of course, dimension > 32 should be avoided in general)
+		n0 = ti.static(n//2); n1 = ti.static(n-n0)
+		x0 = ti.lang.matrix.VectorType(n0,dtype)(0); x1 = ti.lang.matrix.VectorType(n1,dtype)(0)
+		for i in ti.static(range(n0)): x0[i] = x[i] # We could avoid these copies (maybe they are removed at compilation ?)
+		for i in ti.static(range(n1)): x1[i] = x[n0+i]
+		r0 = argsort(x0,int_t,dtype); r1 = argsort(x1,int_t,dtype)
+		i0 = 0; i1 = 0
+		for i in range(n0+n1):
+			if i0==n0: r[i] = r1[i1]+n0; i1+=1
+			elif i1==n1: r[i] = r0[i0]; i0+=1
+			elif x0[r0[i0]] < x1[r1[i1]]: r[i] = r0[i0]; i0+=1
+			else: r[i] = r1[i1]+n0; i1+=1
+	else: # Small dimension : use network sort
+		gates = ti.static(NetworkGates[n])
+		for i in ti.static(range(n)): r[i]=int_t(i)
+		for i,j in ti.static(gates):
+			_i = r[i]
+			_j = r[j]
+			if x[_i]>x[_j]:
+				r[i]=_j
+				r[j]=_i
 	return r
 
 @ti.pyfunc

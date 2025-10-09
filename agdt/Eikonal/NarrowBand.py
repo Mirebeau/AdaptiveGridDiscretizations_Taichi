@@ -385,7 +385,7 @@ class _Algo:
 		@ti.kernel # We cannot define it as a member kernel, because self_ti_t is only known after __init__
 		def update(self_ti:self.self_ti_t, 
 			 ixs_o:ti.types.ndarray(ti.i32,1), improved:ti.types.ndarray(ti.i8,1),
-			 ixs_o_begin:ti.i32, ixs_o_end:ti.i32, flow:ti.types.ndarray(Traits.vec_t)):
+			 ixs_o_begin:ti.i32, ixs_o_end:ti.i32, flows:ti.types.ndarray(Traits.vec_t)):
 			"""
 			- self_ti : dat
 			"""
@@ -430,12 +430,12 @@ class _Algo:
 				wall = self_ti.walls[ix] # wall : immutable value
 				nvalues = Traits.nvalues_t(np.nan) # NaN is a dummy neighbor value, will be replaced (becomes inf ??)
 
-				if ti.static(len(flow.shape)>0): # Not actually an update : compute flow and exit
-					if wall: flow[ix] = ti.select(values_i[ix_i]<np.inf,0,np.nan) # Null at seed, NaN in wall
+				if ti.static(len(flows.shape)>0): # Not actually an update : compute flow and exit
+					if wall: flows[ix] = ti.select(values_i[ix_i]<np.inf,0,np.nan) # Null at seed, NaN in wall
 					else: # Get the neighbor values, and compute the flow
 						for i in ti.static(range(Traits.nstencil)): # Get required neighbor values
 							nvalues[i] = ti.select(inner[i],values_i[iy[i]],self_ti.values[iy[i]])
-						flow[ix] = self.metric.Flow(nvalues,self_ti.data,data_ind)
+						flows[ix] = self.metric.Flow(nvalues,self_ti.data,data_ind)
 				else: 
 					# A temporary array is needed with strict_iter_i
 					new_values_i = ti.simt.block.SharedArray((size_i if Traits.strict_iter_i else 0,), Traits.float_t)
@@ -461,7 +461,7 @@ class _Algo:
 
 			# Copy back data. It would be more efficient to swap values with new_values,
 			# but I failed to make it work. (The global pointers in self_ti are regarded as constants at compilation)
-			if ti.static(Traits.strict_iter_o and len(flow.shape)==0):
+			if ti.static(Traits.strict_iter_o and len(flows.shape)==0):
 				for ix in range(self.size): self_ti.values[ix] = self_ti.new_values[ix]
 
 		self.update = update # Save the kernel
@@ -654,17 +654,17 @@ class _Algo:
 		else: print(f'Global iteration completed {nitermax=} iterations, without reaching tolerance {tol=}')
 		return iter
 
-	def flow(self):
+	def flows(self):
 		"""
 		Extracts the geodesic flow from the solution of the eikonal equation (which must be computed before)
 		"""
 		self_ti = self.self_ti; Traits = self.Traits; size_o = self.size_o
 		ixs_o = ti.ndarray(ti.i32,size_o)
 		ixs_o.from_numpy(np.arange(size_o)) # Compute the flow in all blocks (we could consider a selection instead)
-		flow = ti.ndarray(Traits.vec_t, self.size)
+		flows = ti.ndarray(Traits.vec_t, self.size)
 		improved = ti.ndarray(ti.i8,1) # Dummy variable 
-		self.update(self_ti,ixs_o,improved,0,size_o,flow) # Set the flow at mutable points
-		return flow
+		self.update(self_ti,ixs_o,improved,0,size_o,flows) # Set the flow at mutable points
+		return flows
 	
 # ------------- Narrow band external interface ---------
 
@@ -702,9 +702,27 @@ class Domain:
 	@property
 	@ti.pyfunc
 	def origin(self): return self._origin[None]
+
 #	@property
 #	@ti.pyfunc
 #	def cprod(self): return self._cprod[None]
+	#@ti.pyfunc
+	#def x2ix(self,x):
+	# @ti.pyfunc
+	# def x2ix_oi(self,x):
+	# 	"""Turns a multi-dimensional index, into a linear index suitable for accessing the fields"""
+	# 	shape_i = Traits.shape
+	# 	return x//self
+
+	# ------ Grid utilities ------
+	
+	# identical to HFM (make grid class to factorize ?)
+	@ti.pyfunc
+	def IndexFromPoint(self,point): return (point-self.origin)*self.ih
+	@ti.pyfunc
+	def PointFromIndex(self,index,to:tpl_t=False):
+		if ti.static(to): return self.IndexFromPoint(index)
+		return index*self.h+self.origin
 
 	# Coordinates, sparse and dense, same as HFM.Domain
 	def sgrid(self):
@@ -716,6 +734,8 @@ class Domain:
 		"""Returns a (broadcasted) grid of the domain"""
 		return tuple(np.broadcast_to(s,self.shape) for s in self.sgrid())
 
+	# -------- Eikonal solver calls --------
+
 	@ti.pyfunc
 	def set_seed(self,self_ti,x,value=0):
 		ix = self.algo.x2ix(1+x) # Add 1 for b.c.
@@ -723,13 +743,6 @@ class Domain:
 		if self.Traits.strict_iter_o: self_ti.new_values[ix] = value
 		self_ti.walls[ix] = True
 		self.algo.seeds.push(ix)
-	#@ti.pyfunc
-	#def x2ix(self,x):
-	# @ti.pyfunc
-	# def x2ix_oi(self,x):
-	# 	"""Turns a multi-dimensional index, into a linear index suitable for accessing the fields"""
-	# 	shape_i = Traits.shape
-	# 	return x//self
 
 	def build_scheme(self,walls=None,**kwargs):
 		"""
@@ -740,5 +753,21 @@ class Domain:
 		data_dict = self.metric.set_defaults(self.sgrid(),self.ih,**kwargs)
 		self.algo.build_scheme(data_dict,walls)
 
+	def values(self): return self.algo.block_squeeze(self.algo.values)
+
+	def flows(self,adim:tpl_t=False):
+		flows = self.algo.block_squeeze(self.algo.flows())
+		@ti.kernel
+		def rescale_flow(flows:arr_t):
+			for x in ti.grouped(flows): flows[x] *= self.h
+		if not adim: rescale_flow(flows)
+		return flows
+
+		# TODO. Should I get diffs ? The flow *should* be more regular due to the small stencils, but who knows ? 
+		# Also, not sure how to compute diffs here. It could depend on the considered scheme, there is no obvious formula.
+		# Maybe juste look at the immediate neighbors ? Or deactivate this criterion ? 
+
+
 	def ode(self):
+		# TODO : seeds_distL1, probably use global iteration, similar to HFM (factorize ?)
 		pass

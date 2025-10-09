@@ -202,15 +202,14 @@ class Elastica2:
 
 	@ti.pyfunc
 	def hfm_scheme(self, x, ih, weights:arr_t, offsets:arr_t, data:tpl_t): 
-		Traits = ti.static(self.HFMTraits)
 		ξ,cθ,sθ,κ,φmax,ε,ε_cosmin2 = getb(data.ξ,x),getb(data.cθ,x),getb(data.sθ,x),getb(data.κ,x),getb(data.φmax,x),getb(data.ε,x),getb(data.ε_cosmin2,x)
-		nFejer = ti.static(Traits.nfwd//6)
+		nFejer = ti.static(self.HFMTraits.nfwd//6)
 		for l in ti.static(range(nFejer)):
 			φ = φmax*((l+0.5)/nFejer-0.5); cφ = ti.cos(φ); sφ = ti.sin(φ) 
-			v = Traits.vect_t([cθ*cφ, sθ*cφ, cφ*κ+sφ/ξ]) * ih
+			v = self.HFMTraits.vec_t([cθ*cφ, sθ*cφ, cφ*κ+sφ/ξ]) * ih
 			λ,e = decomp_v(v,ε,ε_cosmin2)
 			s = fejerWeights[l]
-			if ti.static(Traits.convex_curvature): # Turn left only variant
+			if ti.static(self.convex_curvature): # Turn left only variant
 				if 2*l == nFejer-1: s /= 2
 				if 2*l >  nFejer-1: s = 0
 			for i in range(6): weights[*x,6*l+i] = λ[i]; offsets[*x,6*l+i] = e[i,:]
@@ -233,11 +232,10 @@ class Dubins2:
 
 	@ti.pyfunc
 	def hfm_scheme(self, x, ih, weights:arr_t, offsets:arr_t, data:tpl_t): 
-		Traits = ti.static(self.HFMTraits)
 		ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(data.ξ,x),getb(data.cθ,x),getb(data.sθ,x),getb(data.κ,x),getb(data.ε,x),getb(data.ε_cosmin2,x)
 		for s in range(2):
 			sign = 1-2*s
-			v = Traits.vec_t([cθ,sθ,κ+sign/ξ]) * ih
+			v = self.HFMTraits.vec_t([cθ,sθ,κ+sign/ξ]) * ih
 			λ,e = decomp_v(v,ε,ε_cosmin2)
 			for i in ti.static(range(6)): weights[*x,6*s+i] = λ[i]; offsets[*x,6*s+i] = e[i,:]
 

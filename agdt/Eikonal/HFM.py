@@ -165,15 +165,26 @@ class _Algo:
 				bact = 0
 				btot = 0
 				voffset = 0
-				for mix in ti.static(range(nmix)):
-					for e in ti.static(range(nrev)):
-						if self.visible(x, offsets[*bx,bact],walls): voffset |= 1<<btot
-						btot+=1
-						if self.visible(x,-offsets[*bx,bact],walls): voffset |= 1<<btot
-						btot+=1; bact+=1
-					for e in ti.static(range(nfwd)):
-						if self.visible(x, offsets[*bx,bact],walls): voffset |= 1<<btot
-						btot+=1; bact+=1
+				for mix in range(nmix): # Nothing unrolled
+					if ti.static(nrev>0): # Usually, either nrev==0 or nfwd==0
+						for e in range(nrev):
+							for s in range(2): 
+								if self.visible(x,(1-2*s)*offsets[*bx,bact],walls): voffset |= 1<<btot
+								btot+=1 
+							bact+=1
+					if ti.static(nfwd>0):
+						for e in range(nfwd):
+							if self.visible(x, offsets[*bx,bact],walls): voffset |= 1<<btot
+							btot+=1; bact+=1
+				# for mix in ti.static(range(nmix)): # All unrolled : long compile times
+				# 	for e in ti.static(range(nrev)):
+				# 		if self.visible(x, offsets[*bx,bact],walls): voffset |= 1<<btot
+				# 		btot+=1
+				# 		if self.visible(x,-offsets[*bx,bact],walls): voffset |= 1<<btot
+				# 		btot+=1; bact+=1
+				# 	for e in ti.static(range(nfwd)):
+				# 		if self.visible(x, offsets[*bx,bact],walls): voffset |= 1<<btot
+				# 		btot+=1; bact+=1
 				voffsets[x] = voffset
 		voffsets = ti.ndarray(dtype=self.Traits.voffset_t,shape=self.shape)
 		if walls is None: walls = ti.ndarray(dtype=Traits.wall_t,shape=self.shape); walls.fill(0)
@@ -415,7 +426,7 @@ class _Algo:
 				if voffset & 1<<btot: vals[bact] = values[ix+ioffsets[fx,bact]]
 				btot+=1; bact+=1
 			# Solve the piecewise quadratic equation, to find the update value
-			ivals = Sort.argsort(vals)
+			ivals = Sort.argsort(vals,dtype=self.float_t)
 			cost = self_ti.costs[ix]
 
 			λ0 = vals[ivals[0]]
