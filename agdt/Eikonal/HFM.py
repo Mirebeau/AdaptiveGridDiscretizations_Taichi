@@ -487,7 +487,7 @@ class _Algo:
 		nrev,nfwd,nact,ntot = ti.static(self.Traits.nrev,self.Traits.nfwd,self.Traits.nact,self.Traits.ntot)
 		values,ioffsets,offsets,weights = ti.static(self_ti.values,self_ti.ioffsets,self_ti.offsets,self_ti.weights)
 		# Note that self.update(ix) == self.values[ix] after solver is run, except at seed points
-		λ,mix = self.update(self_ti, ix, ret_mix=True) 
+		λ,mix = self.update(self_ti, ix, ret_mix=True)  # Recomputation is in case of partial convergence, and to get mix
 		λ = min(λ,values[ix]) # Get null gradient at the seed center
 		bact = mix*nact; btot = mix*ntot
 		voffset = self_ti.voffsets[ix]
@@ -495,7 +495,7 @@ class _Algo:
 		flow = self.Traits.vec_t(0.)
 		wsum : self.float_t = 0.
 		csum : self.float_t = 0.
-		for e in ti.static(range(nrev)):
+		for e in ti.static(range(nrev)): # Actual counters are btot, bact
 			val = np.inf
 			sign = 1
 			if voffset & 1<<btot: val = values[ix+ioffsets[fx,bact]]
@@ -1005,7 +1005,7 @@ class GeodesicODE:
 			0.25, # geodesicStep : how much to advance at each step
 			0.5/2**self.ndim, # weightThreshold : used in interpolation pruning
 			4, # causalityTolerance : likewise
-		)))
+		),dtype=self.np_float_t))
 		self.seeds_top = np.iinfo(convert_dtype['np'][seeds.dtype]).max #1000 # Some arbitrary upper bound for the seeds field #np.iinfo(convert_dtype['np'][seeds.dtype]).max 
 	
 	# Runtime parameters
@@ -1028,9 +1028,13 @@ class GeodesicODE:
 	@property
 	def float_t(self): return self.flows.dtype
 	@property
+	def np_float_t(self): return convert_dtype['np'][self.float_t]
+	@property
 	def vec_t(self): return ti.lang.matrix.VectorType(self.ndim,self.float_t)
 	@property
 	def ivec_t(self): return ti.lang.matrix.VectorType(self.ndim,ti.i32)
+	@property
+	def hasdiffs(self): return len(self.diffs.shape)>0 # Pointwise diffs are optional
 
 	@ti.pyfunc
 	def crop_periodize(self,x):
@@ -1070,13 +1074,17 @@ class GeodesicODE:
 					min_val = val
 					minx = xe
 
-		thres_val = min_val + self_ti.diffs[minx] * self.causalityTolerance
+		#diff = self_ti.diffs[None]
+		diff:self.float_t=0.
+		if ti.static(self.hasdiffs): diff=self_ti.diffs[minx]
+		else: diff = self_ti.diffs[None]
+		thres_val = min_val + diff * self.causalityTolerance
 		wsum = 0.; val = 0. # wsum = self.float_t(0); val = self.float_t(0) # Error ??
 		flow = self.vec_t(0)
 
 		for e in ti.grouped(ti.ndrange(*(2,)*self.ndim)):
 			xe = self.crop_periodize(x0+e)
-			if self_ti.values[xe]<=thres_val: # Disregard too large values
+			if self_ti.values[xe]<thres_val: # Disregard too large values
 				w = Linalg.product(1-ti.abs(e-e0)) # Interpolation weight
 				wsum += w
 				val  += w*self_ti.values[xe]
@@ -1085,7 +1093,7 @@ class GeodesicODE:
 		val /= wsum; flow /= wsum # Due to pruning, weights may not sum to one
 		return flow,val,minx,min_seed
 	
-	def backtrack(self,tips,delay_values=50,delay_minx=30,delay_seeds=6,max_len=2000):
+	def backtrack(self,tips,delay_values=60,delay_minx=30,delay_seeds=6,max_len=2000):
 		"""Backtrack geodesics from the given tips.
 		- delay_values : delay before stopping if values increase (StationnaryValues criterion)
 		- delay_minx : delay before stopping if values increase (StationnaryPosition criterion)
@@ -1155,7 +1163,7 @@ class GeodesicODE:
 
 		geo = ti.ndarray(self.vec_t, shape = (ntips,256))
 		geo_old = ti.ndarray(self.vec_t, shape = (ntips,1))
-		geo_old.from_numpy(tips[:,None,:])
+		geo_old.from_numpy(tips[:,None,:].astype(self.np_float_t))
 		PointFromIndex_ker(geo_old,True)
 
 		ode(pack, geo, geo_old)
