@@ -4,10 +4,9 @@ import numpy as np
 import copy
 import itertools
 from ..GetArrayModule import convert_dtype,reshape_ndarray,ti_debug,make_argpack
-from ..GetArrayModule import getitem_broadcast as getb
 from .. import GetArrayModule
 from . import CappedQueue
-from .. import Sort
+from . import HFM
 
 # Design principles.
 # - One pixel of padding/periodization in each dimension
@@ -74,75 +73,6 @@ class TraitsType:
 	def x2ix_i(self,x):
 		assert all(x>=0) and all(x<self.shape_i)
 		return x@self.cprod_i
-
-# ------------------ Models and local scheme update ------------------
-shape_i_default = ( # Default base level block
-	tuple(),
-	(32,),
-	(8,8),
-	(4,4,4),
-	(4,4,2,2),
-	(2,2,2,2,2)
-)
-
-def axis_aligned_stencil(ndim):
-	return tuple((0,)*i + (s,) + (0,)*(ndim-1-i) for i in range(ndim) for s in (-1,1)) 
-
-@ti.pyfunc
-def getData(pack:ti.template(),ind,name:ti.template()):
-	"""returns pack.name[ind.name], for an array, or pack.name for a value"""
-	if ti.static(isinstance(pack[name],(ti.lang.any_array.AnyArray,ti.lang._ndarray.Ndarray))): 
-		return pack[name][ind[ti.static(pack.keys.index(name))]]
-	else: return pack[name]
-
-
-# class Laplacian:
-# 	"""
-# 	Discretization of Δu = rhs, extremely inefficient (only debugging)
-# 	"""
-# 	def __init__(self,ndim,float_t):
-# 		self.NBTraits = TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
-	
-# 	def set_defaults(self,sgrid,ih,rhs=0):
-# 		"""
-# 		Prepares the arguments to be passed to the update function.
-# 		- sgrid : Sparse grid of the domain
-# 		- ih : Inverse grid scales (Could be computed from sgrid, but convenient)
-# 		- rhs (optional) : right hand side for the PDE
-# 		"""
-# 		Traits = self.NBTraits
-# 		return {'ih2':(ih**2,Traits.vec_t), 'ih2is':(1/(2*ih**2).sum(),Traits.float_t), 'rhs':(rhs,Traits.float_t)}
-	
-# 	@ti.pyfunc
-# 	def Update(self,nvals,data:tpl_t,ind):
-# 		"""
-# 		Solve sum (u(x+hi ei)+u(x-hi ei)-2 λ)/hi**2 = rhs
-# 		- nvals : neighbor values, according to the provided stencil
-# 		- data : scheme parameters
-# 		- ind : where to extract the scheme parameters
-# 		"""
-# 		r:   self.NBTraits.int_t   = 0  # type:ignore
-# 		sum: self.NBTraits.float_t = 0. # type:ignore
-# 		for i,s in ti.static(ti.ndrange(self.NBTraits.ndim, 2)):
-# 			sum += data.ih2[i] * nvals[r]
-# 			r+=1
-# 		rhs = getData(data,ind,'rhs')
-# 		λ = (sum - rhs) * data.ih2is
-# 		return λ
-	
-class DistL1:
-	"""Computation of the pixel-wise L1 distance (for debug purposes)"""
-	def __init__(self,ndim,float_t): 
-		self.NBTraits = TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
-	def set_defaults(self,sgrid,ih): return {'dummy':(1,self.NBTraits.float_t)}
-	@ti.pyfunc
-	def Update(self,nvals,data:tpl_t,ind): return nvals.min()+1
-	@ti.pyfunc
-	def Flow(self,nvals,data:tpl_t,ind):
-		flow = self.NBTraits.ivec_t(0)
-		k = Sort.argmin(nvals)
-		flow[k//2] = 2*(k%2)-1
-		return flow
 	
 # -------------- Narrow band core algorithm --------------
 
@@ -154,7 +84,7 @@ class _Algo:
 		self._shape = ti.field(Traits.ivec_t,tuple())
 		self._shape[None] = shape 
 
-		# We pad with at least one pixel on each dimension, for b.c. and periodicity 
+		# Boundary padding : We pad with at least one pixel on each dimension, for b.c. and periodicity 
 		shape_o = tuple(int(np.ceil((s + 2)/s_i)) for s,s_i in zip(self.shape,self.Traits.shape_i))
 		self._shape_o = ti.field(Traits.ivec_t,tuple())
 		self._shape_o[None] = shape_o
@@ -171,7 +101,7 @@ class _Algo:
 
 	# Compile time constants
 	@property
-	def Traits(self): return self.metric.NBTraits
+	def Traits(self): return self.metric.Traits
 
 	# Runtime constants (changing domain size should not trigger recompilation)
 	@property
@@ -383,7 +313,7 @@ class _Algo:
 		"""
 		Traits = self.Traits
 		@ti.kernel # We cannot define it as a member kernel, because self_ti_t is only known after __init__
-		def update(self_ti:self.self_ti_t, 
+		def gpu_update(self_ti:self.self_ti_t, 
 			 ixs_o:ti.types.ndarray(ti.i32,1), improved:ti.types.ndarray(ti.i8,1),
 			 ixs_o_begin:ti.i32, ixs_o_end:ti.i32, flows:ti.types.ndarray(Traits.vec_t)):
 			"""
@@ -435,7 +365,7 @@ class _Algo:
 					else: # Get the neighbor values, and compute the flow
 						for i in ti.static(range(Traits.nstencil)): # Get required neighbor values
 							nvalues[i] = ti.select(inner[i],values_i[iy[i]],self_ti.values[iy[i]])
-						flows[ix] = self.metric.Flow(nvalues,self_ti.data,data_ind)
+						flows[ix] = self.metric.Flow(nvalues,self_ti.data,data_ind,value_old)
 				else: 
 					# A temporary array is needed with strict_iter_i
 					new_values_i = ti.simt.block.SharedArray((size_i if Traits.strict_iter_i else 0,), Traits.float_t)
@@ -464,7 +394,67 @@ class _Algo:
 			if ti.static(Traits.strict_iter_o and len(flows.shape)==0):
 				for ix in range(self.size): self_ti.values[ix] = self_ti.new_values[ix]
 
-		self.update = update # Save the kernel
+		# CPU update is intended for debug purposes. Should be quite slow and limited.
+		@ti.kernel # We cannot define it as a member kernel, because self_ti_t is only known after __init__
+		def cpu_update(self_ti:self.self_ti_t, 
+			 ixs_o:ti.types.ndarray(ti.i32,1), improved:ti.types.ndarray(ti.i8,1),
+			 ixs_o_begin:ti.i32, ixs_o_end:ti.i32, flows:ti.types.ndarray(Traits.vec_t)):
+			ti.static_assert(len(ixs_o.shape)==1)
+			assert ixs_o_begin <= ixs_o_end <= ixs_o.shape[0]
+			ndim,size_i = ti.static(Traits.ndim,Traits.size_i)
+			#ti.loop_config(block_dim=size_i)
+			for _ix_o,ix_i in ti.ndrange((ixs_o_begin,ixs_o_end),size_i):
+				# ix_i the index in the inner shape, and also the thread index
+				ix_o = ixs_o[_ix_o] # ix_o is the index in the outer shape
+				x_o = self.ix2x_o(ix_o) # No way to avoid this, unless ixs_o stores full indices
+				x_i = Traits.ix2x_i(ix_i) # Should be cheap thanks to power-of-2 arithmertic
+				x = x_o * Traits.shape_i + x_i # Not always used, but should be cheap ...
+				assert 0<=ix_o<self.size_o
+
+				# Also setup the indices for the data extraction
+				data_ind = self.data_ind_t(0)
+				for name in ti.static(self_ti.data.keys):
+					i = ti.static(self_ti.data.keys.index(name))
+					if ti.static(isinstance(self_ti.data[name],ti.lang.any_array.AnyArray)):
+						data_ind[i] = (x_o @ self_ti.cprod_o[name])*size_i + x_i @ self.cprods_i[name]
+
+				# Fetch the values from global memory
+				ix = ix_i + ix_o*size_i # Global index
+				ix_per = ix 
+				for k in ti.static(range(ndim)): # Take periodic b.c into account
+					if ti.static(Traits.periodic[k]):
+						if x[k]==0: ix_per += self.periodic_shift[k]
+						if x[k]==self.shape[k]+1: ix_per -= self.periodic_shift[k]	
+				value_old = self_ti.values[ix_per] #values_i[ix_i] # Save the value to compare with update
+				value_new = value_old
+				wall = self_ti.walls[ix] # wall : immutable value
+
+				# Fetch the neighbor values
+				nstencil = ti.static(Traits.nstencil)
+				nvalues = Traits.nvalues_t(np.nan) # NaN is a dummy neighbor value, will be replaced (becomes inf ??)
+				if not wall:
+					for i in ti.static(range(nstencil)):
+						ioffset,_ = self.ioffset_static(x_i,offset=ti.static(Traits.stencil[i]))
+						nvalues[i] = self_ti.values[ix+ioffset]
+
+				if ti.static(len(flows.shape)>0): # Not actually an update : compute flow and exit
+					if wall: flows[ix] = ti.select(value_old<np.inf,0,np.nan) # Null at seed, NaN in wall
+					else: flows[ix] = self.metric.Flow(nvalues,self_ti.data,data_ind,value_old)
+				else: # no inner loop here, equivalently niter_i = 1
+					if not wall: value_new = self.metric.Update(nvalues,self_ti.data,data_ind)
+					
+					if not(value_new >= value_old + self_ti.tol): 
+						improved[_ix_o] = True # All threads the write to same place
+						self_ti.new_values[ix] = value_new # Write back to global memory, if improved.
+
+			# Copy back data. It would be more efficient to swap values with new_values,
+			# but I failed to make it work. (The global pointers in self_ti are regarded as constants at compilation)
+			if ti.static(Traits.strict_iter_o and len(flows.shape)==0):
+				for ix in range(self.size): self_ti.values[ix] = self_ti.new_values[ix]
+
+		self.gpu_update = gpu_update
+		self.cpu_update = cpu_update
+		self.update = gpu_update # Save the kernel
 	
 	# --------- AGSI -------
 
@@ -517,21 +507,23 @@ class _Algo:
 		# Prefix sum, using a single recusion since we only have rather small data, as we are at the block level. 
 		# Reimplemented since taichi.algorithms._algorithms.PrefixSumExecutor is not available for metal.
 		stride = ti.static(32) # Number of values dealt with by a single thread
-		for i in range(ixs_end//stride): 
+		end_stride = ixs_end//stride
+		for i in range(end_stride): 
 			for j in range(1,stride): tag_count[i*stride+j] += tag_count[(i*stride+j)-1] # unroll ? 
 		ti.loop_config(serialize=True) # Serial loop bottleneck. Should be fine here (relatively few active blocks) ? 
-		for i in range(1,ixs_end//stride): tag_count[(i+1)*stride-1]+=tag_count[i*stride-1]
-		for i in range(1,ixs_end//stride): 
+		for i in range(1,end_stride): tag_count[(i+1)*stride-1]+=tag_count[i*stride-1]
+		for i in range(1,end_stride): 
 			for j in range(stride-1): tag_count[i*stride+j] += tag_count[i*stride-1] # unroll ? 
 		ti.loop_config(serialize=True) # Deal with the last elements
-		for j in range((ixs_end//stride)*stride,ixs_end): tag_count[j] += tag_count[j-1]
+		for j in range((end_stride==0)+end_stride*stride,ixs_end): tag_count[j] += tag_count[j-1]  
 		ixs_end_new = tag_count[ixs_end-1]
 		# Generate the new_ixs
 		for _ixs in range(ixs_end):
 			if not improved[_ixs]: continue
 			ix = ixs[_ixs]
 			x = self.ix2x_o(ix)
-			counter = ti.select(_ixs>0,tag_count[_ixs-1],0)
+			counter = 0
+			if _ixs>0: counter = tag_count[_ixs-1] # Note : ti.select does not early branch -> bad access
 			# Note : cleanup of tag array, with value -1, is not absolutely needed for correctness
 			if tag[ix]==_ixs:         ixs_new[counter]=ix; counter+=1; tag[ix]=-1
 			for k in ti.static(range(ndim)):
@@ -690,7 +682,7 @@ class Domain:
 		
 	# Compile time constants
 	@property
-	def Traits(self): return self.metric.NBTraits
+	def Traits(self): return self.metric.Traits
 
 	# Runtime constants
 	@property
@@ -762,12 +754,41 @@ class Domain:
 			for x in ti.grouped(flows): flows[x] *= self.h
 		if not adim: rescale_flow(flows)
 		return flows
-
-		# TODO. Should I get diffs ? The flow *should* be more regular due to the small stencils, but who knows ? 
+		# TODO. Should I get diffs as in HFM ? The flow *should* be more regular due to the small stencils, but who knows ? 
 		# Also, not sure how to compute diffs here. It could depend on the considered scheme, there is no obvious formula.
 		# Maybe juste look at the immediate neighbors ? Or deactivate this criterion ? 
 
+	def seeds_distL1(self,maxL1=7):
+		"""
+		L1 distance to the seeds, up to maxL1. Used for PastSeed backtracking stopping criterion."
+		"""
+		distL1 = ti.ndarray(ti.i8,self.shape)
+		distL1.fill(maxL1+1)
+		algo = self.algo
+
+		@ti.kernel # Seeds are points with finite values which are tagged as walls
+		def set_seeds(distL1:ti.types.ndarray(),self_ti:algo.self_ti_t):
+			for x in ti.grouped(distL1):
+				ix = self.algo.x2ix(x+1) # Accounts for padding
+				if self_ti.walls[ix]==1: distL1[x] = ti.select(self_ti.values[ix]<np.inf, 0,maxL1+2)
+		set_seeds(distL1,algo.self_ti)
+
+		@ti.kernel
+		def GlobalIterL1(distL1:ti.types.ndarray()):
+			for x in ti.grouped(distL1):
+				dist = distL1[x]
+				if 0<dist<maxL1+2: # Do not update seeds or walls
+					for i in ti.static(range(self.Traits.ndim)):
+						if x[i]>0: y=x; y[i]-=1; dist = min(dist,1+distL1[y]) # Update left
+						elif ti.static(self.Traits.periodic[i]): y=x; y[i]=self.shape[i]-1; dist = min(dist,1+distL1[y])
+						if x[i]<self.shape[i]-1: y=x; y[i]+=1; dist = min(dist,1+distL1[y]) # Update right
+						elif ti.static(self.Traits.periodic[i]): y=x; y[i]=0; dist = min(dist,1+distL1[y])
+					distL1[x]=dist
+		for iter in range(maxL1): GlobalIterL1(distL1)
+		return distL1
+
 
 	def ode(self):
-		# TODO : seeds_distL1, probably use global iteration, similar to HFM (factorize ?)
-		pass
+		diffs = ti.ndarray(self.Traits.float_t, tuple())
+		diffs.fill(np.inf)
+		return HFM.GeodesicODE(self.seeds_distL1(),self.values(),self.flows(adim=True),diffs,self.Traits.periodic,self.PointFromIndex)
