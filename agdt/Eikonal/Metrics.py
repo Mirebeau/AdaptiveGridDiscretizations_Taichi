@@ -19,7 +19,7 @@ tpl_t = ti.template()
 # --------------------
 class Diagonal:
 	"""
-	Eikonal discretization scheme for a diagonal metric
+	Eikonal discretization scheme for a diagonal metric, using upwind finite differences
 	- dcost (Array of shape (d,)): positive cost along each axis
 	"""
 	def __init__(self,ndim,float_t):
@@ -75,7 +75,7 @@ class Riemann:
 		Traits= self.HFMTraits
 		if m is None: m = ti.math.eye(self.HFMTraits.ndim).tolist()
 		data_t = ti.types.argpack(m=ti.types.ndarray(Traits.mat_t))
-		return data_t(to_ndarray(m,self.HFMTraits.mat_t)), data_t #(to_ndarray(m,self.HFMTraits.mat_t),)
+		return data_t(to_ndarray(m,self.HFMTraits.mat_t)), data_t
 
 # --------- Non-holonomic models ---------
 @ti.pyfunc
@@ -199,20 +199,22 @@ class Elastica2:
 	def __init__(self,float_t,nFejer=5, convex_curvature=False):
 		self.HFMTraits = HFM.TraitsType(3,float_t,nfwd=nFejer*6,periodic_axis=2)
 		self.convex_curvature = convex_curvature
+		self.fejerWeights = ti.field(float_t,nFejer)
+		self.fejerWeights.from_numpy(np.array(fejerWeights[nFejer]))
 
 	@ti.pyfunc
 	def hfm_scheme(self, x, ih, weights:arr_t, offsets:arr_t, data:tpl_t): 
 		ξ,cθ,sθ,κ,φmax,ε,ε_cosmin2 = getb(data.ξ,x),getb(data.cθ,x),getb(data.sθ,x),getb(data.κ,x),getb(data.φmax,x),getb(data.ε,x),getb(data.ε_cosmin2,x)
 		nFejer = ti.static(self.HFMTraits.nfwd//6)
-		for l in ti.static(range(nFejer)):
+		for l in range(nFejer): # Purposedly not static (save compile time)
 			φ = φmax*((l+0.5)/nFejer-0.5); cφ = ti.cos(φ); sφ = ti.sin(φ) 
 			v = self.HFMTraits.vec_t([cθ*cφ, sθ*cφ, cφ*κ+sφ/ξ]) * ih
 			λ,e = decomp_v(v,ε,ε_cosmin2)
-			s = fejerWeights[l]
+			s = self.fejerWeights[l] #s = fejerWeights[nFejer,l]
 			if ti.static(self.convex_curvature): # Turn left only variant
 				if 2*l == nFejer-1: s /= 2
 				if 2*l >  nFejer-1: s = 0
-			for i in range(6): weights[*x,6*l+i] = λ[i]; offsets[*x,6*l+i] = e[i,:]
+			for i in ti.static(range(6)): weights[*x,6*l+i] = s*λ[i]; offsets[*x,6*l+i] = e[i,:]
 
 	def set_defaults(self,sgrid,ξ=1,cθ=None,sθ=None,κ=0,φmax=np.pi/2,ε=0.01,ε_cosmin2=0.67):
 		cθ,sθ = _default_trigo(sgrid[2],cθ,sθ)
@@ -233,7 +235,7 @@ class Dubins2:
 	@ti.pyfunc
 	def hfm_scheme(self, x, ih, weights:arr_t, offsets:arr_t, data:tpl_t): 
 		ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(data.ξ,x),getb(data.cθ,x),getb(data.sθ,x),getb(data.κ,x),getb(data.ε,x),getb(data.ε_cosmin2,x)
-		for s in range(2):
+		for s in range(2): # Purposedly not static (save compile time)
 			sign = 1-2*s
 			v = self.HFMTraits.vec_t([cθ,sθ,κ+sign/ξ]) * ih
 			λ,e = decomp_v(v,ε,ε_cosmin2)
