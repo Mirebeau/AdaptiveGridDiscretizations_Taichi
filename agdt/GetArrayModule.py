@@ -189,7 +189,7 @@ def reshape_ndarray(arr,shape,dtype=None):
 # 		return x
 
 
-def to_ndarray(x,dtype):
+def to_ndarray(x,dtype,to_field=False):
 	# import numbers
 	# if isinstance(x,numbers.Number) or isinstance(x,tuple) or isinstance(x,list):
 	# 	xf = ti.ndarray(dtype=dtype,shape=tuple())
@@ -199,7 +199,7 @@ def to_ndarray(x,dtype):
 		shape = x.shape
 		if hasattr(dtype,'m') and dtype.m==shape[-1]: shape = shape[:-1]
 		if hasattr(dtype,'n') and dtype.n==shape[-1]: shape = shape[:-1]
-		field = ti.ndarray(dtype,shape)
+		field = ti.field(dtype,shape) if to_field else ti.ndarray(dtype,shape)
 		field.from_numpy(x) 
 		return field
 	else:

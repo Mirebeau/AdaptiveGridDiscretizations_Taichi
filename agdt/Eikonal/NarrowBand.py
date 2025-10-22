@@ -4,7 +4,7 @@ import numpy as np
 import copy
 import itertools
 from ..GetArrayModule import convert_dtype,reshape_ndarray,ti_debug,make_argpack
-from .. import GetArrayModule
+from .. import GetArrayModule,Linalg
 from . import CappedQueue
 from . import HFM
 
@@ -21,8 +21,17 @@ from . import HFM
 arr_t = ti.types.ndarray()
 tpl_t = ti.types.template()
 
-# --------------------- Compile time constants associated with the scheme ---------------------
+@ti.kernel
+def any_ndarray(a:arr_t) -> ti.u1:
+	"""
+	Python 'any' function fails on ti.ndarray. This is a substitute. 
+	Equivalently : any(a.to_numpy()), but this copies all data.
+	"""
+	res=False
+	for x in a: res = res or ti.u1(a[x])  # Reduction operation, hope taichi parallelizes it
+	return res
 
+# --------------------- Compile time constants associated with the scheme ---------------------
 def cprod(shape):
 	"""Cumulative product of dimensions, for accessing entries from global indices."""
 	cprod = np.cumprod((1,)+shape[1:][::-1])[::-1] # Twice reverse, prepend 1
@@ -51,6 +60,8 @@ class TraitsType:
 	def vec_t(self): return ti.lang.matrix.VectorType(self.ndim,self.float_t)
 	@property
 	def ivec_t(self): return ti.lang.matrix.VectorType(self.ndim,self.int_t)
+#	@property
+#	def ioffset_t(self): return ti.lang.matrix.VectorType(self.ndim,ti.i8)
 	@property
 	def mat_t(self): return ti.lang.matrix.MatrixType(self.ndim,self.ndim,2,self.float_t)
 	@property
@@ -155,6 +166,14 @@ class _Algo:
 		assert all(0<=x) and all(x<self.shape_o*self.Traits.shape_i) # Largest possible domain 
 		return self.x2ix_o(x//self.Traits.shape_i)*self.Traits.size_i + self.Traits.x2ix_i(x%self.Traits.shape_i)
 	
+	@ti.pyfunc
+	def set_seed(self,self_ti,ix,value):
+		self_ti.values[ix] = value
+		if self.Traits.strict_iter_o: self_ti.new_values[ix] = value
+		self_ti.walls[ix] = True
+		self.seeds.push(ix)
+
+
 	def block_expand(self,arr,padding=0,dtype=None):
 		"""
 		Input : 
@@ -385,16 +404,19 @@ class _Algo:
 					
 					# Diagnostic : did we improve the value ? (TODO : narrowband exponential criterion.)
 					value_new = values_i[ix_i]
-					if not(value_new >= value_old + self_ti.tol): 
+					if value_new < value_old - self_ti.tol: 
 						improved[_ix_o] = True # All threads the write to same place
 						self_ti.new_values[ix] = values_i[ix_i] # Write back to global memory, if improved.
 
 			# Copy back data. It would be more efficient to swap values with new_values,
 			# but I failed to make it work. (The global pointers in self_ti are regarded as constants at compilation)
 			if ti.static(Traits.strict_iter_o and len(flows.shape)==0):
-				for ix in range(self.size): self_ti.values[ix] = self_ti.new_values[ix]
+				for _ix_o,ix_i in ti.ndrange((ixs_o_begin,ixs_o_end),size_i): # Copy updated values
+					ix = ixs_o[_ix_o]*size_i + ix_i
+					self_ti.values[ix] = self_ti.new_values[ix]
+				#for ix in range(self.size): self_ti.values[ix] = self_ti.new_values[ix] # Copy all
 
-		# CPU update is intended for debug purposes. Should be quite slow and limited.
+		# --- CPU update is intended for debug purposes. Should be quite slow and limited. ---
 		@ti.kernel # We cannot define it as a member kernel, because self_ti_t is only known after __init__
 		def cpu_update(self_ti:self.self_ti_t, 
 			 ixs_o:ti.types.ndarray(ti.i32,1), improved:ti.types.ndarray(ti.i8,1),
@@ -417,6 +439,7 @@ class _Algo:
 					i = ti.static(self_ti.data.keys.index(name))
 					if ti.static(isinstance(self_ti.data[name],ti.lang.any_array.AnyArray)):
 						data_ind[i] = (x_o @ self_ti.cprod_o[name])*size_i + x_i @ self.cprods_i[name]
+				data = self.metric.Preproc(self_ti.data,data_ind)
 
 				# Fetch the values from global memory
 				ix = ix_i + ix_o*size_i # Global index
@@ -439,22 +462,29 @@ class _Algo:
 
 				if ti.static(len(flows.shape)>0): # Not actually an update : compute flow and exit
 					if wall: flows[ix] = ti.select(value_old<np.inf,0,np.nan) # Null at seed, NaN in wall
-					else: flows[ix] = self.metric.Flow(nvalues,self_ti.data,data_ind,value_old)
+					else: flows[ix] = self.metric.Flow(nvalues,*data,value_old)
+					#else: flows[ix] = self.metric.Flow(nvalues,self_ti.data,data_ind,value_old)
 				else: # no inner loop here, equivalently niter_i = 1
-					if not wall: value_new = self.metric.Update(nvalues,self_ti.data,data_ind)
+					if not wall: value_new = self.metric.Update(nvalues,*data)
 					
-					if not(value_new >= value_old + self_ti.tol): 
+					if value_new < value_old - self_ti.tol:
 						improved[_ix_o] = True # All threads the write to same place
 						self_ti.new_values[ix] = value_new # Write back to global memory, if improved.
 
 			# Copy back data. It would be more efficient to swap values with new_values,
 			# but I failed to make it work. (The global pointers in self_ti are regarded as constants at compilation)
 			if ti.static(Traits.strict_iter_o and len(flows.shape)==0):
-				for ix in range(self.size): self_ti.values[ix] = self_ti.new_values[ix]
+				for _ix_o,ix_i in ti.ndrange((ixs_o_begin,ixs_o_end),size_i): # Copy updated values
+					ix = ixs_o[_ix_o]*size_i + ix_i
+					self_ti.values[ix] = self_ti.new_values[ix]
+				#for ix in range(self.size): self_ti.values[ix] = self_ti.new_values[ix]
 
 		self.gpu_update = gpu_update
 		self.cpu_update = cpu_update
-		self.update = gpu_update # Save the kernel
+		if ti.lang.impl.default_cfg().arch == ti.cpu: 
+			self.update = cpu_update 
+			print("NarrowBand efficiency warning : using CPU eikonal solver")
+		else: self.update = gpu_update 
 	
 	# --------- AGSI -------
 
@@ -624,7 +654,7 @@ class _Algo:
 				for r in itertools.chain(range(self.shape_o[k]), reversed(range(self.shape_o[k]))): 
 					beg = k*self.size_o + r*ksize_o
 					self.update(self_ti, ixs_o, improved, beg, beg+ksize_o, self.noflow)
-			if not any(improved): break
+			if not any_ndarray(improved): break
 		else: print(f"Fast Sweeping completed {nitermax=} iterations, without reaching tolerance {tol=}")
 		return iter
 
@@ -641,7 +671,7 @@ class _Algo:
 		for iter in range(nitermax):
 			improved.fill(False)
 			self.update(self_ti, ixs_o, improved, 0, self.size_o, self.noflow)
-			if not any(improved): break # Update until no-one improves
+			if not any_ndarray(improved): break # Update until no-one improves
 			#self_ti.values,self_ti.new_values = self_ti.new_values,self_ti.values # Swap fails ??
 		else: print(f'Global iteration completed {nitermax=} iterations, without reaching tolerance {tol=}')
 		return iter
@@ -729,12 +759,11 @@ class Domain:
 	# -------- Eikonal solver calls --------
 
 	@ti.pyfunc
-	def set_seed(self,self_ti,x,value=0):
+	def set_seed(self,self_ti,point,value=0):
+		index = self.IndexFromPoint(point)
+		x = Linalg.cast_vec(ti.round(index),self.Traits.ivec_t)
 		ix = self.algo.x2ix(1+x) # Add 1 for b.c.
-		self_ti.values[ix] = value
-		if self.Traits.strict_iter_o: self_ti.new_values[ix] = value
-		self_ti.walls[ix] = True
-		self.algo.seeds.push(ix)
+		self.algo.set_seed(self_ti,ix,value)
 
 	def build_scheme(self,walls=None,**kwargs):
 		"""
@@ -742,8 +771,9 @@ class Domain:
 		- walls : obstacles in the domain
 		- **kwargs : metric parameters, passed to metric.set_defaults
 		"""
-		data_dict = self.metric.set_defaults(self.sgrid(),self.ih,**kwargs)
+		data_dict = self.metric.set_defaults(self.sgrid(),self.h,**kwargs)
 		self.algo.build_scheme(data_dict,walls)
+		self.self_ti = self.algo.self_ti
 
 	def values(self): return self.algo.block_squeeze(self.algo.values)
 
