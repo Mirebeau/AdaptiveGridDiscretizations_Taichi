@@ -7,7 +7,7 @@ import taichi as ti
 import numpy as np
 import itertools
 from collections import namedtuple
-from .. import Sort
+from .. import Sort,Linalg
 from . import NarrowBand
 from ..GetArrayModule import to_ndarray
 
@@ -127,24 +127,23 @@ class DistL1:
 		self.Traits = NarrowBand.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
 	def set_defaults(self,sgrid,h): return {'dummy':(1,self.Traits.float_t)}
 	@ti.pyfunc
-	def Preproc(self,data:tpl_t,ind): return ()
+	def Preproc(self,data:tpl_t,ind): return () # No preprocessing or data to be teched
 	@ti.pyfunc
-	def Update(self,nvals,data:tpl_t,ind): return nvals.min()+1
+	def Update(self,nvals): return nvals.min()+1
 	@ti.pyfunc
-	def Flow(self,nvals,data:tpl_t,ind,λ):
+	def Flow(self,nvals,λ):
 		flow = self.Traits.ivec_t(0)
 		k = Sort.argmin(nvals)
 		if nvals[k]<λ: flow[k//2] = 2*(k%2)-1
 		return flow
 
 class LaxFriedrichsScheme:
-	# LaxFriedrichs_Preproc: must return C0,c1,normdata		
-
+	# LaxFriedrichs_Preproc: must return C0,c1,norm_data
 	@ti.pyfunc
-	def LaxFriedrichs_Update(self,nvals,C0,c1,normdata): #data:tpl_t,ind):
+	def LaxFriedrichs_Update(self,nvals,C0,c1,norm_data:tpl_t):
 		"""
 		For stability and consistency, the constants C0, c1 should obey:
-		(1/C0) |x|_infty <= F^*(x) < (1/c1) |x|_1, where F is the primal norm
+		(1/C0) |x|_infty <= F^*(x) < (1/c1) |x|_1, where F^* is the dual norm
 		Equivalently, for the primal norm :
 		c1 |x|_infty <= F(x) <= C0 |x|_1
 		"""
@@ -152,26 +151,19 @@ class LaxFriedrichsScheme:
 		grad = ti.Vector([(nvals[2*i+1]-nvals[2*i])/2 for i in ti.static(range(ndim))])
 		avg = nvals.sum()/(2*ndim)
 
-		cost = getData(data,ind,'costs'); C0 = c1 = cost # Just to get the correct type
-		if ti.static(self.Traits.precompute_C0c1): C0,c1 = cost*getData(data,ind,'C0'), cost*getData(data,ind,'c1')
-		else: C0,c1 = self.C0c1(data,ind); C0*=cost; c1*=cost
 		updt = C0 + nvals.min() # Causal update, slope limiter
 		if avg<np.inf: 
-			gradnorm = cost * self.dualnorm(grad,data,ind)  # Model specific 
+			gradnorm = self.dualnorm(grad,norm_data)  # Model specific 
 			updt = min(updt, (c1/ndim)*(1-gradnorm)+avg ) # Minimum with Lax-Friedrichs update
-			#print(avg,gradnorm,updt,C0,c1,cost)
 		return updt
 
 	@ti.pyfunc
-	def LaxFriedrichs_Flow(self,nvals,data:tpl_t,ind,λ):
+	def LaxFriedrichs_Flow(self,nvals,λ,C0,c1,norm_data:tpl_t): #data:tpl_t,ind,λ):
 		ndim = ti.static(self.Traits.ndim)
 		grad = ti.Vector([(nvals[2*i+1]-nvals[2*i])/2 for i in ti.static(range(ndim))])
 		avg = nvals.sum()/(2*ndim)
 
-		cost = getData(data,ind,'costs'); C0 = c1 = cost # Just to get the correct type
-		if ti.static(self.Traits.precompute_C0c1): C0,c1 = cost*getData(data,ind,'C0'), cost*getData(data,ind,'c1')
-		else: C0,c1 = self.C0c1(data,ind); C0*=cost; c1*=cost
-		flow = -cost*self.flow(grad,data,ind) # Note the minus sign: direction toward source
+		flow = -self.flow(grad,norm_data) # Note the minus sign: direction toward source
 		causal = C0 + nvals.min() # Causal update
 		# - grad@flow == dualnorm(grad) : Euler's identity and minus sign above
 		noncausal = (c1/ndim)*(1 + grad@flow)+avg # LaxFriedrichs update
@@ -192,11 +184,10 @@ class Diagonal(LaxFriedrichsScheme):
 	def __init__(self,ndim,float_t,scheme='Godunov'):
 		if scheme=='Godunov':
 			self.Traits = NarrowBand.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
-			self.set_defaults,self.Update,self.Flow = self.Godunov_set_defaults,self.Godunov_Update,self.Godunov_Flow
+			self.set_defaults,self.Update,self.Flow,self.Preproc = self.Godunov_set_defaults,self.Godunov_Update,self.Godunov_Flow,self.Godunov_Preproc
 		elif scheme=='LaxFriedrichs':
 			self.Traits = NarrowBand.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
-			self.Traits.precompute_C0c1 = False
-			self.set_defaults,self.Update,self.Flow = self.Godunov_set_defaults,self.LaxFriedrichs_Update,self.LaxFriedrichs_Flow
+			self.set_defaults,self.Update,self.Flow,self.Preproc = self.Godunov_set_defaults,self.LaxFriedrichs_Update,self.LaxFriedrichs_Flow,self.LaxFriedrichs_Preproc
 		else: raise ValueError(f"Unrecognized {scheme=}")
 
 	# ------------------ Godunov scheme -------------------
@@ -212,25 +203,27 @@ class Diagonal(LaxFriedrichsScheme):
 		return {'weights':(weights,Traits.vec_t),'costs':(costs,Traits.float_t)}
 	
 	@ti.pyfunc
-	def Godunov_Update(self,nvals,data:tpl_t,ind):
+	def Godunov_Preproc(self,data:tpl_t,ind):
+		weights = getData(data,ind,'weights')
+		cost = getData(data,ind,'costs')
+		return weights/cost**2, 
+	
+	@staticmethod
+	@ti.pyfunc
+	def Godunov_UpdateBase(vals,weights):
 		"""
-		Godunov scheme, same as HFM
+		Computes updt such that : 
+		sum_i weights[i]*(updt-vals[i])_+^2 == 1
 		"""
-		ndim = ti.static(self.Traits.ndim)
-		nact = ti.static(ndim)
-		vals = self.Traits.vec_t(0)
-		for i in ti.static(range(ndim)): vals[i] = min(nvals[2*i],nvals[2*i+1]) # Best of left and right neighbors 
 		ivals = Sort.argsort(vals)
 		λ0 = vals[ivals[0]]
 		updt = np.inf
-		weights = getData(data,ind,'weights')
-		cost = getData(data,ind,'costs')
 		if λ0 < np.inf:
 			a = weights[ivals[0]]
 			b = 0.
-			c = -cost**2
-			if a>0: updt = cost/ti.sqrt(a) # First updt solves a linear equation 
-			for iact in range(1,nact):
+			c = -1.
+			if a>0: updt = 1./ti.sqrt(a) # First updt solves a linear equation 
+			for iact in range(1,vals.n): 
 				w = weights[ivals[iact]]
 				if w==0.: continue
 				λ = vals[ivals[iact]]-λ0  # Shift values here for quadratic solution accuracy 
@@ -245,12 +238,18 @@ class Diagonal(LaxFriedrichsScheme):
 				updt = r
 			updt+=λ0
 		return updt
-	
 	@ti.pyfunc
-	def Godunov_Flow(self,nvals,data:tpl_t,ind,λ):
+	def Godunov_Update(self,nvals,weights:tpl_t):
+		"""
+		Godunov scheme, same as HFM
+		"""
+		vals = self.Traits.vec_t(0)
+		for i in ti.static(range(vals.n)): vals[i] = min(nvals[2*i],nvals[2*i+1]) # Best of left and right neighbors 
+		return self.Godunov_UpdateBase(vals,weights)
+	@ti.pyfunc
+	def Godunov_Flow(self,nvals,λ,weights:tpl_t):
 		"""Intrinsic gradient from the Godunov scheme"""
 		ndim = ti.static(self.Traits.ndim)
-		weights = getData(data,ind,'weights')
 		flow = self.Traits.vec_t(0)
 		for i in ti.static(range(ndim)): 
 			val = min(nvals[2*i],nvals[2*i+1]) # Best of left and right neighbors 
@@ -260,18 +259,17 @@ class Diagonal(LaxFriedrichsScheme):
 
 	# ------------------ Lax-Friedrichs scheme ----------------
 	@ti.pyfunc
-	def flow(self,grad,data:tpl_t,ind): # Turn a gradient into a flow
-		weights = getData(data,ind,'weights')
+	def LaxFriedrichs_Preproc(self,data:tpl_t,ind):
+		weights = getData(data,ind,'weights') / getData(data,ind,'costs')**2
+		C0 = 1./ti.sqrt(weights.min())
+		c1 = 1./ti.sqrt(weights.max())
+		return C0,c1,weights
+	@ti.pyfunc
+	def flow(self,grad,weights:tpl_t): # Turn a gradient into a flow
 		uflow = weights*grad # Flow, but not normalized. (Could be sufficient for most applications.)
 		return uflow / ti.sqrt(grad @ uflow)
 	@ti.pyfunc
-	def dualnorm(self,grad,data:tpl_t,ind): 
-		weights = getData(data,ind,'weights')
-		return ti.sqrt(grad @ (weights*grad))
-	@ti.pyfunc
-	def C0c1(self,data:tpl_t,ind):
-		sweights = ti.sqrt(getData(data,ind,'weights'))
-		return 1/sweights.min(),1/sweights.max() # Recompute, since it is cheap	
+	def dualnorm(self,grad,weights:tpl_t): return ti.sqrt(grad @ (weights*grad))
 
 # --------------------------------------------------------------------------------------------------
 class Riemann(LaxFriedrichsScheme):
@@ -285,23 +283,33 @@ class Riemann(LaxFriedrichsScheme):
 		if isinstance(scheme,(SemiLag2_t,SemiLag3_t)):
 			Traits = NarrowBand.TraitsType(scheme.vertices,shape_i_default[ndim],float_t)
 			Traits.SemiLag = scheme; Traits.fSemiLag = scheme.to_field()
-			self.Traits,self.set_defaults,self.Update,self.Flow = Traits,self.SemiLag_set_defaults,self.SemiLag_Update,self.SemiLag_Flow
+			self.Traits,self.set_defaults = Traits,self.SemiLag_set_defaults
+			self.Update,self.Flow,self.Preproc = [None,None, (self.SemiLag2_Update,self.SemiLag2_Flow,self.SemiLag2_Preproc), (self.SemiLag3_Update,self.SemiLag3_Flow,self.SemiLag3_Preproc)][ndim]
 		elif scheme=='LaxFriedrichs': 
 			Traits = NarrowBand.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
-			Traits.precompute_C0c1 = True
-			self.Traits,self.set_defaults,self.Update,self.Flow = Traits,self.LaxFriedrichs_set_defaults,self.LaxFriedrichs_Update,self.LaxFriedrichs_Flow
+			self.Traits,self.set_defaults,self.Update,self.Flow,self.Preproc = Traits,self.LaxFriedrichs_set_defaults,self.LaxFriedrichs_Update,self.LaxFriedrichs_Flow,self.LaxFriedrichs_Preproc
+		elif scheme=='UpwindDifferences':
+			LexCube = [None,None,LexCube2,LexCube3][ndim]
+			Traits = NarrowBand.TraitsType(LexCube,shape_i_default[ndim],float_t)
+			Traits.CubeFwd,Traits.CubeInv = LexCubeInv(LexCube)
+			self.Traits,self.set_defaults,self.Update,self.Flow,self.Preproc = Traits,self.UpwindDifferences_set_defaults,self.UpwindDifferences_Update,self.UpwindDifferences_Flow,self.UpwindDifferences_Preproc
+			Traits.fstencil = to_ndarray(np.array(Traits.stencil),ti.lang.matrix.VectorType(ndim,ti.i8),True)
 		else: raise ValueError(f"Unrecognized {scheme=}")
 
 	# ------------------ Lax-Friedrichs scheme ----------------
 	@ti.pyfunc
-	def flow(self,grad,data:tpl_t,ind): # Turn a gradient into a flow
-		D = getData(data,ind,'D')
+	def LaxFriedrichs_Preproc(self,data:tpl_t,ind):
+		cost = getData(data,ind,'costs')
+		D = getData(data,ind,'D') / cost**2
+		C0 = getData(data,ind,'C0') * cost
+		c1 = getData(data,ind,'c1') * cost
+		return C0,c1,D
+	@ti.pyfunc
+	def flow(self,grad,D:tpl_t): # Turn a gradient into a flow
 		uflow = D @ grad # Flow, but not normalized. (Could be sufficient for most applications.)
 		return uflow / ti.sqrt(grad @ uflow) # Normalized flow, cf Euler identity
 	@ti.pyfunc
-	def dualnorm(self,grad,data:tpl_t,ind): 
-		D = getData(data,ind,'D')
-		return ti.sqrt(grad @ D @ grad)
+	def dualnorm(self,grad,D:tpl_t): return ti.sqrt(grad @ D @ grad)
 	@ti.pyfunc
 	def C0c1(self,D):
 		ndim = ti.static(self.Traits.ndim)
@@ -326,6 +334,10 @@ class Riemann(LaxFriedrichsScheme):
 	@staticmethod
 	@ti.pyfunc
 	def SemiLag_min(M,l):
+		"""
+		Semi-Lagrangian optimization problem associated with a single sector, unconstrained.
+		min |ξ|_M + <ξ,l> subject to <ξ,1> = 1
+		"""
 		D = ti.math.inverse(M) # Dual metric
 		Dl = D @ l; lDl = l @ Dl # Note : u = (1,1,...)
 		Du = ti.Vector([ti.Vector([D[i,j] for j in ti.static(range(l.n))]).sum() for i in ti.static(range(l.n))]); 
@@ -334,59 +346,64 @@ class Riemann(LaxFriedrichsScheme):
 		λ = (uDl + ti.sqrt(δ) ) / uDu # Update value. Could be NaN if δ<0
 		ξ = λ*Du-Dl # Optimal interpolation weights
 		return λ,ξ
-
-	@staticmethod # Two-dimensional implementation 
-	@ti.pyfunc 
-	def SemiLag2_Update(Traits:tpl_t,nvals,m,ret_flow:tpl_t=False):
-		vertices,nstencil,fvertices = ti.static(Traits.SemiLag.vertices,Traits.nstencil,Traits.fSemiLag.vertices)
-		ti.static_assert(Traits.ndim==2) # Assuming a static stencil in two dimensions
-		norm2,scal,flow = Traits.nvalues_t(np.nan),Traits.nvalues_t(np.nan),Traits.vec_t(np.nan)
+	
+	@ti.func
+	def SemiLag2_Preproc(self,data:tpl_t,ind):
+		"""Compute all the squared-norms and inner products associated with the stencil structure"""
+		m = getData(data,ind,'m') * getData(data,ind,'costs')**2
+		vertices,nstencil = ti.static(self.Traits.SemiLag.vertices,self.Traits.nstencil)
 		# TODO : since the stencil and norm are symmetric, we can cut this storage and computations in half
+		norm2,scal = self.Traits.nvalues_t(np.nan),self.Traits.nvalues_t(np.nan)
 		for i,ei in ti.static(enumerate(vertices)):
 			norm2[i] = scal_static(ei,m,ei)
 			j = ti.static((i+1)%nstencil); ej = ti.static(vertices[j])
 			scal[i] = scal_static(ei,m,ej)
-
-		updt = Traits.float_t(np.inf)
-		for i in range(nstencil): # Not static, to reduce compile time
+		return m,norm2,scal
+	@ti.func 
+	def SemiLag2_Update(self,nvals, m,norm2,scal, ret_flow:tpl_t=False):
+		nstencil,fvertices = ti.static(self.Traits.nstencil,self.Traits.fSemiLag.vertices)
+		updt = self.Traits.float_t(np.inf)
+		flow = self.Traits.vec_t(np.nan)
+		for i in range(nstencil): # Not a static loop, to reduce compile time
 			# Graph-like update from neighbor
 			λ = nvals[i]+ti.sqrt(norm2[i]) 
 			if ti.static(ret_flow) and λ<updt: flow = fvertices[i]
 			updt = min(updt, λ) 
 			# Update from stencil
 			j = (i+1)%nstencil
-			M = Traits.mat_t([[norm2[i],scal[i]],[scal[i],norm2[j]]]) # The metric in the offsets basis
-			l = Traits.vec_t([nvals[i],nvals[j]])
+			M = self.Traits.mat_t([[norm2[i],scal[i]],[scal[i],norm2[j]]]) # The metric in the offsets basis
+			l = self.Traits.vec_t([nvals[i],nvals[j]])
 			λ,ξ = Riemann.SemiLag_min(M,l)
 			if λ<updt and all(ξ>=0): # Test should fail if λ is NaN
 				if ti.static(ret_flow): flow = ξ[0]*fvertices[i]+ξ[1]*fvertices[j]
 				updt=λ
-		if ti.static(ret_flow): 
-			flow /= ti.sqrt(flow @ m @ flow) # normalize the flow, w.r.t. the primal metric
-			return updt,flow
+		if ti.static(ret_flow): return flow/ti.sqrt(flow @ m @ flow) # normalized w.r.t. primal metric
 		return updt
-	
-	@staticmethod
-	@ti.pyfunc
-	def SemiLag3_Update(Traits:tpl_t,nvals,m,ret_flow:tpl_t=False):
-		vertices,edges,face_vertices = ti.static(Traits.SemiLag.vertices,Traits.SemiLag.edges,Traits.SemiLag.face_vertices)
-		fvertices,fedges,fface_vertices,fface_edges = ti.static(Traits.fSemiLag.vertices,Traits.fSemiLag.edges,Traits.fSemiLag.face_vertices,Traits.fSemiLag.face_edges)
-		#stencil,fstencil = ti.static(Traits.stencil,Traits.fstencil)
-		ti.static_assert(Traits.ndim==3) # Assuming a static stencil in three dimensions
-		norm2,flow = Traits.nvalues_t(np.nan),Traits.vec_t(np.nan)
-		scal = ti.lang.matrix.VectorType(len(edges),Traits.float_t)(np.nan)
-		# Compute the norms associated with vertices, and inner products assoc to edges
+	@ti.func
+	def SemiLag2_Flow(self,nvals,λ, m,norm2,scal): return self.SemiLag2_Update(nvals,m,norm2,scal,True)
+
+	@ti.func
+	def SemiLag3_Preproc(self,data:tpl_t,ind):
+		"""Compute the norms associated with vertices, and inner products assoc to edges in the stencil structure"""
 		# TODO : since the stencil and norm are symmetric, we can easily cut storage and/or compute cost in half here
+		m = getData(data,ind,'m') * getData(data,ind,'costs')**2
+		vertices,edges = ti.static(self.Traits.SemiLag.vertices,self.Traits.SemiLag.edges)
+		norm2 = self.Traits.nvalues_t(np.nan)
+		scal = ti.lang.matrix.VectorType(ti.static(len(edges)),self.Traits.float_t)(np.nan)
 		for i,v in ti.static(enumerate(vertices)): norm2[i] = scal_static(v, m, v) 
 		for e,ij in ti.static(enumerate(edges)): 
 			i,j = ti.static(ij) # Taichi does not allow : for e,(i,j) in ...
 			scal[e] = scal_static(ti.static(vertices[i]),m,ti.static(vertices[j]))
-
-		updt = Traits.float_t(np.inf)
-		for i in range(len(vertices)): # Update from the offsets
+		return m,norm2,scal
+	@ti.pyfunc
+	def SemiLag3_Update(self,nvals, m,norm2,scal, ret_flow:tpl_t=False):
+		fvertices,fedges,fface_vertices,fface_edges = ti.static(self.Traits.fSemiLag.vertices,self.Traits.fSemiLag.edges,self.Traits.fSemiLag.face_vertices,self.Traits.fSemiLag.face_edges)
+		flow = self.Traits.vec_t(np.nan)
+		updt = self.Traits.float_t(np.inf)
+		for i in range(norm2.n): # Update from the offsets
 			λ = ti.sqrt(norm2[i]) + nvals[i]
 			updt = min(λ,updt)
-		for e in range(len(edges)): # Update from the edges
+		for e in range(scal.n): # Update from the edges
 			i,j = fedges[e]
 			M = ti.Matrix([[norm2[i],scal[e]],[scal[e],norm2[j]]])
 			l = ti.Vector([nvals[i],nvals[j]])
@@ -394,35 +411,20 @@ class Riemann(LaxFriedrichsScheme):
 			if λ<updt and all(ξ>=0): # Test should fail if λ is NaN
 				if ti.static(ret_flow): flow = ξ[0]*fvertices[i]+ξ[1]*fvertices[j]
 				updt=λ
-		for face in range(len(face_vertices)): # Update from the faces
+		for face in range(fface_vertices.shape[0]): # Update from the faces
 			i,j,k = fface_vertices[face]
 			e,f,g = fface_edges[face]
-			M = Traits.mat_t([norm2[i],scal[e],scal[f], scal[e],norm2[j],scal[g], scal[f],scal[g],norm2[k] ])
-			l = Traits.vec_t([nvals[i],nvals[j],nvals[k]]) # TODO : conflict of notation for l
+			M = self.Traits.mat_t([norm2[i],scal[e],scal[f], scal[e],norm2[j],scal[g], scal[f],scal[g],norm2[k] ])
+			l = self.Traits.vec_t([nvals[i],nvals[j],nvals[k]]) # TODO : conflict of notation for l
 			λ,ξ = Riemann.SemiLag_min(M,l)
 			if λ<updt and all(ξ>=0): # Test should fail if λ is NaN
 				if ti.static(ret_flow): flow = ξ[0]*fvertices[i]+ξ[1]*fvertices[j]+ξ[2]*fvertices[k]
 				updt=λ
-		if ti.static(ret_flow): 
-			flow /= ti.sqrt(flow @ m @ flow) # normalize the flow, w.r.t. the primal metric
-			return updt,flow
+		if ti.static(ret_flow): return flow / ti.sqrt(flow @ m @ flow) # normalize w.r.t. primal metric
 		return updt
+	@ti.func
+	def SemiLag3_Flow(self,nvals,λ, m,norm2,scal): return self.SemiLag3_Update(nvals,m,norm2,scal,True)
 
-
-	@ti.pyfunc
-	def SemiLag_Update(self,nvals,data:tpl_t,ind):
-		m = getData(data,ind,'m') * getData(data,ind,'costs')**2
-		if ti.static(m.n==2):   return self.SemiLag2_Update(self.Traits,nvals,m)
-		elif ti.static(m.n==3): return self.SemiLag3_Update(self.Traits,nvals,m)
-		else: ti.static_assert(False,"Unsupported dimension in semi-Lagrangian update")
-
-	@ti.pyfunc
-	def SemiLag_Flow(self,nvals,data:tpl_t,ind,λ):
-		m = getData(data,ind,'m') * getData(data,ind,'costs')**2
-		if ti.static(m.n==2):   return self.SemiLag2_Update(self.Traits,nvals,m,True)[1]
-		elif ti.static(m.n==3): return self.SemiLag3_Update(self.Traits,nvals,m,True)[1]
-		else: ti.static_assert(False,"Unsupported dimension in semi-Lagrangian flow")
-	
 	def SemiLag_set_defaults(self,sgrid,h,m=None,costs=1):
 		Traits = self.Traits; ndim = Traits.ndim
 		@ti.kernel
@@ -436,28 +438,68 @@ class Riemann(LaxFriedrichsScheme):
 		return {'m':(getSing(mh),Traits.mat_t),'costs':(costs,Traits.float_t)}
 
 	# ------------------------------ Monotone ----------------------------------
-	def Monotone_set_defaults(self,sgrid,h,m=None,costs=1):
+	def UpwindDifferences_set_defaults(self,sgrid,h,m=None,costs=1):
 		Traits = self.Traits; ndim = Traits.ndim
-		@ti.kernel
-		def set_λe(m:arr_t,λ:arr_t,e:arr_t,h:Traits.vec_t):
+		@ti.kernel # Compute square root, in rescaled coords. (Further processing done later.)
+		def set_isqrt(m:arr_t,m_isqrt:arr_t,h:Traits.vec_t):
 			for x in ti.grouped(m):
 				mh = Traits.mat_t([[m[x][i,j]*h[i]*h[j] for i in ti.static(range(ndim))] 
 					   for j in ti.static(range(ndim))]) # Take gridscale into account
-				# Compute the power -1/2
-				# Compute the weights and offsets
-				
+				λ,e = Linalg.sym_eig(mh) # ti.sym_eig is buggy in 2D (version 1.7.4)
+				m_isqrt[x] = Linalg.mat_dot_diag(e.transpose(),1./ti.sqrt(λ)) @ e # power -1/2
+		m = toSing(m,Traits.mat_t,np.eye(ndim))
+		m_isqrt = ti.ndarray(Traits.mat_t,m.shape)
+		set_isqrt(m,m_isqrt,h)
+		return {'m_isqrt':(getSing(m_isqrt),Traits.mat_t),'costs':(costs,Traits.float_t)}
 
-
-
-	# --------------- HFM ?? ---------------
-	# + should quite fast, sets a baseline for speed
-	# + very fast decomposition in 2D, possibly 3D
-	# = medium accuracy
-	# - limited amount of anisotropy, due to the bound on the stencil
-
-	# ------------ Monotone ------------
-	# + test something new, non-causal but fitting the NarrowBand assumptions
-
+	@ti.func
+	def UpwindDifferences_Preproc(self,data:tpl_t,ind):
+		m_isqrt = getData(data,ind,'m_isqrt') / getData(data,ind,'costs')
+		 # Reconstruct m, for graph-like update and flow normalization (we could also just store it ?)
+		m_sqrt = ti.math.inverse(m_isqrt); m = m_sqrt@m_sqrt
+		norm = self.Traits.nvalues_t(np.nan) # Note : since norm and stencil are symmetric, we could cut this in half
+		for i,e in ti.static(enumerate(self.Traits.stencil)): norm[i] = ti.sqrt(scal_static(e,m,e))
+		μ = self.Traits.mat_t(np.nan) # Build the finite differences weights and offsets
+		e = ti.lang.matrix.MatrixType(m.n,m.n,2,ti.i8)(0)
+		for i in ti.static(range(m.n)): μ[i,:],e[i,:] = LexCubeDecomp(m_isqrt[i,:],self.Traits.CubeInv)
+		return m,norm,μ,e
+	
+	@ti.func
+	def UpwindDifferences_Update(self,nvals, m,norm,μ,e, ret_flow:tpl_t=False):
+		fstencil = ti.static(self.Traits.fstencil)
+		flow = self.Traits.vec_t(np.nan)
+		updt = self.Traits.float_t(np.inf)
+		# Graph like update from the neighbor vertices
+		for i in ti.static(range(nvals.n)): 
+			λ = nvals[i] + norm[i]
+			if λ<updt:
+				if ti.static(ret_flow): flow = fstencil[i]
+				updt = λ
+		# Prepare for a Godunov-type upwind update
+		vals = self.Traits.vec_t(np.nan)
+		weights = self.Traits.vec_t(np.nan)
+		flows = self.Traits.mat_t(0.) # Flows associated with each finite difference
+		for i in ti.static(range(μ.n)):
+			μsum = μ[i,:].sum()
+			val_p = 0.; val_m = 0. # Left and right update
+			for j in ti.static(range(μ.n)): 
+				val_p += μ[i,j]*nvals[e[i,j]]
+				val_m += μ[i,j]*nvals[(nvals.n-1)-e[i,j]] # Offsets are symmetric
+				if ti.static(ret_flow): flows[i,:] += μ[i,j]*fstencil[e[i,j]]
+			vals[i] = min(val_p,val_m) / μsum
+			if ti.static(ret_flow): 
+				flows[i,:] /= μsum
+				if val_m<val_p: flows[i,:] *= -1.
+			weights[i] = μsum**2
+		λ_Godunov = Diagonal.Godunov_UpdateBase(vals,weights)
+		if λ_Godunov < updt:
+			if ti.static(ret_flow): flow = flows.transpose() @ (weights*max(0.,λ_Godunov-vals))
+			updt = λ_Godunov
+		if ti.static(ret_flow): return flow / ti.sqrt(flow @ m @ flow) # Normalize w.r.t. primal metric
+		return updt
+	@ti.func
+	def UpwindDifferences_Flow(self,nvals,λ, m,norm,μ,e): # Note : we could avoid recomputing λ
+		return self.UpwindDifferences_Update(nvals, m,norm,μ,e, True)
 
 class Randers:
 	def __init__(self,ndim,float_t,scheme):

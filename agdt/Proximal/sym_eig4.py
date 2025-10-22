@@ -14,7 +14,7 @@ from .. import Linalg
 @ti.func
 def sym_eig(m:ti.template()):
 	if ti.static(m.n==4): return sym_eig4(m)
-	else: return ti.sym_eig(m)
+	else: return Linalg.sym_eig(m)
 
 @ti.func 
 def normalize(m): # Purposedly passed by value
@@ -26,17 +26,6 @@ def normalize(m): # Purposedly passed by value
 	for i in range(m.n): m[i,i] -= tr # Trace is now zero
 	ifrob = m.norm_inv()
 	return tr, 1./ifrob, m*ifrob
-
-@ti.func
-def _imaxabs(a:ti.template()):
-	"""Index of the largest absolute value the given numbers"""
-	m = abs(a[0])
-	i = 0
-	for j in range(1,a.n):
-		if abs(a[j])>m:
-			m = abs(a[j])
-			i = j
-	return i
 
 @ti.func
 def sym_eig4(m0:ti.template(),nitermax=50):
@@ -75,10 +64,10 @@ def sym_eig4(m0:ti.template(),nitermax=50):
 	# m is now semi-definite (either positive or negative)
 	# m has rank >= 2 (typically 3, but 2 if x is an eigenvalue with double multiplicity)
 	# Starting gauss elimination
-	I = _imaxabs(ti.Vector((m[0,0],m[1,1],m[2,2],m[3,3])))
+	I = Linalg._imaxabs(ti.Vector((m[0,0],m[1,1],m[2,2],m[3,3])))
 	for i in ti.static(range(4)):
 		if i!=I: m[i,:] -= m[I,:] * (m[i,I]/m[I,I]) # Substract line m[I,:] to m[i,:], so as to cancel m[I,i]
-	J = _imaxabs(ti.Vector((m[(I+1)%4,(I+1)%4],m[(I+2)%4,(I+2)%4],m[(I+3)%4,(I+3)%4]))); J = (I+J+1)%4
+	J = Linalg._imaxabs(ti.Vector((m[(I+1)%4,(I+1)%4],m[(I+2)%4,(I+2)%4],m[(I+3)%4,(I+3)%4]))); J = (I+J+1)%4
 	K = ij2k[I,J]; L = 6-(I+J+K) # Get the other two columns
 	m[K,:] -= m[J,:] * (m[K,J]/m[J,J])
 	m[L,:] -= m[J,:] * (m[L,J]/m[J,J])
@@ -98,7 +87,7 @@ def sym_eig4(m0:ti.template(),nitermax=50):
 
 	# Complete e into an orthogonal basis
 	A = MatrixType(3,4,1,float)(0)
-	iemax = _imaxabs(e)
+	iemax = Linalg._imaxabs(e)
 	A[0,(iemax+1)%4] = 1
 	A[1,(iemax+2)%4] = 1
 	A[2,(iemax+3)%4] = 1

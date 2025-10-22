@@ -439,7 +439,7 @@ class _Algo:
 					i = ti.static(self_ti.data.keys.index(name))
 					if ti.static(isinstance(self_ti.data[name],ti.lang.any_array.AnyArray)):
 						data_ind[i] = (x_o @ self_ti.cprod_o[name])*size_i + x_i @ self.cprods_i[name]
-				data = self.metric.Preproc(self_ti.data,data_ind)
+				update_data = self.metric.Preproc(self_ti.data,data_ind)
 
 				# Fetch the values from global memory
 				ix = ix_i + ix_o*size_i # Global index
@@ -462,10 +462,10 @@ class _Algo:
 
 				if ti.static(len(flows.shape)>0): # Not actually an update : compute flow and exit
 					if wall: flows[ix] = ti.select(value_old<np.inf,0,np.nan) # Null at seed, NaN in wall
-					else: flows[ix] = self.metric.Flow(nvalues,*data,value_old)
+					else: flows[ix] = self.metric.Flow(nvalues,value_old,*update_data)
 					#else: flows[ix] = self.metric.Flow(nvalues,self_ti.data,data_ind,value_old)
 				else: # no inner loop here, equivalently niter_i = 1
-					if not wall: value_new = self.metric.Update(nvalues,*data)
+					if not wall: value_new = self.metric.Update(nvalues,*update_data)
 					
 					if value_new < value_old - self_ti.tol:
 						improved[_ix_o] = True # All threads the write to same place

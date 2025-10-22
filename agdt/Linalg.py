@@ -129,6 +129,33 @@ def flt2sym(flt:ti.template(),dtype:ti.template()=None):
 	rg = ti.static( range(int(sqrt(2*flt.n))) )
 	return ti.Matrix([[flt[sym2flt_index(i,j)] for i in ti.static(range(d))] for j in range(d)])
 
+@ti.func
+def _imaxabs(a:ti.template()):
+	"""Index of the largest absolute value in the given numbers"""
+	m = abs(a[0])
+	i = 0
+	for j in range(1,a.n):
+		if abs(a[j])>m:
+			m = abs(a[j])
+			i = j
+	return i
+@ti.func
+def sym_eig(m):
+	"""Same as ti.sym_eig, but does not fail on [[1.,0.],[0.,2.]] ..."""
+	if ti.static(m.n==3): return ti.sym_eig(m)
+	ti.static_assert(m.n==2,"Only two and three dimensions are supported") # see sym_eig4 if needed
+	htr = 0.5*(m[0,0]+m[1,1])
+	Δ = ti.math.sqrt(0.25*(m[0,0]-m[1,1])**2+m[0,1]**2)
+	λ = ti.math.vec2(htr-Δ, htr+Δ) # Eigenvalues computed, now get eigenvectors
+
+	m[0,0]-=λ[0]; m[1,1]-=λ[0] # Compute m-λ[0]*Id. Note that m is passed by value (no side effect)
+	e = m[_imaxabs(ti.math.vec2(m[0,0],m[1,1])),:] # Select strong column (they are proportionnal)
+	Ne=e.norm() # Prepare to orthonormalize
+	if Ne==0: e[1]=1 # Two equal eigvals, comatrix is zero. Arbitrary orth basis is ok.
+	else: e /= Ne
+	return λ,ti.math.mat2((e[1],-e[0]),e) # Concatenate with perpendicular vector
+
+
 # ---------- linear solve ----------
 
 @ti.func
