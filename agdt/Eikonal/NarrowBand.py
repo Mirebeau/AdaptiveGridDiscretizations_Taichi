@@ -85,6 +85,23 @@ class TraitsType:
 		assert all(x>=0) and all(x<self.shape_i)
 		return x@self.cprod_i
 	
+	@property
+	def has_source(self): return hasattr(self,'source_singularity')
+	@ti.func
+	def source_factorization(self,x,corr:ti.template()):
+		"""
+		Corrections for source factorization, which improves accuracy near singularities. 
+		source_singularity must be implemented
+		"""
+		# Note : we pre-allocate corr, and pass it as reference, to simplify control flow
+		Nx,Gx = self.source_singularity(x,ret_grad=True)
+		for i,_e in ti.static(enumerate(self.stencil)):
+			e = self.vec_t(_e)
+			Nxpe = self.source_singularity(x+e) 
+			# Note : the next expression might be sub-optimal in terms of accuracy due to the 
+			# difference of close values. Improvements possible depending on the norm structure.
+			corr[i] = (e @ Gx) + Nx - Nxpe 
+
 # -------------- Narrow band core algorithm --------------
 
 @ti.data_oriented
@@ -128,7 +145,7 @@ class _Algo:
 	@ti.pyfunc
 	def size(self): return self._sizes[1]
 	@property
-	@ti.pyfunc
+	@ti.pyfunc # Domain shape, not counting the 1-pixel padding on each boundary
 	def shape(self): return self._shape[None]
 	@ti.pyfunc
 	def periodic_shift(self): return self._periodic_shift[None]
@@ -167,7 +184,7 @@ class _Algo:
 		return self.x2ix_o(x//self.Traits.shape_i)*self.Traits.size_i + self.Traits.x2ix_i(x%self.Traits.shape_i)
 	
 	@ti.pyfunc
-	def set_seed(self,self_ti,ix,value):
+	def set_seed(self,self_ti:ti.template(),ix,value):
 		self_ti.values[ix] = value
 		if self.Traits.strict_iter_o: self_ti.new_values[ix] = value
 		self_ti.walls[ix] = True
@@ -356,7 +373,8 @@ class _Algo:
 					i = ti.static(self_ti.data.keys.index(name))
 					if ti.static(isinstance(self_ti.data[name],ti.lang.any_array.AnyArray)):
 						data_ind[i] = (x_o @ self_ti.cprod_o[name])*size_i + x_i @ self.cprods_i[name]
-					
+				update_data = self.metric.Preproc(self_ti.data,data_ind)
+
 				# Fetch the values from global memory
 				values_i = ti.simt.block.SharedArray((size_i,), Traits.float_t)
 				ix = ix_i + ix_o*size_i # Global index
@@ -384,7 +402,7 @@ class _Algo:
 					else: # Get the neighbor values, and compute the flow
 						for i in ti.static(range(Traits.nstencil)): # Get required neighbor values
 							nvalues[i] = ti.select(inner[i],values_i[iy[i]],self_ti.values[iy[i]])
-						flows[ix] = self.metric.Flow(nvalues,self_ti.data,data_ind,value_old)
+						flows[ix] = self.metric.Flow(nvalues,value_old,*update_data)
 				else: 
 					# A temporary array is needed with strict_iter_i
 					new_values_i = ti.simt.block.SharedArray((size_i if Traits.strict_iter_i else 0,), Traits.float_t)
@@ -393,7 +411,7 @@ class _Algo:
 							for i in ti.static(range(Traits.nstencil)): # Get required neighbor values
 								if inner[i]: nvalues[i] = values_i[iy[i]] # Local values are updated along iterations
 								elif ti.static(iter_i==0): nvalues[i] = self_ti.values[iy[i]] # Global values are immutable along iterations						
-							λ = self.metric.Update(nvalues,self_ti.data,data_ind)
+							λ = self.metric.Update(nvalues,*update_data)
 							if ti.static(Traits.strict_iter_i): # Use temporary variable to separate updates
 								new_values_i[ix_i]=λ
 								ti.simt.block.sync() # Wait until all thread finish using values_i
@@ -414,7 +432,6 @@ class _Algo:
 				for _ix_o,ix_i in ti.ndrange((ixs_o_begin,ixs_o_end),size_i): # Copy updated values
 					ix = ixs_o[_ix_o]*size_i + ix_i
 					self_ti.values[ix] = self_ti.new_values[ix]
-				#for ix in range(self.size): self_ti.values[ix] = self_ti.new_values[ix] # Copy all
 
 		# --- CPU update is intended for debug purposes. Should be quite slow and limited. ---
 		@ti.kernel # We cannot define it as a member kernel, because self_ti_t is only known after __init__
@@ -453,20 +470,21 @@ class _Algo:
 				wall = self_ti.walls[ix] # wall : immutable value
 
 				# Fetch the neighbor values
+				nsource = Traits.nvalues_t(np.nan) # Compute the source factorization (optional)
+				if ti.static(Traits.has_source): Traits.source_factorization(x,nsource)
 				nstencil = ti.static(Traits.nstencil)
 				nvalues = Traits.nvalues_t(np.nan) # NaN is a dummy neighbor value, will be replaced (becomes inf ??)
 				if not wall:
 					for i in ti.static(range(nstencil)):
 						ioffset,_ = self.ioffset_static(x_i,offset=ti.static(Traits.stencil[i]))
 						nvalues[i] = self_ti.values[ix+ioffset]
+						if ti.static(Traits.has_source): nvalues[i] += nsource[i]
 
 				if ti.static(len(flows.shape)>0): # Not actually an update : compute flow and exit
 					if wall: flows[ix] = ti.select(value_old<np.inf,0,np.nan) # Null at seed, NaN in wall
 					else: flows[ix] = self.metric.Flow(nvalues,value_old,*update_data)
-					#else: flows[ix] = self.metric.Flow(nvalues,self_ti.data,data_ind,value_old)
 				else: # no inner loop here, equivalently niter_i = 1
 					if not wall: value_new = self.metric.Update(nvalues,*update_data)
-					
 					if value_new < value_old - self_ti.tol:
 						improved[_ix_o] = True # All threads the write to same place
 						self_ti.new_values[ix] = value_new # Write back to global memory, if improved.
@@ -477,7 +495,6 @@ class _Algo:
 				for _ix_o,ix_i in ti.ndrange((ixs_o_begin,ixs_o_end),size_i): # Copy updated values
 					ix = ixs_o[_ix_o]*size_i + ix_i
 					self_ti.values[ix] = self_ti.new_values[ix]
-				#for ix in range(self.size): self_ti.values[ix] = self_ti.new_values[ix]
 
 		self.gpu_update = gpu_update
 		self.cpu_update = cpu_update
@@ -695,7 +712,6 @@ class Domain:
 	def __init__(self,bounds,shape,metric):
 		self.metric = metric
 		Traits = self.Traits
-		self.shape=shape
 		self.algo = _Algo(shape,metric)
 		#self._cprod = ti.field(Traits.ivec_t,tuple())
 		#self._cprod[None] = cprod(shape)
@@ -724,6 +740,9 @@ class Domain:
 	@property
 	@ti.pyfunc
 	def origin(self): return self._origin[None]
+	@property 
+	@ti.pyfunc
+	def shape(self): return self.algo.shape
 
 #	@property
 #	@ti.pyfunc
@@ -759,22 +778,46 @@ class Domain:
 	# -------- Eikonal solver calls --------
 
 	@ti.pyfunc
-	def set_seed(self,self_ti,point,value=0):
+	def set_seed(self,self_ti:ti.template(),point,value=0):
 		index = self.IndexFromPoint(point)
 		x = Linalg.cast_vec(ti.round(index),self.Traits.ivec_t)
 		ix = self.algo.x2ix(1+x) # Add 1 for b.c.
 		self.algo.set_seed(self_ti,ix,value)
 
-	def build_scheme(self,walls=None,**kwargs):
+	def build_scheme(self,walls=None,source_seed=None,source_radius=1.5,**kwargs):
 		"""
 		Build the numerical scheme.
 		- walls : obstacles in the domain
+		- source_seed : use source factorization w.r.t. this point
+		- source_radius : use frozen values over this range in source factorization
 		- **kwargs : metric parameters, passed to metric.set_defaults
 		"""
 		data_dict = self.metric.set_defaults(self.sgrid(),self.h,**kwargs)
 		self.algo.build_scheme(data_dict,walls)
 		self.self_ti = self.algo.self_ti
 
+		if source_seed is None: return # Implementing source factorization
+		self.metric.set_source_singularity(self,source_seed,**kwargs)
+		# r = int(np.floor(source_radius))
+		# ndim = self.Traits.ndim
+		# @ti.kernel # Set (several) frozen seed points within a small radius around given source_seed
+		# def spread_seed(self_ti:self.algo.self_ti_t):
+		# 	X0 = self.Traits.source_seed_index[None] 
+		# 	X = Linalg.cast_vec(ti.round(X0),self.Traits.ivec_t)
+		# 	for e in ti.grouped(ti.ndrange(*((-r,r+1),)*ndim)):
+		# 		y = X+e 
+		# 		# Keep only seeds which are close enough to X0 (the closest is always kept)
+		# 		if any(e) and (y-X0).norm_sqr()>source_radius**2: continue
+		# 		value = self.Traits.source_singularity(y)
+		# 		for i in ti.static(range(ndim)):
+		# 			if ti.static(self.Traits.periodic[i]):
+		# 				if y[i]<1: y[i]+= self.shape[i]
+		# 				if y[i]>self.shape[i]: y[i]-=self.shape[i]
+		# 		if self.algo.indomain(y): 
+		# 			self.algo.set_seed(self_ti,self.algo.x2ix(y),value)
+		#spread_seed(self.self_ti)
+		self.set_seed(self.self_ti,source_seed)
+		
 	def values(self): return self.algo.block_squeeze(self.algo.values)
 
 	def flows(self,adim:tpl_t=False):
@@ -817,8 +860,31 @@ class Domain:
 		for iter in range(maxL1): GlobalIterL1(distL1)
 		return distL1
 
-
 	def ode(self):
 		diffs = ti.ndarray(self.Traits.float_t, tuple())
 		diffs.fill(np.inf)
 		return HFM.GeodesicODE(self.seeds_distL1(),self.values(),self.flows(adim=True),diffs,self.Traits.periodic,self.PointFromIndex)
+	
+	@ti.pyfunc
+	def Interpolate(self,arr:arr_t,point):
+		"""
+		Interpolate the given ndarray, at the given point.
+		Takes care of broadcasting, and periodic boundary conditions.
+		""" # ,expanded:tpl_t=False - expanded : set true for two-level expanded arrays, as used in the algorithm
+		if ti.static(not isinstance(arr,(ti.lang.any_array.AnyArray,ti.lang._ndarray.Ndarray))): 
+			return arr # If arr is not an array, just return the value (regard as singleton array)
+		ndim = ti.static(self.Traits.ndim)
+		ti.static_assert(point.n==ndim)
+		ti.static_assert(len(arr.shape)==ndim)
+		x = self.IndexFromPoint(point)
+		x0 = ti.cast(ti.math.floor(x),ti.i32) # ti.cast is only taichi scope
+		e0 = x-x0
+		value = GetArrayModule.getitem_broadcast(arr,0*x0); value=0 # Very bad way to get zero value
+		for e in ti.grouped(ti.ndrange(*(2,)*ndim)): # ti.grouped is only taichi scope
+			# Possible improvement : take advantage of broadcasting
+			weight = Linalg.product(1-ti.abs(e-e0)) 
+			y = x0+e 
+			for i in ti.static(range(ndim)): # Python modulo (%) always produces non-negative results
+				if ti.static(self.Traits.periodic[i]): y[i] = y[i] % self.shape[i]
+			value += GetArrayModule.getitem_broadcast(arr,y) * weight
+		return value

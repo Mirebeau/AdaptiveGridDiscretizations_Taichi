@@ -841,7 +841,7 @@ class Domain:
 	@ti.func
 	def Interpolate(self,field,point):
 		"""
-		Interpolated the given field, at the given point.
+		Interpolate the given field, at the given point.
 		Takes care of broadcasting, and periodic boundary conditions.
 		"""
 		ndim = ti.static(self.Traits.ndim)
@@ -855,7 +855,8 @@ class Domain:
 			# Possible improvement : take advantage of broadcasting
 			weight = Linalg.product(1-ti.abs(e-e0)) 
 			y = x0+e
-			if ti.static(self.periodic): y[self.periodic_axis] = y[self.periodic_axis] % self.shape[self.periodic_axis]
+			if ti.static(self.periodic): # Python modulo (%) always produces non-negative results
+				y[self.periodic_axis] = y[self.periodic_axis] % self.shape[self.periodic_axis]
 			value += getitem_broadcast(field,y) * weight
 		return value
 
@@ -885,6 +886,7 @@ class Domain:
 		- radius (in pixels) : if positive, several seed points will be inserted within given radius
 		- metric (optional) : added to the value in the case of several seed points 
 		"""
+		# TODO : Upgrade to full source factorization
 		index = self.IndexFromPoint(point)
 		x = Linalg.cast_vec(ti.round(index),self.Traits.ivec_t)
 		r = ti.i32(ti.floor(radius))

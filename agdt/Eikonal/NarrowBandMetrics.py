@@ -23,7 +23,6 @@ shape_i_default = ( # Default base level block
 	(4,4,2,2),
 	(2,2,2,2,2)
 )
-
 # ------------------- Stencil helpers ------------------
 
 def axis_aligned_stencil(ndim):
@@ -119,8 +118,6 @@ def getSing(arr):
 	return arr[None] if arr.shape==tuple() else arr
 
 # ------------------ Models and local scheme update ------------------
-
-
 class DistL1:
 	"""Computation of the pixel-wise L1 distance (for debug purposes)"""
 	def __init__(self,ndim,float_t): 
@@ -138,7 +135,14 @@ class DistL1:
 		return flow
 
 class LaxFriedrichsScheme:
-	# LaxFriedrichs_Preproc: must return C0,c1,norm_data
+	"""
+	Base class for the implementation of a LaxFriedrichs scheme. 
+	The subclass must implement : 
+	- LaxFriedrichs_Preproc: must return C0,c1,norm_data
+	- dualnorm(grad,norm_data)
+	- flow(grad,norm_data)
+	"""
+
 	@ti.pyfunc
 	def LaxFriedrichs_Update(self,nvals,C0,c1,norm_data:tpl_t):
 		"""
@@ -171,8 +175,8 @@ class LaxFriedrichsScheme:
 			flow.fill(0)
 			k = Sort.argmin(nvals)
 			flow[k//2] = C0*(2*(k%2)-1) # Gradient from the slope limiter
-		return flow 
-
+		return flow
+		
 # --------------------------------------------------------------------------------------------------
 class Diagonal(LaxFriedrichsScheme):
 	"""
@@ -190,8 +194,23 @@ class Diagonal(LaxFriedrichsScheme):
 			self.set_defaults,self.Update,self.Flow,self.Preproc = self.Godunov_set_defaults,self.LaxFriedrichs_Update,self.LaxFriedrichs_Flow,self.LaxFriedrichs_Preproc
 		else: raise ValueError(f"Unrecognized {scheme=}")
 
-	# ------------------ Godunov scheme -------------------
+	def set_source_singularity(self,dom,x0,dcosts=1,costs=1):
+		# We use singleton fields to avoid unnecessary recompilations when values change
+		X0,dcost2 = ti.field(self.Traits.vec_t,tuple()), ti.field(self.Traits.vec_t,tuple())
+		X0[None] = dom.IndexFromPoint(x0) + 1 # Account for scale and padding
+		dcost = dom.Interpolate(dcosts,x0) * dom.Interpolate(costs,x0) * dom.h
+		dcost2[None] = dcost**2
+		@ti.func # X0 and dcost2 are fields to avoid recompilation when changed
+		def source_singularity(x,ret_grad:tpl_t=False):
+			v = x-X0[None]
+			Gv = dcost2[None] * v
+			Nv = ti.sqrt(v @ Gv) 
+			if ti.static(ret_grad): return Nv, Gv/Nv
+			return Nv
+		self.Traits.source_singularity = source_singularity
+		self.Traits.source_seed_index = X0
 
+	# ------------------ Godunov scheme -------------------
 	def Godunov_set_defaults(self,sgrid,h,dcosts=1,costs=1):
 		Traits = self.Traits
 		if isinstance(dcosts,ti.lang._ndarray.Ndarray): 
@@ -207,7 +226,7 @@ class Diagonal(LaxFriedrichsScheme):
 		weights = getData(data,ind,'weights')
 		cost = getData(data,ind,'costs')
 		return weights/cost**2, 
-	
+
 	@staticmethod
 	@ti.pyfunc
 	def Godunov_UpdateBase(vals,weights):
@@ -295,6 +314,22 @@ class Riemann(LaxFriedrichsScheme):
 			self.Traits,self.set_defaults,self.Update,self.Flow,self.Preproc = Traits,self.UpwindDifferences_set_defaults,self.UpwindDifferences_Update,self.UpwindDifferences_Flow,self.UpwindDifferences_Preproc
 			Traits.fstencil = to_ndarray(np.array(Traits.stencil),ti.lang.matrix.VectorType(ndim,ti.i8),True)
 		else: raise ValueError(f"Unrecognized {scheme=}")
+
+	def set_source_singularity(self,dom,x0,m=None,costs=1):
+		Traits = self.Traits; ndim = Traits.ndim
+		X0,mh = ti.field(self.Traits.vec_t,tuple()), ti.field(self.Traits.mat_t,tuple())
+		X0[None] = dom.IndexFromPoint(x0) + 1 # Account for scale and padding
+		m_ = np.eye(ndim) if m is None else dom.Interpolate(m,x0)
+		mh[None] = ti.Matrix([[m_[i,j]*dom.h[i]*dom.h[j] for i in range(ndim)] for j in range(ndim)])
+		@ti.func # X0 and dcost2 are fields to avoid recompilation when changed
+		def source_singularity(x,ret_grad:tpl_t=False):
+			v = x-X0[None]
+			Gv = mh[None] @ v
+			Nv = ti.sqrt(v @ Gv) 
+			if ti.static(ret_grad): return Nv, Gv/Nv
+			return Nv
+		self.Traits.source_singularity = source_singularity
+		self.Traits.source_seed_index = X0
 
 	# ------------------ Lax-Friedrichs scheme ----------------
 	@ti.pyfunc
