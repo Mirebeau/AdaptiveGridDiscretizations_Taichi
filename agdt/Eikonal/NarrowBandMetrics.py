@@ -54,7 +54,7 @@ SemiLag3_26 = SemiLag3_t(((-1,-1,-1),(-1,-1,0),(-1,-1,1),(-1,0,-1),(-1,0,0),(-1,
 # Cube neighborhood offsets, lexigraphically sorted, hence with opposites put symmetrically
 LexCube2 = ((-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1))
 LexCube3 = SemiLag3_26.vertices
-def LexCubeInv(l): 
+def LexCubeInd(l): 
 	"""Compute the inverse mapping to LexCube2 or LexCube3 (offset->index)"""
 	L = list(l); ndim = len(l[0])
 	indices = [L.index(e) if any(e) else -1 for e in itertools.product((-1,0,1),repeat=ndim)]
@@ -65,7 +65,7 @@ def LexCubeInv(l):
 	fwd.from_numpy(np.array(L).astype(np.int8)) # Also provide the forward mapping while we're at it
 	return fwd,inv 
 @ti.func
-def LexCubeDecomp(v,CubeInv):
+def LexCubeDecompInd(v,CubeInd):
 	"""
 	Decomposes the vector v as a positively weighted sum of cube vertices, using standard triangulation.
 	Ex : [-3,-5,4] = 3*(-1,-1,1) + (0,-1,1) + (0,-1,0)
@@ -79,7 +79,35 @@ def LexCubeDecomp(v,CubeInv):
 		λ[i] = a[σ[i]]
 		if ti.static(i>0): λ[i]-=a[σ[i-1]]
 		u[σ[i]] = ti.i8(ti.math.sign(v[σ[i]]))
-		e[i] = CubeInv[u+1]
+		e[i] = CubeInd[u+1]
+	return λ,e
+# def _LexCubeDecompHelper(ndim,inv):
+# 	if inv: return ti.lang.matrix.VectorType(ndim,ti.i8)
+# 	else: return ti.lang.matrix.MatrixType(ndim,ndim,2,ti.i8)
+@ti.func
+def LexCubeDecomp(v):
+	"""
+	Decomposes the vector v as a positively weighted sum of cube vertices, using standard triangulation.
+	Ex : [-3,-5,4] = 3*(-1,-1,1) + (0,-1,1) + (0,-1,0)
+	""" # TODO : we could factorize with previous fct, but defining e with the correct type is tricky
+	a = ti.abs(v)
+	σ = Sort.argsort(a)
+	λ = v; λ = 0 # Get correctly typed zero_like(v)
+	u = ti.lang.matrix.VectorType(v.n,ti.i8)(0)
+	e = ti.lang.matrix.MatrixType(v.n,v.n,2,ti.i8)(0)
+	# ndim = ti.static(v.n)
+	# inv = ti.static(CubeInd!=None)
+	# e = _LexCubeDecompHelper(ndim,inv)(0)
+	# #e = ti.static((ti.lang.matrix.MatrixType(v.n,v.n,2,ti.i8)(0)) if (CubeInd==None) else (ti.lang.matrix.VectorType(v.n,ti.i8)(0)))
+	#if ti.static(CubeInd==None): pass
+	#else: e = ti.lang.matrix.VectorType(v.n,ti.i8)(0)
+	for i in ti.static(tuple(reversed(range(v.n)))):
+		λ[i] = a[σ[i]]
+		if ti.static(i>0): λ[i]-=a[σ[i-1]]
+		u[σ[i]] = ti.i8(ti.math.sign(v[σ[i]]))
+		e[i,:] = u
+		# if ti.static(CubeInd==None): e[i,:] = u
+		# else: e[i] = CubeInd[u+1]
 	return λ,e
 
 
@@ -106,13 +134,16 @@ def getData(pack:ti.template(),ind,name:ti.template()):
 		return pack[name][ind[ti.static(pack.keys.index(name))]]
 	else: return pack[name]
 
-def toSing(data,dtype,default=None):
+def toSing(data,dtype,default=None,empty_like=False):
 	"""Turn some data to a singleton ndarray, unless it is already an ndarray."""
 	if data is None: data = default
-	if isinstance(data,ti.lang._ndarray.Ndarray): return data
-	arr = ti.ndarray(dtype,tuple())
-	arr.fill(data) # Assignment arr[None]=data requires casting
-	return arr
+	if not isinstance(data,ti.lang._ndarray.Ndarray): 
+		arr = ti.ndarray(dtype,tuple())
+		arr.fill(data) # Assignment arr[None]=data requires casting
+		data = arr
+	if not empty_like: return data
+	empty_like = ti.ndarray(dtype,data.shape)
+	return data,empty_like
 def getSing(arr): 
 	"""Get the value from a singleton ndarray, unless it is not a singleton."""
 	return arr[None] if arr.shape==tuple() else arr
@@ -130,7 +161,7 @@ class DistL1:
 	def Preproc(self,data:tpl_t,ind): 
 		if ti.static(self.Traits.nstencil_dynamic==0): return () # No preprocessing or data to be fetched
 		ndim = ti.static(self.Traits.ndim)
-		stencil_dynamic = ti.lang.matrix.MatrixType(2*ndim,ndim,2,ti.i8)(ti.static(axis_aligned_stencil(self.Traits.ndim)))
+		stencil_dynamic = self.Traits.stencil_dynamic_t(ti.static(axis_aligned_stencil(self.Traits.ndim)))
 		return stencil_dynamic,
 	@ti.pyfunc
 	def Update(self,nvals,stencil_dynamic=None): return nvals.min()+1
@@ -317,7 +348,7 @@ class Riemann(LaxFriedrichsScheme):
 		elif scheme=='UpwindDifferences':
 			LexCube = [None,None,LexCube2,LexCube3][ndim]
 			Traits = NarrowBand.TraitsType(LexCube,shape_i_default[ndim],float_t)
-			Traits.CubeFwd,Traits.CubeInv = LexCubeInv(LexCube)
+			_,Traits.CubeInd = LexCubeInd(LexCube)
 			self.Traits,self.set_defaults,self.Update,self.Flow,self.Preproc = Traits,self.UpwindDifferences_set_defaults,self.UpwindDifferences_Update,self.UpwindDifferences_Flow,self.UpwindDifferences_Preproc
 			Traits.fstencil = to_ndarray(np.array(Traits.stencil),ti.lang.matrix.VectorType(ndim,ti.i8),True)
 		else: raise ValueError(f"Unrecognized {scheme=}")
@@ -503,7 +534,7 @@ class Riemann(LaxFriedrichsScheme):
 		for i,e in ti.static(enumerate(self.Traits.stencil)): norm[i] = ti.sqrt(scal_static(e,m,e))
 		μ = self.Traits.mat_t(np.nan) # Build the finite differences weights and offsets
 		e = ti.lang.matrix.MatrixType(m.n,m.n,2,ti.i8)(0)
-		for i in ti.static(range(m.n)): μ[i,:],e[i,:] = LexCubeDecomp(m_isqrt[i,:],self.Traits.CubeInv)
+		for i in ti.static(range(m.n)): μ[i,:],e[i,:] = LexCubeDecompInd(m_isqrt[i,:],self.Traits.CubeInd)
 		return m,norm,μ,e
 	
 	@ti.func
@@ -553,22 +584,3 @@ class AsymQuad:
 		pass
 	# TODO : SemiLag, cf Randers
 
-class ReedsShepp2:
-	def __init__(self,float_t,scheme):
-		pass
-	# TODO : Some monotone scheme, fitting NarrowBand
-
-class ReedsSheppForward2:
-	def __init__(self,float_t,scheme):
-		pass
-	# TODO : Some monotone scheme, fitting NarrowBand
-
-class Dubins2:
-	def __init__(self,float_t,scheme):
-		pass
-	# TODO : Some monotone scheme, fitting NarrowBand
-
-class Elastica2:
-	def __init__(self,float_t,scheme):
-		pass
-	# TODO : Some monotone scheme, fitting NarrowBand
