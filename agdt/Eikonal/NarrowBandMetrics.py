@@ -81,9 +81,6 @@ def LexCubeDecompInd(v,CubeInd):
 		u[σ[i]] = ti.i8(ti.math.sign(v[σ[i]]))
 		e[i] = CubeInd[u+1]
 	return λ,e
-# def _LexCubeDecompHelper(ndim,inv):
-# 	if inv: return ti.lang.matrix.VectorType(ndim,ti.i8)
-# 	else: return ti.lang.matrix.MatrixType(ndim,ndim,2,ti.i8)
 @ti.func
 def LexCubeDecomp(v):
 	"""
@@ -95,19 +92,11 @@ def LexCubeDecomp(v):
 	λ = v; λ = 0 # Get correctly typed zero_like(v)
 	u = ti.lang.matrix.VectorType(v.n,ti.i8)(0)
 	e = ti.lang.matrix.MatrixType(v.n,v.n,2,ti.i8)(0)
-	# ndim = ti.static(v.n)
-	# inv = ti.static(CubeInd!=None)
-	# e = _LexCubeDecompHelper(ndim,inv)(0)
-	# #e = ti.static((ti.lang.matrix.MatrixType(v.n,v.n,2,ti.i8)(0)) if (CubeInd==None) else (ti.lang.matrix.VectorType(v.n,ti.i8)(0)))
-	#if ti.static(CubeInd==None): pass
-	#else: e = ti.lang.matrix.VectorType(v.n,ti.i8)(0)
 	for i in ti.static(tuple(reversed(range(v.n)))):
 		λ[i] = a[σ[i]]
 		if ti.static(i>0): λ[i]-=a[σ[i-1]]
 		u[σ[i]] = ti.i8(ti.math.sign(v[σ[i]]))
 		e[i,:] = u
-		# if ti.static(CubeInd==None): e[i,:] = u
-		# else: e[i] = CubeInd[u+1]
 	return λ,e
 
 
@@ -510,7 +499,7 @@ class Riemann(LaxFriedrichsScheme):
 		set_mh(m,mh,h)
 		return {'m':(getSing(mh),Traits.mat_t),'costs':(costs,Traits.float_t)}
 
-	# ------------------------------ Monotone ----------------------------------
+	# ------------------------------ UpwindDifferences ----------------------------------
 	def UpwindDifferences_set_defaults(self,sgrid,h,m=None,costs=1):
 		Traits = self.Traits; ndim = Traits.ndim
 		@ti.kernel # Compute square root, in rescaled coords. (Further processing done later.)

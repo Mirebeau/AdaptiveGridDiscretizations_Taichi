@@ -68,6 +68,7 @@ def f(n):
 - argpack 
   - Two different argpack, passed to a kernel, may not have elements with identical names.
   - The names used in the argpack are forbidden in the function code
+  - In the case of nested argpacks, containing ndarrays, Taichi can mess up references (1.7.4)
 
 - static
  - cannot use it to declare types, e.g. vec_t = ti.static(self.vec_t)

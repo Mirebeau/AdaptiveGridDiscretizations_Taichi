@@ -157,9 +157,9 @@ class ReedsShepp2:
 	def hfm_scheme(self, x, ih, weights:arr_t, offsets:arr_t, data:tpl_t): 
 		ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(data.ξ,x),getb(data.cθ,x),getb(data.sθ,x),getb(data.κ,x),getb(data.ε,x),getb(data.ε_cosmin2,x)
 		v = self.HFMTraits.vec_t([cθ,sθ,κ]) * ih # Horizontal control
-		m = self_outer_relax(v,ε) # Relaxation to allow a bit of orthogonal control
-		m[2,2] = max(m[2,2],v[2]*v[2]+(ih[2]/ξ)**2) # Angular control
-		λ,e = Selling.decomp(m) # Selling decomposition
+		D = self_outer_relax(v,ε) # Relaxation to allow a bit of orthogonal control
+		D[2,2] = max(m[2,2],v[2]*v[2]+(ih[2]/ξ)**2) # Angular control
+		λ,e = Selling.decomp(D) # Selling decomposition
 		w = self.HFMTraits.vec_t([v[1],-v[0],0.]) # cross product of v and {0,0,1}, i.e. non-holonomy direction
 		for i in range(self.HFMTraits.nactx): 
 			weights[*x,i] = λ[i]

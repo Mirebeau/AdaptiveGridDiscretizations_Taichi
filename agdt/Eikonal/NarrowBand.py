@@ -53,6 +53,8 @@ class TraitsType:
 
 	@property
 	def nstencil_static(self): return  len(self.stencil)
+	@property
+	def stencil_dynamic_t(self): return ti.lang.matrix.MatrixType(self.nstencil_dynamic,self.ndim,2,ti.i8)
 	@property 
 	def nstencil(self): return self.nstencil_static + self.nstencil_dynamic
 	@property
@@ -195,12 +197,12 @@ class _Algo:
 		self.seeds.push(ix)
 
 
-	def block_expand(self,arr,padding=0,dtype=None):
+	def block_expand(self,arr,dtype=None,padding=0):
 		"""
 		Input : 
 		 - arr : ti.ndarray, which can broadcast to shape
+		 - padding : padding value
 		 - dtype : element type
-		 - pad : padding value
 		Output : 
 		 - arr_io : ti.ndarray, flattened but with the implicit two-level block structure
 		 - cprod_o, cprod_i : for array index conversion
@@ -210,8 +212,7 @@ class _Algo:
 		Traits = self.Traits
 		bshape = arr.shape
 		for bs,s in zip(bshape,self.shape): assert bs in (1,s) # Check broadcasting
-		cprod = cprod(bshape)
-		bshape_o = tuple(s_o if bs>1 else 1 for s_o,bs in zip(self.shape_o,       bshape))
+		bshape_o = tuple(s_o if bs>1 else 1 for s_o,bs in zip(self.shape_o,  bshape))
 		bshape_i = tuple(s_i if bs>1 else 1 for s_i,bs in zip(Traits.shape_i,bshape))
 		cprod_o = cprod(bshape_o)
 		cprod_i = Traits.ivec_t(cprod(bshape_i)) # Can be templated (always powers of two)
@@ -226,7 +227,7 @@ class _Algo:
 				arr_oi[(x_o @ cprod_o)*size_i + (x_i @ cprod_i)] = arr[y]
 
 		arr_oi = ti.ndarray(dtype,np.prod(bshape_o+bshape_i)) 
-		arr_oi.fill(pad)
+		arr_oi.fill(padding)
 		copy_data(arr,arr_oi,cprod_o)
 		return arr_oi,cprod_o,cprod_i
 	
@@ -313,13 +314,19 @@ class _Algo:
 		self.noflow = ti.ndarray(Traits.vec_t,tuple())
 
 		self.self_ti, self.self_ti_t = make_argpack(
-		values = (self.values,Traits.float_t), 
-		new_values = (self.new_values,Traits.float_t),
-		walls = (self.walls,ti.i8), # Location of mmutable values
-		tol = (0,Traits.float_t), # Tolerance for the iterative methods
-		data = make_argpack(**data_oi), # Data for the metric update
-		cprods_o = make_argpack(**{key:(value,Traits.ivec_t) for key,value in cprods_o.items()})
-		)
+			values = (self.values,Traits.float_t), 
+			new_values = (self.new_values,Traits.float_t),
+			walls = (self.walls,ti.i8), # Location of mmutable values
+			tol = (0,Traits.float_t), # Tolerance for the iterative methods
+			# Important : 'data' must be put first otherwise taichi messes together the different ndarrays 
+			data = make_argpack(**data_oi), # Data for the metric update
+			cprods_o = make_argpack(**{key:(value,Traits.ivec_t) for key,value in cprods_o.items()})
+			)
+
+		@ti.kernel
+		def check_data(self_ti:self.self_ti_t,walls:arr_t)->ti.i32:
+			return walls.shape==self_ti.walls.shape and walls[0]==self_ti.walls[0]
+		if not check_data(self.self_ti,self.walls): raise BufferError("Taichi argpack failing in NarrowBand.build_scheme")
 
 		self.mk_update()
 
@@ -395,7 +402,7 @@ class _Algo:
 				for name in ti.static(self_ti.data.keys):
 					i = ti.static(self_ti.data.keys.index(name))
 					if ti.static(isinstance(self_ti.data[name],ti.lang.any_array.AnyArray)):
-						data_ind[i] = (x_o @ self_ti.cprod_o[name])*size_i + x_i @ self.cprods_i[name]
+						data_ind[i] = (x_o @ self_ti.cprods_o[name])*size_i + x_i @ self.cprods_i[name]
 				update_data = self.metric.Preproc(self_ti.data,data_ind)
 
 				# Fetch the values from global memory
@@ -434,7 +441,7 @@ class _Algo:
 							if inner[i]: nvalues[i] = values_i[iy[i]]
 							else: nvalues[i] = self_ti.values[iy[i]]
 							if ti.static(Traits.has_source): nvalues[i] += nsource[i]
-							# nvalues[i] = ti.select(inner[i],values_i[iy[i]],self_ti.values[iy[i]]) # Out of bounds access
+							#nvalues[i] = ti.select(inner[i],values_i[iy[i]],self_ti.values[iy[i]]) # Out of bounds access
 						flows[ix] = self.metric.Flow(nvalues,value_old,*update_data)
 				else: 
 					# A temporary array is needed with strict_iter_i
@@ -444,8 +451,8 @@ class _Algo:
 							for i in ti.static(range(Traits.nstencil)): # Get required neighbor values
 								if inner[i]: nvalues[i] = values_i[iy[i]] # Local values are updated along iterations
 								elif ti.static(iter_i==0): nvalues[i] = self_ti.values[iy[i]] # Global values are immutable along iterations
-								if ti.static(Traits.has_source) and (inner[i] or ti.static(iter_i==0)): 
-									nvalues[i] += nsource[i]
+								if ti.static(Traits.has_source):
+									if (inner[i] or ti.static(iter_i==0)): nvalues[i] += nsource[i]
 							λ = self.metric.Update(nvalues,*update_data)
 							if ti.static(Traits.strict_iter_i): # Use temporary variable to separate updates
 								new_values_i[ix_i]=λ
@@ -490,7 +497,7 @@ class _Algo:
 				for name in ti.static(self_ti.data.keys):
 					i = ti.static(self_ti.data.keys.index(name))
 					if ti.static(isinstance(self_ti.data[name],ti.lang.any_array.AnyArray)):
-						data_ind[i] = (x_o @ self_ti.cprod_o[name])*size_i + x_i @ self.cprods_i[name]
+						data_ind[i] = (x_o @ self_ti.cprods_o[name])*size_i + x_i @ self.cprods_i[name]
 				update_data = self.metric.Preproc(self_ti.data,data_ind)
 
 				# Fetch the values from global memory
@@ -511,6 +518,7 @@ class _Algo:
 				if not wall:
 					for i in ti.static(range(Traits.nstencil_static)):
 						ioffset,_ = self.ioffset_static(x_i,offset=ti.static(Traits.stencil[i]))
+						if(ix+ioffset<0): print(Traits.stencil[i],ioffset,ix,self_ti.walls[ix])
 						nvalues[i] = self_ti.values[ix+ioffset]
 						if ti.static(Traits.has_source): nvalues[i] += nsource[i]
 					for i in ti.static(range(Traits.nstencil_dynamic)):
@@ -717,7 +725,6 @@ class _Algo:
 		self_ti = self.self_ti
 		self_ti.tol = tol # Set tolerance parameter
 		self.seeds.clear()
-
 		ixs_o = ti.ndarray(ti.i32,self.size_o)
 		ixs_o.from_numpy(np.arange(self.size_o)) # Every block is listed for update
 		improved = ti.ndarray(ti.i8,self.size_o)
@@ -835,25 +842,25 @@ class Domain:
 
 		if source_seed is None: return # Implementing source factorization
 		self.metric.set_source_singularity(self,source_seed,**kwargs)
-		# r = int(np.floor(source_radius))
-		# ndim = self.Traits.ndim
-		# @ti.kernel # Set (several) frozen seed points within a small radius around given source_seed
-		# def spread_seed(self_ti:self.algo.self_ti_t):
-		# 	X0 = self.Traits.source_seed_index[None] 
-		# 	X = Linalg.cast_vec(ti.round(X0),self.Traits.ivec_t)
-		# 	for e in ti.grouped(ti.ndrange(*((-r,r+1),)*ndim)):
-		# 		y = X+e 
-		# 		# Keep only seeds which are close enough to X0 (the closest is always kept)
-		# 		if any(e) and (y-X0).norm_sqr()>source_radius**2: continue
-		# 		value = self.Traits.source_singularity(y)
-		# 		for i in ti.static(range(ndim)):
-		# 			if ti.static(self.Traits.periodic[i]):
-		# 				if y[i]<1: y[i]+= self.shape[i]
-		# 				if y[i]>self.shape[i]: y[i]-=self.shape[i]
-		# 		if self.algo.indomain(y): 
-		# 			self.algo.set_seed(self_ti,self.algo.x2ix(y),value)
-		#spread_seed(self.self_ti)
-		self.set_seed(self.self_ti,source_seed)
+		r = int(np.floor(source_radius))
+		ndim = self.Traits.ndim
+		@ti.kernel # Set (several) frozen seed points within a small radius around given source_seed
+		def spread_seed(self_ti:self.algo.self_ti_t):
+			X0 = self.Traits.source_seed_index[None] 
+			X = Linalg.cast_vec(ti.round(X0),self.Traits.ivec_t)
+			for e in ti.grouped(ti.ndrange(*((-r,r+1),)*ndim)):
+				y = X+e 
+				# Keep only seeds which are close enough to X0 (the closest is always kept)
+				if any(e) and (y-X0).norm_sqr()>source_radius**2: continue
+				value = self.Traits.source_singularity(y)
+				for i in ti.static(range(ndim)):
+					if ti.static(self.Traits.periodic[i]):
+						if y[i]<1: y[i]+= self.shape[i]
+						if y[i]>self.shape[i]: y[i]-=self.shape[i]
+				if self.algo.indomain(y): 
+					self.algo.set_seed(self_ti,self.algo.x2ix(y),value)
+		spread_seed(self.self_ti)
+		#self.set_seed(self.self_ti,source_seed)
 		
 	def values(self): return self.algo.block_squeeze(self.algo.values)
 
