@@ -119,9 +119,10 @@ def scal_static(e:tpl_t,m:tpl_t,f:tpl_t):
 @ti.pyfunc
 def getData(pack:ti.template(),ind,name:ti.template()):
 	"""returns pack.name[ind.name], for an array, or pack.name for a value"""
-	if ti.static(isinstance(pack[name],(ti.lang.any_array.AnyArray,ti.lang._ndarray.Ndarray))): 
-		return pack[name][ind[ti.static(pack.keys.index(name))]]
-	else: return pack[name]
+	# This function is more ugly than it should due to issues with argpack nesting in Taichi (1.7.4)
+	if ti.static(isinstance(pack['data_'+name],(ti.lang.any_array.AnyArray,ti.lang._ndarray.Ndarray))): 
+		return pack['data_'+name][ind[ti.static(pack.cprods_o.keys.index(name))]]
+	else: return pack['data_'+name]
 
 def toSing(data,dtype,default=None,empty_like=False):
 	"""Turn some data to a singleton ndarray, unless it is already an ndarray."""

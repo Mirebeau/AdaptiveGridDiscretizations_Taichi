@@ -318,8 +318,10 @@ class _Algo:
 			new_values = (self.new_values,Traits.float_t),
 			walls = (self.walls,ti.i8), # Location of mmutable values
 			tol = (0,Traits.float_t), # Tolerance for the iterative methods
-			# Important : 'data' must be put first otherwise taichi messes together the different ndarrays 
-			data = make_argpack(**data_oi), # Data for the metric update
+			# Nested argpacks containing ndarrays seem to cause trouble.
+			**{('data_'+key):value for key,value in data_oi.items()}, # Data for the metric update
+			# Important : 'data' is flattened since otherwise taichi messes together the different ndarrays (1.7.4)
+			#data = make_argpack(**data_oi), # Data for the metric update
 			cprods_o = make_argpack(**{key:(value,Traits.ivec_t) for key,value in cprods_o.items()})
 			)
 
@@ -328,13 +330,15 @@ class _Algo:
 			return walls.shape==self_ti.walls.shape and walls[0]==self_ti.walls[0]
 		if not check_data(self.self_ti,self.walls): raise BufferError("Taichi argpack failing in NarrowBand.build_scheme")
 
+		print(self.self_ti)
+
 		self.mk_update()
 
 	@ti.pyfunc
 	def ioffset_static(self,x_i,offset:ti.template()):
 		"""Index to access the solution value at x+offset, where the offset is a compile time constant (static)"""
 		ioffset:self.Traits.int_t = 0
-		inner:ti.i8 = True # Can we get the value from the inner block
+		inner = True # Can we get the value from the inner block
 		for k in ti.static(range(self.Traits.ndim)):
 			c = self.cprod_o[k] * self.Traits.size_i - self.Traits.cprod_i[k] * (self.Traits.shape_i[k]-1)
 			if ti.static(offset[k]==1):
@@ -351,7 +355,7 @@ class _Algo:
 	def ioffset_dynamic(self,x_i,offset):
 		"""Index to access the solution value at x+offset, where the offset is defined at runtime (dynamic)"""
 		ioffset:self.Traits.int_t = 0
-		inner:ti.i8 = True # Can we get the value from the inner block
+		inner = True # Can we get the value from the inner block, in the two-level architecture
 		for k in ti.static(range(self.Traits.ndim)):
 			c = self.cprod_o[k] * self.Traits.size_i - self.Traits.cprod_i[k] * (self.Traits.shape_i[k]-1)
 			if offset[k]==1:
@@ -399,11 +403,11 @@ class _Algo:
 
 				# Also setup the indices for the data extraction
 				data_ind = self.data_ind_t(0)
-				for name in ti.static(self_ti.data.keys):
-					i = ti.static(self_ti.data.keys.index(name))
-					if ti.static(isinstance(self_ti.data[name],ti.lang.any_array.AnyArray)):
+				for name in ti.static(self_ti.cprods_o.keys):
+					i = ti.static(self_ti.cprods_o.keys.index(name))
+					if ti.static(isinstance(self_ti['data_'+name],ti.lang.any_array.AnyArray)):
 						data_ind[i] = (x_o @ self_ti.cprods_o[name])*size_i + x_i @ self.cprods_i[name]
-				update_data = self.metric.Preproc(self_ti.data,data_ind)
+				update_data = self.metric.Preproc(self_ti,data_ind)
 
 				# Fetch the values from global memory
 				values_i = ti.simt.block.SharedArray((size_i,), Traits.float_t)
@@ -465,7 +469,7 @@ class _Algo:
 					# Diagnostic : did we improve the value ? (TODO : narrowband exponential criterion.)
 					value_new = values_i[ix_i]
 					if value_new < value_old - self_ti.tol: 
-						improved[_ix_o] = True # All threads the write to same place
+						improved[_ix_o] = ti.i8(True) # All threads the write to same place
 						self_ti.new_values[ix] = values_i[ix_i] # Write back to global memory, if improved.
 
 			# Copy back data. It would be more efficient to swap values with new_values,
@@ -494,11 +498,11 @@ class _Algo:
 
 				# Also setup the indices for the data extraction
 				data_ind = self.data_ind_t(0)
-				for name in ti.static(self_ti.data.keys):
-					i = ti.static(self_ti.data.keys.index(name))
-					if ti.static(isinstance(self_ti.data[name],ti.lang.any_array.AnyArray)):
+				for name in ti.static(self_ti.cprods_o.keys):
+					i = ti.static(self_ti.cprods_o.keys.index(name))
+					if ti.static(isinstance(self_ti['data_'+name],ti.lang.any_array.AnyArray)):
 						data_ind[i] = (x_o @ self_ti.cprods_o[name])*size_i + x_i @ self.cprods_i[name]
-				update_data = self.metric.Preproc(self_ti.data,data_ind)
+				update_data = self.metric.Preproc(self_ti,data_ind)
 
 				# Fetch the values from global memory
 				ix = ix_i + ix_o*size_i # Global index
@@ -531,7 +535,7 @@ class _Algo:
 				else: # no inner loop here, equivalently niter_i = 1
 					if not wall: value_new = self.metric.Update(nvalues,*update_data)
 					if value_new < value_old - self_ti.tol:
-						improved[_ix_o] = True # All threads the write to same place
+						improved[_ix_o] = ti.i8(True) # All threads the write to same place
 						self_ti.new_values[ix] = value_new # Write back to global memory, if improved.
 
 			# Copy back data. It would be more efficient to swap values with new_values,
