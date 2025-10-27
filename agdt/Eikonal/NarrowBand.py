@@ -397,11 +397,17 @@ class _Algo:
 				wall = self_ti.walls[ix] # wall : immutable value
 				nvalues = Traits.nvalues_t(np.nan) # NaN is a dummy neighbor value, will be replaced (becomes inf ??)
 
+				nsource = Traits.nvalues_t(np.nan) # Compute the source factorization (optional)
+				if ti.static(Traits.has_source): Traits.source_factorization(x,nsource)
+
 				if ti.static(len(flows.shape)>0): # Not actually an update : compute flow and exit
 					if wall: flows[ix] = ti.select(values_i[ix_i]<np.inf,0,np.nan) # Null at seed, NaN in wall
 					else: # Get the neighbor values, and compute the flow
 						for i in ti.static(range(Traits.nstencil)): # Get required neighbor values
-							nvalues[i] = ti.select(inner[i],values_i[iy[i]],self_ti.values[iy[i]])
+							if inner[i]: nvalues[i] = values_i[iy[i]]
+							else: nvalues[i] = self_ti.values[iy[i]]
+							if ti.static(Traits.has_source): nvalues[i] += nsource[i]
+							# nvalues[i] = ti.select(inner[i],values_i[iy[i]],self_ti.values[iy[i]]) # Out of bounds access
 						flows[ix] = self.metric.Flow(nvalues,value_old,*update_data)
 				else: 
 					# A temporary array is needed with strict_iter_i
@@ -410,7 +416,9 @@ class _Algo:
 						if not wall:  # wall : immutable value
 							for i in ti.static(range(Traits.nstencil)): # Get required neighbor values
 								if inner[i]: nvalues[i] = values_i[iy[i]] # Local values are updated along iterations
-								elif ti.static(iter_i==0): nvalues[i] = self_ti.values[iy[i]] # Global values are immutable along iterations						
+								elif ti.static(iter_i==0): nvalues[i] = self_ti.values[iy[i]] # Global values are immutable along iterations
+								if ti.static(Traits.has_source) and (inner[i] or ti.static(iter_i==0)): 
+									nvalues[i] += nsource[i]
 							λ = self.metric.Update(nvalues,*update_data)
 							if ti.static(Traits.strict_iter_i): # Use temporary variable to separate updates
 								new_values_i[ix_i]=λ
