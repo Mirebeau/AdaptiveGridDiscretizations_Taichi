@@ -120,15 +120,22 @@ def getSing(arr):
 # ------------------ Models and local scheme update ------------------
 class DistL1:
 	"""Computation of the pixel-wise L1 distance (for debug purposes)"""
-	def __init__(self,ndim,float_t): 
-		self.Traits = NarrowBand.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
+	def __init__(self,ndim,float_t,stencil_static=True):
+		if stencil_static: self.Traits = NarrowBand.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
+		else: # Use a dynamic stencil (in fact everywhere the same)
+			self.Traits = NarrowBand.TraitsType(tuple(),shape_i_default[ndim],float_t)
+			self.Traits.nstencil_dynamic = 2*ndim
 	def set_defaults(self,sgrid,h): return {'dummy':(1,self.Traits.float_t)}
 	@ti.pyfunc
-	def Preproc(self,data:tpl_t,ind): return () # No preprocessing or data to be teched
+	def Preproc(self,data:tpl_t,ind): 
+		if ti.static(self.Traits.nstencil_dynamic==0): return () # No preprocessing or data to be fetched
+		ndim = ti.static(self.Traits.ndim)
+		stencil_dynamic = ti.lang.matrix.MatrixType(2*ndim,ndim,2,ti.i8)(ti.static(axis_aligned_stencil(self.Traits.ndim)))
+		return stencil_dynamic,
 	@ti.pyfunc
-	def Update(self,nvals): return nvals.min()+1
+	def Update(self,nvals,stencil_dynamic=None): return nvals.min()+1
 	@ti.pyfunc
-	def Flow(self,nvals,λ):
+	def Flow(self,nvals,λ,stencil_dynamic=None):
 		flow = self.Traits.ivec_t(0)
 		k = Sort.argmin(nvals)
 		if nvals[k]<λ: flow[k//2] = 2*(k%2)-1

@@ -40,7 +40,7 @@ def cprod(shape):
 
 @dataclass
 class TraitsType:
-	stencil:tuple = None # The neighbor points used in the numerical scheme. Use int for dynamic stencil.
+	stencil:tuple = None # The neighbor points used in the numerical scheme. (Static stencil.)
 	shape_i:tuple = None # 
 	float_t:type = ti.f32 # Solution values
 	int_t:type = ti.i32 # Type used for array indexing
@@ -49,19 +49,22 @@ class TraitsType:
 	_periodic:tuple = None # tuple of ndim booleans, for each axis
 	strict_iter_i:bool = False
 	strict_iter_o:bool = False
+	nstencil_dynamic:int = 0 # Additional stencil points may be defined at runtime
 
+	@property
+	def nstencil_static(self): return  len(self.stencil)
 	@property 
-	def nstencil(self): return self.stencil if isinstance(self.stencil,int) else len(self.stencil)
+	def nstencil(self): return self.nstencil_static + self.nstencil_dynamic
 	@property
 	def nvalues_t(self): return ti.lang.matrix.VectorType(self.nstencil,self.float_t)
 	@property
 	def ndim(self): return len(self.shape_i)
 	@property
 	def vec_t(self): return ti.lang.matrix.VectorType(self.ndim,self.float_t)
-	@property
+	@property # Vector with integer coordinates
 	def ivec_t(self): return ti.lang.matrix.VectorType(self.ndim,self.int_t)
-#	@property
-#	def ioffset_t(self): return ti.lang.matrix.VectorType(self.ndim,ti.i8)
+	#@property # Vector with short coordinates, used as an stencil element
+	#def ioffset_t(self): return ti.lang.matrix.VectorType(self.ndim,ti.i8)
 	@property
 	def mat_t(self): return ti.lang.matrix.MatrixType(self.ndim,self.ndim,2,self.float_t)
 	@property
@@ -91,9 +94,10 @@ class TraitsType:
 	def source_factorization(self,x,corr:ti.template()):
 		"""
 		Corrections for source factorization, which improves accuracy near singularities. 
-		source_singularity must be implemented
+		source_singularity(index,ret_grad=False) must be implemented
 		"""
 		# Note : we pre-allocate corr, and pass it as reference, to simplify control flow
+		# Note : dynamic stencils are not supported at this point
 		Nx,Gx = self.source_singularity(x,ret_grad=True)
 		for i,_e in ti.static(enumerate(self.stencil)):
 			e = self.vec_t(_e)
@@ -321,7 +325,7 @@ class _Algo:
 
 	@ti.pyfunc
 	def ioffset_static(self,x_i,offset:ti.template()):
-		"""Access the solution value at x+offset, where the offset is static"""
+		"""Index to access the solution value at x+offset, where the offset is a compile time constant (static)"""
 		ioffset:self.Traits.int_t = 0
 		inner:ti.i8 = True # Can we get the value from the inner block
 		for k in ti.static(range(self.Traits.ndim)):
@@ -335,6 +339,25 @@ class _Algo:
 			else:
 				ti.static_assert(offset[k]==0) # Offsets with abs(component)>1 unsupported
 		return ioffset, inner
+	
+	@ti.pyfunc
+	def ioffset_dynamic(self,x_i,offset):
+		"""Index to access the solution value at x+offset, where the offset is defined at runtime (dynamic)"""
+		ioffset:self.Traits.int_t = 0
+		inner:ti.i8 = True # Can we get the value from the inner block
+		for k in ti.static(range(self.Traits.ndim)):
+			c = self.cprod_o[k] * self.Traits.size_i - self.Traits.cprod_i[k] * (self.Traits.shape_i[k]-1)
+			if offset[k]==1:
+				if x_i[k]==self.Traits.shape_i[k]-1: ioffset += c; inner=False
+				else: ioffset += self.Traits.cprod_i[k]
+			elif offset[k]==-1:
+				if x_i[k]==0: ioffset -= c; inner=False
+				else: ioffset -= self.Traits.cprod_i[k]
+			else:
+				assert(offset[k]==0) # Offsets with abs(component)>1 unsupported
+		return ioffset, inner
+
+
 	
 	@ti.pyfunc
 	def get_value_static(self,values:ti.template(),values_i,x,ix,x_i,ix_i,offset:ti.template()):
@@ -388,12 +411,16 @@ class _Algo:
 				ti.simt.block.sync()
 
 				# Prepare to fetch the neighbor values
-				nstencil = ti.static(Traits.nstencil)
+				nstencil,nstencil_static = ti.static(Traits.nstencil,Traits.nstencil_static)
 				inner = ti.lang.matrix.VectorType(nstencil,ti.i8)(0)
 				iy = ti.lang.matrix.VectorType(nstencil,Traits.int_t)(0)
-				for i in ti.static(range(nstencil)):
+				for i in ti.static(range(Traits.nstencil_static)):
 					ioffset,inner[i] = self.ioffset_static(x_i,offset=ti.static(Traits.stencil[i]))
 					iy[i] = ti.select(inner[i], ix_i+ioffset, ix+ioffset)
+				for i in ti.static(range(Traits.nstencil_dynamic)):
+					ioffset,inner[nstencil_static+i] = self.ioffset_dynamic(x_i,update_data[-1][i,:])
+					iy[nstencil_static+i] = ti.select(inner[i], ix_i+ioffset, ix+ioffset)
+
 				wall = self_ti.walls[ix] # wall : immutable value
 				nvalues = Traits.nvalues_t(np.nan) # NaN is a dummy neighbor value, will be replaced (becomes inf ??)
 
@@ -480,13 +507,15 @@ class _Algo:
 				# Fetch the neighbor values
 				nsource = Traits.nvalues_t(np.nan) # Compute the source factorization (optional)
 				if ti.static(Traits.has_source): Traits.source_factorization(x,nsource)
-				nstencil = ti.static(Traits.nstencil)
 				nvalues = Traits.nvalues_t(np.nan) # NaN is a dummy neighbor value, will be replaced (becomes inf ??)
 				if not wall:
-					for i in ti.static(range(nstencil)):
+					for i in ti.static(range(Traits.nstencil_static)):
 						ioffset,_ = self.ioffset_static(x_i,offset=ti.static(Traits.stencil[i]))
 						nvalues[i] = self_ti.values[ix+ioffset]
 						if ti.static(Traits.has_source): nvalues[i] += nsource[i]
+					for i in ti.static(range(Traits.nstencil_dynamic)):
+						ioffset,_ = self.ioffset_dynamic(x_i,update_data[-1][i,:])
+						nvalues[Traits.nstencil_static+i] = self_ti.values[ix+ioffset]
 
 				if ti.static(len(flows.shape)>0): # Not actually an update : compute flow and exit
 					if wall: flows[ix] = ti.select(value_old<np.inf,0,np.nan) # Null at seed, NaN in wall
