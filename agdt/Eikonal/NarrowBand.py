@@ -134,8 +134,6 @@ class _Algo:
 		self._periodic_shift[None] = tuple( 
 			(s//s_i) * c_o * Traits.size_i + (s%s_i) * c_i for s,s_i,c_o,c_i in 
 			zip(shape, Traits.shape_i, self.cprod_o, Traits.cprod_i )  )
-		print(shape, Traits.shape_i, self.cprod_o, Traits.cprod_i)
-		print(f"{self.periodic_shift=},{self.shape_o=}")
 
 	# Compile time constants
 	@property

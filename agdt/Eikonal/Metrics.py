@@ -106,11 +106,12 @@ def decomp_v(v,ε=0.01,ε_cosmin2=0.67):
 		if ve<0: e[i,:] = -ei
 	return λ,e
 
-def _default_trigo(θ,cθ=None,sθ=None):
+def _default_trigo(θ,cθ=None,sθ=None,θper=2*np.pi):
 	"""Returns cθ and sθ, or cos(θ) and sin(θ) if they are None"""
 	float_t = convert_dtype['ti'][θ.dtype]
 	if cθ is None: cθ = ti.ndarray(float_t,θ.shape); cθ.from_numpy(np.cos(θ))
 	if sθ is None: sθ = ti.ndarray(float_t,θ.shape); sθ.from_numpy(np.sin(θ))
+	assert abs((θper/2 + θ[0,0,1]+θ[0,0,-1]-2*θ[0,0,0]) % θper - θper/2) < 1e-3 # Check periodicity
 	return cθ,sθ
 
 class ReedsSheppForward2:
