@@ -158,7 +158,7 @@ class ReedsShepp2:
 		ξ,cθ,sθ,κ,ε,ε_cosmin2 = getb(data.ξ,x),getb(data.cθ,x),getb(data.sθ,x),getb(data.κ,x),getb(data.ε,x),getb(data.ε_cosmin2,x)
 		v = self.HFMTraits.vec_t([cθ,sθ,κ]) * ih # Horizontal control
 		D = self_outer_relax(v,ε) # Relaxation to allow a bit of orthogonal control
-		D[2,2] = max(m[2,2],v[2]*v[2]+(ih[2]/ξ)**2) # Angular control
+		D[2,2] = max(D[2,2],v[2]*v[2]+(ih[2]/ξ)**2) # Angular control
 		λ,e = Selling.decomp(D) # Selling decomposition
 		w = self.HFMTraits.vec_t([v[1],-v[0],0.]) # cross product of v and {0,0,1}, i.e. non-holonomy direction
 		for i in range(self.HFMTraits.nactx): 

@@ -97,6 +97,7 @@ def LexCubeDecomp(v):
 		if ti.static(i>0): λ[i]-=a[σ[i-1]]
 		u[σ[i]] = ti.i8(ti.math.sign(v[σ[i]]))
 		e[i,:] = u
+		# if λ[i]==0: e[i,:]=0 # Do we want to do something about null offsets ?  
 	return λ,e
 
 
@@ -223,11 +224,16 @@ class Diagonal(LaxFriedrichsScheme):
 		else: raise ValueError(f"Unrecognized {scheme=}")
 
 	def set_source_singularity(self,dom,x0,dcosts=1,costs=1):
+		Traits = self.Traits; float_t,vec_t = Traits.float_t,Traits.vec_t 
 		# We use singleton fields to avoid unnecessary recompilations when values change
 		X0,dcost2 = ti.field(self.Traits.vec_t,tuple()), ti.field(self.Traits.vec_t,tuple())
-		X0[None] = dom.IndexFromPoint(x0) + 1 # Account for scale and padding
-		dcost = dom.Interpolate(dcosts,x0) * dom.Interpolate(costs,x0) * dom.h
-		dcost2[None] = dcost**2
+		@ti.kernel
+		def set_source_params(x0:vec_t,dcosts:arr_t,costs:arr_t):
+			X0[None] = dom.IndexFromPoint(x0) + 1 # Account for scale and padding
+			dcost = dom.Interpolate(dcosts,x0) * dom.Interpolate(costs,x0) * dom.h # Taichi scope only
+			dcost2[None] = dcost**2
+		set_source_params(x0,toSing(dcosts,vec_t),toSing(costs,float_t))
+
 		@ti.func # X0 and dcost2 are fields to avoid recompilation when changed
 		def source_singularity(x,ret_grad:tpl_t=False):
 			v = x-X0[None]
@@ -245,6 +251,7 @@ class Diagonal(LaxFriedrichsScheme):
 			@ti.kernel
 			def build_scheme(h:Traits.vec_t,dcosts:arr_t,weights:arr_t):
 				for x in ti.grouped(dcosts): weights[x] = (h*dcosts[x])**-2 
+			weights = ti.ndarray(Traits.vec_t,dcosts.shape)
 			build_scheme(h,dcosts,weights)
 		else: weights = (h*dcosts)**-2
 		return {'weights':(weights,Traits.vec_t),'costs':(costs,Traits.float_t)}
@@ -344,11 +351,15 @@ class Riemann(LaxFriedrichsScheme):
 		else: raise ValueError(f"Unrecognized {scheme=}")
 
 	def set_source_singularity(self,dom,x0,m=None,costs=1):
-		Traits = self.Traits; ndim = Traits.ndim
-		X0,mh = ti.field(self.Traits.vec_t,tuple()), ti.field(self.Traits.mat_t,tuple())
-		X0[None] = dom.IndexFromPoint(x0) + 1 # Account for scale and padding
-		m_ = np.eye(ndim) if m is None else dom.Interpolate(m,x0)
-		mh[None] = ti.Matrix([[m_[i,j]*dom.h[i]*dom.h[j] for i in range(ndim)] for j in range(ndim)])
+		Traits = self.Traits; ndim,float_t,vec_t,mat_t = Traits.ndim,Traits.float_t,Traits.vec_t,Traits.mat_t
+		X0,mh = ti.field(vec_t,tuple()), ti.field(mat_t,tuple())
+		@ti.kernel
+		def source_params(x0:vec_t,m:arr_t,costs:arr_t):
+			X0[None] = dom.IndexFromPoint(x0) + 1 # Account for scale and padding
+			m_ = dom.Interpolate(m,x0) * dom.Interpolate(costs,x0)# Taichi scope only
+			mh[None] = ti.Matrix([[m_[i,j]*dom.h[i]*dom.h[j] for i in range(ndim)] for j in range(ndim)])
+		source_params(x0,toSing(m,mat_t,np.eye(ndim)),toSing(costs,float_t))
+
 		@ti.func # X0 and dcost2 are fields to avoid recompilation when changed
 		def source_singularity(x,ret_grad:tpl_t=False):
 			v = x-X0[None]
@@ -545,10 +556,11 @@ class Riemann(LaxFriedrichsScheme):
 		for i in ti.static(range(μ.n)):
 			μsum = μ[i,:].sum()
 			val_p = 0.; val_m = 0. # Left and right update
-			for j in ti.static(range(μ.n)): 
+			for j in ti.static(range(μ.n)):
+				# Note : (μ=0)*(nvals=inf) results in NaN, but this configuration is handled by the graph updates
 				val_p += μ[i,j]*nvals[e[i,j]]
 				val_m += μ[i,j]*nvals[(nvals.n-1)-e[i,j]] # Offsets are symmetric
-				if ti.static(ret_flow): flows[i,:] += μ[i,j]*fstencil[e[i,j]]
+				if ti.static(ret_flow): flows[i,:] += μ[i,j] * fstencil[e[i,j]]
 			vals[i] = min(val_p,val_m) / μsum
 			if ti.static(ret_flow): 
 				flows[i,:] /= μsum

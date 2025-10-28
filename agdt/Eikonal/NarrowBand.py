@@ -28,7 +28,9 @@ def any_ndarray(a:arr_t) -> ti.u1:
 	Equivalently : any(a.to_numpy()), but this copies all data.
 	"""
 	res=False
-	for x in a: res = res or ti.u1(a[x])  # Reduction operation, hope taichi parallelizes it
+	for x in a:
+		if a[x]: res = True # All threads write to the same place, data races innocuous
+		# res = res or ti.u1(a[x])  # Fails. Taichi bug in reduction operation ??
 	return res
 
 # --------------------- Compile time constants associated with the scheme ---------------------
@@ -132,6 +134,8 @@ class _Algo:
 		self._periodic_shift[None] = tuple( 
 			(s//s_i) * c_o * Traits.size_i + (s%s_i) * c_i for s,s_i,c_o,c_i in 
 			zip(shape, Traits.shape_i, self.cprod_o, Traits.cprod_i )  )
+		print(shape, Traits.shape_i, self.cprod_o, Traits.cprod_i)
+		print(f"{self.periodic_shift=},{self.shape_o=}")
 
 	# Compile time constants
 	@property
@@ -153,6 +157,7 @@ class _Algo:
 	@property
 	@ti.pyfunc # Domain shape, not counting the 1-pixel padding on each boundary
 	def shape(self): return self._shape[None]
+	@property
 	@ti.pyfunc
 	def periodic_shift(self): return self._periodic_shift[None]
 
@@ -214,9 +219,10 @@ class _Algo:
 		for bs,s in zip(bshape,self.shape): assert bs in (1,s) # Check broadcasting
 		bshape_o = tuple(s_o if bs>1 else 1 for s_o,bs in zip(self.shape_o,  bshape))
 		bshape_i = tuple(s_i if bs>1 else 1 for s_i,bs in zip(Traits.shape_i,bshape))
-		cprod_o = cprod(bshape_o)
 		cprod_i = Traits.ivec_t(cprod(bshape_i)) # Can be templated (always powers of two)
 		size_i = np.prod(bshape_i)
+		cprod_o = Traits.ivec_t(cprod(bshape_o)) * size_i
+		#print(bshape,bshape_o,bshape_i,cprod_o,cprod_i,size_i)
 		
 		@ti.kernel
 		def copy_data(arr:arr_t, arr_oi:arr_t, cprod_o:Traits.ivec_t):
@@ -224,7 +230,7 @@ class _Algo:
 				x = 1+y # Padding along the boundary
 				x_o = x // Traits.shape_i
 				x_i = x %  Traits.shape_i
-				arr_oi[(x_o @ cprod_o)*size_i + (x_i @ cprod_i)] = arr[y]
+				arr_oi[(x_o @ cprod_o) + (x_i @ cprod_i)] = arr[y]
 
 		arr_oi = ti.ndarray(dtype,np.prod(bshape_o+bshape_i)) 
 		arr_oi.fill(padding)
@@ -318,19 +324,16 @@ class _Algo:
 			new_values = (self.new_values,Traits.float_t),
 			walls = (self.walls,ti.i8), # Location of mmutable values
 			tol = (0,Traits.float_t), # Tolerance for the iterative methods
-			# Nested argpacks containing ndarrays seem to cause trouble.
+			# Important : 'data' is flattened since otherwise taichi messes together the different ndarrays (v1.7.4)
 			**{('data_'+key):value for key,value in data_oi.items()}, # Data for the metric update
-			# Important : 'data' is flattened since otherwise taichi messes together the different ndarrays (1.7.4)
 			#data = make_argpack(**data_oi), # Data for the metric update
 			cprods_o = make_argpack(**{key:(value,Traits.ivec_t) for key,value in cprods_o.items()})
 			)
 
-		@ti.kernel
+		@ti.kernel 	# Nested arpacks containing ndarrays fail (Taichi v1.7.4)
 		def check_data(self_ti:self.self_ti_t,walls:arr_t)->ti.i32:
 			return walls.shape==self_ti.walls.shape and walls[0]==self_ti.walls[0]
 		if not check_data(self.self_ti,self.walls): raise BufferError("Taichi argpack failing in NarrowBand.build_scheme")
-
-		print(self.self_ti)
 
 		self.mk_update()
 
@@ -406,7 +409,7 @@ class _Algo:
 				for name in ti.static(self_ti.cprods_o.keys):
 					i = ti.static(self_ti.cprods_o.keys.index(name))
 					if ti.static(isinstance(self_ti['data_'+name],ti.lang.any_array.AnyArray)):
-						data_ind[i] = (x_o @ self_ti.cprods_o[name])*size_i + x_i @ self.cprods_i[name]
+						data_ind[i] = (x_o @ self_ti.cprods_o[name]) + (x_i @ self.cprods_i[name])
 				update_data = self.metric.Preproc(self_ti,data_ind)
 
 				# Fetch the values from global memory
@@ -429,8 +432,9 @@ class _Algo:
 					ioffset,inner[i] = self.ioffset_static(x_i,offset=ti.static(Traits.stencil[i]))
 					iy[i] = ti.select(inner[i], ix_i+ioffset, ix+ioffset)
 				for i in ti.static(range(Traits.nstencil_dynamic)):
-					ioffset,inner[nstencil_static+i] = self.ioffset_dynamic(x_i,update_data[-1][i,:])
-					iy[nstencil_static+i] = ti.select(inner[i], ix_i+ioffset, ix+ioffset)
+					j = ti.static(nstencil_static+i)
+					ioffset,inner[j] = self.ioffset_dynamic(x_i,update_data[-1][i,:])
+					iy[j] = ti.select(inner[j], ix_i+ioffset, ix+ioffset)
 
 				wall = self_ti.walls[ix] # wall : immutable value
 				nvalues = Traits.nvalues_t(np.nan) # NaN is a dummy neighbor value, will be replaced (becomes inf ??)
@@ -501,7 +505,7 @@ class _Algo:
 				for name in ti.static(self_ti.cprods_o.keys):
 					i = ti.static(self_ti.cprods_o.keys.index(name))
 					if ti.static(isinstance(self_ti['data_'+name],ti.lang.any_array.AnyArray)):
-						data_ind[i] = (x_o @ self_ti.cprods_o[name])*size_i + x_i @ self.cprods_i[name]
+						data_ind[i] = (x_o @ self_ti.cprods_o[name]) + (x_i @ self.cprods_i[name])
 				update_data = self.metric.Preproc(self_ti,data_ind)
 
 				# Fetch the values from global memory
@@ -512,6 +516,7 @@ class _Algo:
 						if x[k]==0: ix_per += self.periodic_shift[k]
 						if x[k]==self.shape[k]+1: ix_per -= self.periodic_shift[k]	
 				value_old = self_ti.values[ix_per] #values_i[ix_i] # Save the value to compare with update
+				if ix!=ix_per: self_ti.new_values[ix] = value_old # Copy not needed in GPU implem (accessed in shared array)
 				value_new = value_old
 				wall = self_ti.walls[ix] # wall : immutable value
 
@@ -522,7 +527,6 @@ class _Algo:
 				if not wall:
 					for i in ti.static(range(Traits.nstencil_static)):
 						ioffset,_ = self.ioffset_static(x_i,offset=ti.static(Traits.stencil[i]))
-						if(ix+ioffset<0): print(Traits.stencil[i],ioffset,ix,self_ti.walls[ix])
 						nvalues[i] = self_ti.values[ix+ioffset]
 						if ti.static(Traits.has_source): nvalues[i] += nsource[i]
 					for i in ti.static(range(Traits.nstencil_dynamic)):
@@ -657,17 +661,17 @@ class _Algo:
 		tag_count = ti.ndarray(ti.i32,size_o); tag_count.fill(0)
 
 		@ti.kernel
-		def set_seeds(ixs:arr_t,tag:arr_t) -> Traits.int_t:
+		def set_seeds(ixs:arr_t,tag:arr_t,improved:arr_t) -> Traits.int_t:
 			# Note : We could do this in parallel using a prefix sum, similar to tag_neighbors.
 			# But there are very few seeds in most applications, so we skip this optimization for now
 			ixs_end:Traits.int_t = 0
 			ti.loop_config(serialize=True)
 			for i in range(self.seeds.size()):
 				ix_o = self.seeds.elem[i]//Traits.size_i
-				if tag[ix_o]==-1: ixs[ixs_end]=ix_o; ixs_end+=1; tag[ix_o]=0
+				if tag[ix_o]==-1: ixs[ixs_end]=ix_o; improved[ixs_end]=True; ixs_end+=1; tag[ix_o]=0
 			for i in range(self.seeds.size()): tag[self.seeds.elem[i]//Traits.size_i]=-1 # Cleanup
 			return ixs_end
-		ixs_end = set_seeds(ixs,tag)
+		ixs_end = set_seeds(ixs,tag,improved)
 		self.seeds.clear()
 
 		for iter in range(nitermax):
@@ -723,7 +727,6 @@ class _Algo:
 			if not any_ndarray(improved): break
 		else: print(f"Fast Sweeping completed {nitermax=} iterations, without reaching tolerance {tol=}")
 		return iter
-
 
 	def solve_GlobalIteration(self,tol,nitermax=5000):
 		self_ti = self.self_ti
@@ -845,6 +848,8 @@ class Domain:
 		self.self_ti = self.algo.self_ti
 
 		if source_seed is None: return # Implementing source factorization
+		# if np.any(self.Traits.periodic): # Accuracy is a little bit reduced, but it does work...
+		# 	print("Accuracy warning : source_seed should be far from periodic domain boundary")
 		self.metric.set_source_singularity(self,source_seed,**kwargs)
 		r = int(np.floor(source_radius))
 		ndim = self.Traits.ndim
@@ -913,7 +918,7 @@ class Domain:
 		diffs.fill(np.inf)
 		return HFM.GeodesicODE(self.seeds_distL1(),self.values(),self.flows(adim=True),diffs,self.Traits.periodic,self.PointFromIndex)
 	
-	@ti.pyfunc
+	@ti.func
 	def Interpolate(self,arr:arr_t,point):
 		"""
 		Interpolate the given ndarray, at the given point.
@@ -921,6 +926,7 @@ class Domain:
 		""" # ,expanded:tpl_t=False - expanded : set true for two-level expanded arrays, as used in the algorithm
 		if ti.static(not isinstance(arr,(ti.lang.any_array.AnyArray,ti.lang._ndarray.Ndarray))): 
 			return arr # If arr is not an array, just return the value (regard as singleton array)
+		if ti.static(len(arr.shape)==0): return arr[None]
 		ndim = ti.static(self.Traits.ndim)
 		ti.static_assert(point.n==ndim)
 		ti.static_assert(len(arr.shape)==ndim)
