@@ -218,11 +218,15 @@ class Diagonal(LaxFriedrichsScheme):
 
 	@staticmethod
 	@ti.func
-	def norm(v,dcosts2,ret_grad:tpl_t=False):
+	def norm(v,dcosts2,ret_grad:tpl_t=False): # Caution : using dcosts2 (=dcosts**2)
 		if ti.static(not ret_grad): return ti.sqrt(v @ (dcosts2 * v))
 		mv = dcosts2 * v; Nv = ti.sqrt(v @ mv)
 		return Nv, mv/Nv
-		
+	
+	@staticmethod
+	@ti.func
+	def dual(dcosts2): return 1./dcosts2
+
 	def __init__(self,ndim,float_t,scheme='Godunov'):
 		if scheme=='Godunov':
 			self.Traits = Solver.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
@@ -250,22 +254,19 @@ class Diagonal(LaxFriedrichsScheme):
 		self.Traits.source_seed_index = X0
 
 	# ------------------ Godunov scheme -------------------
-	def Godunov_set_defaults(self,sgrid,h,dcosts=1,costs=1):
-		Traits = self.Traits
-		if isinstance(dcosts,ti.lang._ndarray.Ndarray): 
-			@ti.kernel
-			def build_scheme(h:Traits.vec_t,dcosts:arr_t,weights:arr_t):
-				for x in ti.grouped(dcosts): weights[x] = (h*dcosts[x])**-2 
-			weights = ti.ndarray(Traits.vec_t,dcosts.shape)
-			build_scheme(h,dcosts,weights)
-		else: weights = (h*dcosts)**-2
-		return {'weights':(weights,Traits.vec_t),'costs':(costs,Traits.float_t)}
+	def Godunov_set_defaults(self,sgrid,h,dcosts=None,costs=1):
+		Traits = self.Traits; ndim,float_t,vec_t = Traits.ndim,Traits.float_t,Traits.vec_t
+		@ti.kernel
+		def build_scheme(dcosts:arr_t,weights:arr_t,h:vec_t):
+			for x in ti.grouped(dcosts): weights[x] = self.dual((h*dcosts[x])**2)
+		dcosts = toSing(dcosts,vec_t,np.ones(ndim))
+		weights = ti.ndarray(vec_t,dcosts.shape)
+		build_scheme(dcosts,weights,h)
+		return {'weights':(getSing(weights),vec_t),'costs':(costs,float_t)}
 	
 	@ti.pyfunc
 	def Godunov_Preproc(self,data:tpl_t,ind):
-		weights = getData(data,ind,'weights')
-		cost = getData(data,ind,'costs')
-		return weights/cost**2, 
+		return  getData(data,ind,'weights') / getData(data,ind,'costs')**2, # Comma needed !
 
 	@staticmethod
 	@ti.pyfunc
@@ -342,6 +343,9 @@ class Riemann(LaxFriedrichsScheme):
 		if ti.static(not ret_grad): return ti.sqrt(v @ m @ v)
 		mv = m@v; Nv = ti.sqrt(v@mv)
 		return Nv,mv/Nv
+	@staticmethod
+	@ti.pyfunc
+	def dual(m): return ti.math.inverse(m)
 
 	def __init__(self,ndim,float_t,scheme=None): self._init__(self,ndim,float_t,scheme)
 	@staticmethod # Reused in Randrs, AsymQuad
@@ -391,9 +395,6 @@ class Riemann(LaxFriedrichsScheme):
 	def flow(self,grad,D:tpl_t): return self.norm(grad,D,True)[1]
 	@ti.pyfunc # Same structure as primal
 	def dualnorm(self,grad,D:tpl_t): return self.norm(grad,D) 
-		# uflow = D @ grad # Flow, but not normalized. (Could be sufficient for most applications.)
-		# # Note : if the eikonal equation is satisfied, then grad @ uflow == 1
-		# return uflow / ti.sqrt(grad @ uflow) # Normalized flow, cf Euler identity
 
 	@ti.pyfunc
 	def C0c1(self,D):
@@ -408,7 +409,7 @@ class Riemann(LaxFriedrichsScheme):
 		@ti.kernel
 		def set_C0c1(m:arr_t,D:arr_t,C0:arr_t,c1:arr_t,h:Traits.vec_t):
 			for x in ti.grouped(m): 
-				D[x] = ti.math.inverse(ti.Matrix([[m[x][i,j]*h[i]*h[j] for i in range(ndim)] for j in range(ndim)]) )
+				D[x] = self.dual(ti.Matrix([[m[x][i,j]*h[i]*h[j] for i in range(ndim)] for j in range(ndim)]) )
 				C0[x],c1[x] = self.C0c1(D[x])
 		D,C0,c1 = ti.ndarray(Traits.mat_t,m.shape),ti.ndarray(float_t,m.shape),ti.ndarray(float_t,m.shape)
 		set_C0c1(m,D,C0,c1,h)
@@ -422,7 +423,7 @@ class Riemann(LaxFriedrichsScheme):
 		Semi-Lagrangian optimization problem associated with a single sector, unconstrained.
 		min |ξ|_M + <ξ,l> subject to <ξ,1> = 1
 		"""
-		D = ti.math.inverse(M) # Dual metric
+		D = Riemann.dual(M) 
 		Dl = D @ l; lDl = l @ Dl # Note : u = (1,1,...)
 		Du = ti.Vector([ti.Vector([D[i,j] for j in ti.static(range(l.n))]).sum() for i in ti.static(range(l.n))]); 
 		uDu = Du.sum(); uDl = Dl.sum() 
@@ -461,7 +462,7 @@ class Riemann(LaxFriedrichsScheme):
 			if λ<updt and all(ξ>=0): # Test should fail if λ is NaN
 				if ti.static(ret_flow): flow = ξ[0]*fvertices[i]+ξ[1]*fvertices[j]
 				updt=λ
-		if ti.static(ret_flow): return flow/ti.sqrt(flow @ m @ flow) # normalized w.r.t. primal metric
+		if ti.static(ret_flow): return flow/self.norm(flow,m) # normalized w.r.t. primal metric
 		return updt
 	@ti.func
 	def SemiLag2_Flow(self,nvals,λ, m,norm2,scal): return self.SemiLag2_Update(nvals,m,norm2,scal,True)
@@ -506,7 +507,7 @@ class Riemann(LaxFriedrichsScheme):
 			if λ<updt and all(ξ>=0): # Test should fail if λ is NaN
 				if ti.static(ret_flow): flow = ξ[0]*fvertices[i]+ξ[1]*fvertices[j]+ξ[2]*fvertices[k]
 				updt=λ
-		if ti.static(ret_flow): return flow / ti.sqrt(flow @ m @ flow) # normalize w.r.t. primal metric
+		if ti.static(ret_flow): return flow / self.norm(flow,m) # normalize w.r.t. primal metric
 		return updt
 	@ti.func
 	def SemiLag3_Flow(self,nvals,λ, m,norm2,scal): return self.SemiLag3_Update(nvals,m,norm2,scal,True)
