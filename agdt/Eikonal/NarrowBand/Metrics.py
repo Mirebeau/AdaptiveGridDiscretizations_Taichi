@@ -1,15 +1,16 @@
 """
 This file describes a number of geodesic models, and implements methods required to run the 
-narrowband eikonal solver. It may be merged with Metrics after some time.
+narrowband eikonal solver. 
 """
 
 import taichi as ti
 import numpy as np
 import itertools
 from collections import namedtuple
-from .. import Sort,Linalg
-from . import NarrowBand
-from ..GetArrayModule import to_ndarray
+from ... import Sort,Linalg
+from ...sym_eig import eigh,eigvalsh # Custom implementation due to bugs in taichi (v1.7.4)
+from . import Solver
+from ...GetArrayModule import to_ndarray
 
 # Shorthands for ti.func and ti.kernel annotations
 arr_t = ti.types.ndarray() 
@@ -143,9 +144,9 @@ def getSing(arr):
 class DistL1:
 	"""Computation of the pixel-wise L1 distance (for debug purposes)"""
 	def __init__(self,ndim,float_t,stencil_static=True):
-		if stencil_static: self.Traits = NarrowBand.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
+		if stencil_static: self.Traits = Solver.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
 		else: # Use a dynamic stencil (in fact everywhere the same)
-			self.Traits = NarrowBand.TraitsType(tuple(),shape_i_default[ndim],float_t)
+			self.Traits = Solver.TraitsType(tuple(),shape_i_default[ndim],float_t)
 			self.Traits.nstencil_dynamic = 2*ndim
 	def set_defaults(self,sgrid,h): return {'dummy':(1,self.Traits.float_t)}
 	@ti.pyfunc
@@ -214,12 +215,20 @@ class Diagonal(LaxFriedrichsScheme):
 	- Godunov (default): average accuracy, low computational cost. Equivalent to the HFM formulation.
 	- LaxFriedrichs: low accuracy, high numerical cost. Only for debug.
 	""" # - SemiLagrangian: high accuracy, average computational cost.
+
+	@staticmethod
+	@ti.func
+	def norm(v,dcosts2,ret_grad:tpl_t=False):
+		if ti.static(not ret_grad): return ti.sqrt(v @ (dcosts2 * v))
+		mv = dcosts2 * v; Nv = ti.sqrt(v @ mv)
+		return Nv, mv/Nv
+		
 	def __init__(self,ndim,float_t,scheme='Godunov'):
 		if scheme=='Godunov':
-			self.Traits = NarrowBand.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
+			self.Traits = Solver.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
 			self.set_defaults,self.Update,self.Flow,self.Preproc = self.Godunov_set_defaults,self.Godunov_Update,self.Godunov_Flow,self.Godunov_Preproc
 		elif scheme=='LaxFriedrichs':
-			self.Traits = NarrowBand.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
+			self.Traits = Solver.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
 			self.set_defaults,self.Update,self.Flow,self.Preproc = self.Godunov_set_defaults,self.LaxFriedrichs_Update,self.LaxFriedrichs_Flow,self.LaxFriedrichs_Preproc
 		else: raise ValueError(f"Unrecognized {scheme=}")
 
@@ -236,11 +245,7 @@ class Diagonal(LaxFriedrichsScheme):
 
 		@ti.func # X0 and dcost2 are fields to avoid recompilation when changed
 		def source_singularity(x,ret_grad:tpl_t=False):
-			v = x-X0[None]
-			Gv = dcost2[None] * v
-			Nv = ti.sqrt(v @ Gv) 
-			if ti.static(ret_grad): return Nv, Gv/Nv
-			return Nv
+			return self.norm(x-X0[None],dcost2[None],ret_grad)
 		self.Traits.source_singularity = source_singularity
 		self.Traits.source_seed_index = X0
 
@@ -318,33 +323,41 @@ class Diagonal(LaxFriedrichsScheme):
 		C0 = 1./ti.sqrt(weights.min())
 		c1 = 1./ti.sqrt(weights.max())
 		return C0,c1,weights
-	@ti.pyfunc
-	def flow(self,grad,weights:tpl_t): # Turn a gradient into a flow
-		uflow = weights*grad # Flow, but not normalized. (Could be sufficient for most applications.)
-		return uflow / ti.sqrt(grad @ uflow)
-	@ti.pyfunc
-	def dualnorm(self,grad,weights:tpl_t): return ti.sqrt(grad @ (weights*grad))
+	@ti.pyfunc # Dual norm has the same structure as the primal norm
+	def dualnorm(self,grad,weights:tpl_t): return self.norm(grad,weights) 
+	@ti.pyfunc # Turn a gradient into a flow, i.e. evaluate the dual norm gradient 
+	def flow(self,grad,weights:tpl_t): return self.norm(grad,weights,True)[1] # Same struct as primal
 
 # --------------------------------------------------------------------------------------------------
 class Riemann(LaxFriedrichsScheme):
 	"""
 	Available schemes : 
-	- SemiLag (default) : accurate, a bit slow, 2D only
+	- SemiLag : good accuracy accurate, slow especially in 3D and with large stencils
+	- Upwind differences : compromise of accuracy and speed
 	- LaxFriedrichs (not recommended) : poor accuracy, very slow (high diffusivity), any dimension
 	"""
-	def __init__(self,ndim,float_t,scheme=None):
+	@staticmethod
+	@ti.pyfunc
+	def norm(v,m,ret_grad:tpl_t=False):
+		if ti.static(not ret_grad): return ti.sqrt(v @ m @ v)
+		mv = m@v; Nv = ti.sqrt(v@mv)
+		return Nv,mv/Nv
+
+	def __init__(self,ndim,float_t,scheme=None): self._init__(self,ndim,float_t,scheme)
+	@staticmethod # Reused in Randrs, AsymQuad
+	def _init__(self,ndim,float_t,scheme):
 		if scheme == 'SemiLag': scheme = [None,None,SemiLag2_8,SemiLag3_6][ndim]
 		if isinstance(scheme,(SemiLag2_t,SemiLag3_t)):
-			Traits = NarrowBand.TraitsType(scheme.vertices,shape_i_default[ndim],float_t)
+			Traits = Solver.TraitsType(scheme.vertices,shape_i_default[ndim],float_t)
 			Traits.SemiLag = scheme; Traits.fSemiLag = scheme.to_field()
 			self.Traits,self.set_defaults = Traits,self.SemiLag_set_defaults
 			self.Update,self.Flow,self.Preproc = [None,None, (self.SemiLag2_Update,self.SemiLag2_Flow,self.SemiLag2_Preproc), (self.SemiLag3_Update,self.SemiLag3_Flow,self.SemiLag3_Preproc)][ndim]
 		elif scheme=='LaxFriedrichs': 
-			Traits = NarrowBand.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
+			Traits = Solver.TraitsType(axis_aligned_stencil(ndim),shape_i_default[ndim],float_t)
 			self.Traits,self.set_defaults,self.Update,self.Flow,self.Preproc = Traits,self.LaxFriedrichs_set_defaults,self.LaxFriedrichs_Update,self.LaxFriedrichs_Flow,self.LaxFriedrichs_Preproc
 		elif scheme=='UpwindDifferences':
 			LexCube = [None,None,LexCube2,LexCube3][ndim]
-			Traits = NarrowBand.TraitsType(LexCube,shape_i_default[ndim],float_t)
+			Traits = Solver.TraitsType(LexCube,shape_i_default[ndim],float_t)
 			_,Traits.CubeInd = LexCubeInd(LexCube)
 			self.Traits,self.set_defaults,self.Update,self.Flow,self.Preproc = Traits,self.UpwindDifferences_set_defaults,self.UpwindDifferences_Update,self.UpwindDifferences_Flow,self.UpwindDifferences_Preproc
 			Traits.fstencil = to_ndarray(np.array(Traits.stencil),ti.lang.matrix.VectorType(ndim,ti.i8),True)
@@ -356,17 +369,13 @@ class Riemann(LaxFriedrichsScheme):
 		@ti.kernel
 		def source_params(x0:vec_t,m:arr_t,costs:arr_t):
 			X0[None] = dom.IndexFromPoint(x0) + 1 # Account for scale and padding
-			m_ = dom.Interpolate(m,x0) * dom.Interpolate(costs,x0)# Taichi scope only
+			m_ = dom.Interpolate(m,x0) * dom.Interpolate(costs,x0)**2 # Taichi scope only
 			mh[None] = ti.Matrix([[m_[i,j]*dom.h[i]*dom.h[j] for i in range(ndim)] for j in range(ndim)])
 		source_params(x0,toSing(m,mat_t,np.eye(ndim)),toSing(costs,float_t))
 
 		@ti.func # X0 and dcost2 are fields to avoid recompilation when changed
-		def source_singularity(x,ret_grad:tpl_t=False):
-			v = x-X0[None]
-			Gv = mh[None] @ v
-			Nv = ti.sqrt(v @ Gv) 
-			if ti.static(ret_grad): return Nv, Gv/Nv
-			return Nv
+		def source_singularity(x,ret_grad:tpl_t=False): 
+			return self.norm(x-X0[None],mh[None],ret_grad)
 		self.Traits.source_singularity = source_singularity
 		self.Traits.source_seed_index = X0
 
@@ -378,19 +387,20 @@ class Riemann(LaxFriedrichsScheme):
 		C0 = getData(data,ind,'C0') * cost
 		c1 = getData(data,ind,'c1') * cost
 		return C0,c1,D
-	@ti.pyfunc
-	def flow(self,grad,D:tpl_t): # Turn a gradient into a flow
-		uflow = D @ grad # Flow, but not normalized. (Could be sufficient for most applications.)
-		return uflow / ti.sqrt(grad @ uflow) # Normalized flow, cf Euler identity
-	@ti.pyfunc
-	def dualnorm(self,grad,D:tpl_t): return ti.sqrt(grad @ D @ grad)
+	@ti.pyfunc # Turn a gradient into a flow, i.e differentiate the dual norm
+	def flow(self,grad,D:tpl_t): return self.norm(grad,D,True)[1]
+	@ti.pyfunc # Same structure as primal
+	def dualnorm(self,grad,D:tpl_t): return self.norm(grad,D) 
+		# uflow = D @ grad # Flow, but not normalized. (Could be sufficient for most applications.)
+		# # Note : if the eikonal equation is satisfied, then grad @ uflow == 1
+		# return uflow / ti.sqrt(grad @ uflow) # Normalized flow, cf Euler identity
+
 	@ti.pyfunc
 	def C0c1(self,D):
 		ndim = ti.static(self.Traits.ndim)
-		# Taichi 1.7.4 issue. There is no way to skip computing eigenvectors. Also, they are NaN for [[2,0],[0,1]]
-		λ,_ = ti.sym_eig(D) 
-		assert λ[ndim-1]>=λ[0] # Eigenvalues seem to be sorted from largest to smallest...
-		return 1/ti.sqrt(λ[ndim-1]),1/ti.sqrt(λ[0]) # Precompute, since it is expensive	
+		# Taichi 1.7.4 issue. There is no way to skip computing eigenvectors. Also, they are NaN for [[2,0],[0,1]]. Also eigvals are not sorted...
+		λ = eigvalsh(D) # Custom routine to solve eigvals, sorted increasingly
+		return 1./ti.sqrt(λ[0]),1./ti.sqrt(λ[ndim-1]) # Precompute, since it is expensive	
 	
 	def LaxFriedrichs_set_defaults(self,sgrid,h,m=None,costs=1):
 		Traits = self.Traits; ndim = Traits.ndim; float_t = Traits.float_t
@@ -440,9 +450,9 @@ class Riemann(LaxFriedrichsScheme):
 		flow = self.Traits.vec_t(np.nan)
 		for i in range(nstencil): # Not a static loop, to reduce compile time
 			# Graph-like update from neighbor
-			λ = nvals[i]+ti.sqrt(norm2[i]) 
-			if ti.static(ret_flow) and λ<updt: flow = fvertices[i]
-			updt = min(updt, λ) 
+			if (λ := nvals[i]+ti.sqrt(norm2[i])) < updt:
+				if ti.static(ret_flow): flow = fvertices[i]
+				updt = λ 
 			# Update from stencil
 			j = (i+1)%nstencil
 			M = self.Traits.mat_t([[norm2[i],scal[i]],[scal[i],norm2[j]]]) # The metric in the offsets basis
@@ -476,7 +486,9 @@ class Riemann(LaxFriedrichsScheme):
 		updt = self.Traits.float_t(np.inf)
 		for i in range(norm2.n): # Update from the offsets
 			λ = ti.sqrt(norm2[i]) + nvals[i]
-			updt = min(λ,updt)
+			if λ<updt:
+				if ti.static(ret_flow): flow = fvertices[i]
+				updt = λ
 		for e in range(scal.n): # Update from the edges
 			i,j = fedges[e]
 			M = ti.Matrix([[norm2[i],scal[e]],[scal[e],norm2[j]]])
@@ -519,7 +531,7 @@ class Riemann(LaxFriedrichsScheme):
 			for x in ti.grouped(m):
 				mh = Traits.mat_t([[m[x][i,j]*h[i]*h[j] for i in ti.static(range(ndim))] 
 					   for j in ti.static(range(ndim))]) # Take gridscale into account
-				λ,e = Linalg.sym_eig(mh) # ti.sym_eig is buggy in 2D (version 1.7.4)
+				λ,e = eigh(mh) # ti.sym_eig is buggy in 2D and 3D (version 1.7.4)
 				m_isqrt[x] = Linalg.mat_dot_diag(e.transpose(),1./ti.sqrt(λ)) @ e # power -1/2
 		m = toSing(m,Traits.mat_t,np.eye(ndim))
 		m_isqrt = ti.ndarray(Traits.mat_t,m.shape)
@@ -576,13 +588,4 @@ class Riemann(LaxFriedrichsScheme):
 	def UpwindDifferences_Flow(self,nvals,λ, m,norm,μ,e): # Note : we could avoid recomputing λ
 		return self.UpwindDifferences_Update(nvals, m,norm,μ,e, True)
 
-class Randers:
-	def __init__(self,ndim,float_t,scheme):
-		pass
-	# TODO : Semilag, at least in two dimensions, try not to repeat too much ? 
-
-class AsymQuad:
-	def __init__(self,ndim,float_t,scheme):
-		pass
-	# TODO : SemiLag, cf Randers
 

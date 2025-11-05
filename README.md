@@ -55,6 +55,10 @@ def f(n):
   In particular, in a class method, the ti.field can be accessed as self.myfield, whereas the ti.ndarray must be 
   passed as an argument. (SILLY. v 1.7.4)
 - (Recompilation) Changing a ti.field passed to a kernel leads to recompilation, but not a ti.ndarray.
+- (Shape parameters)
+  The shape of a field is fixed at compile, whereas the shape of an ndarray is only known at runtime.
+  (BUG ?? v1.7.4) The element shape parameters 'n' and 'm' are accessible in kernels for fields, but not ndarrays
+
 
 ### Known issues with Taichi
 - More predictable type casting
@@ -68,7 +72,7 @@ def f(n):
 - argpack 
   - Two different argpack, passed to a kernel, may not have elements with identical names.
   - The names used in the argpack are forbidden in the function code
-  - In the case of nested argpacks, containing ndarrays, Taichi can mess up references (1.7.4)
+  - (BUG v1.7.4) In the case of nested argpacks, containing ndarrays, Taichi can mess up references (1.7.4)
 
 - static
  - cannot use it to declare types, e.g. vec_t = ti.static(self.vec_t)

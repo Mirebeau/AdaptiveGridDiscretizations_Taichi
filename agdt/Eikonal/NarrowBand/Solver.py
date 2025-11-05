@@ -3,10 +3,10 @@ import taichi as ti
 import numpy as np
 import copy
 import itertools
-from ..GetArrayModule import convert_dtype,reshape_ndarray,ti_debug,make_argpack
-from .. import GetArrayModule,Linalg
-from . import CappedQueue
-from . import HFM
+from ...GetArrayModule import convert_dtype,reshape_ndarray,ti_debug,make_argpack
+from ... import GetArrayModule,Linalg
+from .. import CappedQueue
+from ..Backtracking import GeodesicODE
 
 # Design principles.
 # - One pixel of padding/periodization in each dimension
@@ -641,14 +641,14 @@ class _Algo:
 		for _ixs in range(ixs_end): improved[_ixs]=False; tag_count[_ixs] = 0 # Cleanup
 		return ixs_end_new
 
-	def solve_AGSI(self,tol,nitermax=2000):
+	def solve_AGSI(self,tol:float,nitermax=2000):
 		"""
-		Variant of Adaptive Gauss-Siedel iteration, applied at the block level, in parallel.
-		Input : 
-		- tol : tolerance parameter for the eikonal fixed point
-		- nitermax : bound on the number of outer iterations
-		Output : 
-		- niter : number of outer iterations
+		Variant of Adaptive Gauss-Siedel iteration, applied at the block level, in parallel.\n
+		Parameters 
+			tol: tolerance parameter for the eikonal fixed point
+			nitermax: bound on the number of outer iterations\n
+		Returns
+			niter: number of outer iterations
 		"""
 		self_ti = self.self_ti; size_o = self.size_o; Traits = self.Traits
 		self_ti.tol = tol # Set tolerance parameter
@@ -712,8 +712,7 @@ class _Algo:
 		self_ti.tol = tol # Set tolerance parameter
 		self.seeds.clear()
 		ixs_o = _Algo.enumerate_sweeps(tuple(self.shape_o)) 
-
-		improved = ti.ndarray(ti.i8,self.size_o); 
+		improved = ti.ndarray(ti.i8,ixs_o.shape); 
 		for iter in range(nitermax):
 			improved.fill(False)
 			for k in range(Traits.ndim): # Loop over axes directions
@@ -741,6 +740,12 @@ class _Algo:
 			#self_ti.values,self_ti.new_values = self_ti.new_values,self_ti.values # Swap fails ??
 		else: print(f'Global iteration completed {nitermax=} iterations, without reaching tolerance {tol=}')
 		return iter
+
+	def solve(self,method,tol,**kwargs): 
+		if method=='AGSI': return self.solve_AGSI(tol,**kwargs)
+		elif method=='FastSweeping': return self.solve_FastSweeping(tol,**kwargs)
+		elif method=='GlobalIteration': return self.solve_GlobalIteration(tol,**kwargs)
+		else: raise ValueError(f"Unrecognized fixed point solver {method=}")
 
 	def flows(self):
 		"""
@@ -827,7 +832,7 @@ class Domain:
 	# -------- Eikonal solver calls --------
 
 	@ti.pyfunc
-	def set_seed(self,self_ti:ti.template(),point,value=0):
+	def set_seed(self,self_ti:ti.template(),point,value=0.):
 		index = self.IndexFromPoint(point)
 		x = Linalg.cast_vec(ti.round(index),self.Traits.ivec_t)
 		ix = self.algo.x2ix(1+x) # Add 1 for b.c.
@@ -914,7 +919,7 @@ class Domain:
 	def ode(self):
 		diffs = ti.ndarray(self.Traits.float_t, tuple())
 		diffs.fill(np.inf)
-		return HFM.GeodesicODE(self.seeds_distL1(),self.values(),self.flows(adim=True),diffs,self.Traits.periodic,self.PointFromIndex)
+		return GeodesicODE(self.seeds_distL1(),self.values(),self.flows(adim=True),diffs,self.Traits.periodic,self.PointFromIndex)
 	
 	@ti.func
 	def Interpolate(self,arr:arr_t,point):

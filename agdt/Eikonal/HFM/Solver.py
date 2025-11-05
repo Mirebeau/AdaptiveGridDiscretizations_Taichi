@@ -8,10 +8,12 @@ benefit from parallel hardware or GPU acceleration.
 import taichi as ti
 import numpy as np
 from dataclasses import dataclass
-from . import Queue,CappedQueue
-from .. import Sort 
-from ..GetArrayModule import convert_dtype,reshape_ndarray,getitem_broadcast,ti_debug
-from .. import Linalg
+import warnings
+from .. import Queue,CappedQueue
+from ..Backtracking import GeodesicODE 
+from ... import Sort
+from ...GetArrayModule import convert_dtype,reshape_ndarray,getitem_broadcast,ti_debug
+from ... import Linalg
 
 # Shorthands for ti.func and ti.kernel annotations
 arr_t = ti.types.ndarray() 
@@ -100,7 +102,8 @@ class _Algo:
 		assert Traits.ntotx <= 8*convert_dtype['np'][self.Traits.voffset_t]().nbytes
 
 		self.seeds = CappedQueue.lifo(self.Traits.int_t,capacity=seeds_capacity)
-		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
+		# Field compiling used to generate a warning message at each kernel compilation 
+		self.compiling = ti.field(ti.i8,4) # Length 4 required for alignment on the GPU
 
 		# Compute the index conversion modulus for the weights and offsets
 		shape = self.shape; ndim = self.ndim
@@ -132,10 +135,10 @@ class _Algo:
 
 		# --- Convert the offsets vectors into integers ---
 		@ti.kernel
-		def set_ioffsets(weights:arr_t,offsets:arr_t, # IN
+		def set_ioffsets(offsets:arr_t, # IN
 				   ioffsets:arr_t,ioffsets_factored:arr_t): #OUT 
-			if ti.static(ti_debug()): compiling[None]=0 # set_ioffsets
-			for xe in ti.grouped(weights):
+			if ti.static(ti_debug()): self.compiling[0]=0 # set_ioffsets
+			for xe in ti.grouped(offsets):
 				ioffset:self.ioffset_t = offsets[xe][0]
 				for i in ti.static(range(1,ndim)):
 					ioffset = self.shape[i]*ioffset + offsets[xe][i]
@@ -150,14 +153,14 @@ class _Algo:
 		
 		ioffsets = ti.ndarray(self.ioffset_t,weights.shape) # i32 needed for 3D
 		ioffsets_factored = ti.ndarray(self.ioffset_t,weights.shape) if self.factored else ioffsets
-		set_ioffsets(weights,offsets,ioffsets,ioffsets_factored)
+		set_ioffsets(offsets,ioffsets,ioffsets_factored)
 
 		# --- Compute the masks for valid offsets, corresponding to visible pair points ---
 		nmix,nrev,nfwd,nactx,ntotx = Traits.nmix,Traits.nrev,Traits.nfwd,Traits.nactx,Traits.ntotx
 		@ti.kernel # TODO : accelerate by precomputing the distance to the walls ? 
 		def set_voffsets(offsets:arr_t,walls:arr_t, # IN
 				   voffsets:arr_t): # OUT
-			if ti.static(ti_debug()): compiling[None]=0 # set_voffsets
+			if ti.static(ti_debug()): self.compiling[0]=0 # set_voffsets
 			for x in ti.grouped(voffsets):
 				bx=x # Broadcasted x, used for the offsets which may be factored
 				for i in ti.static(range(factored_start)): bx[i]=0
@@ -165,7 +168,7 @@ class _Algo:
 				bact = 0
 				btot = 0
 				voffset = 0
-				for mix in range(nmix): # Nothing unrolled
+				for mix in range(nmix): # Nothing unrolled : short compile times
 					if ti.static(nrev>0): # Usually, either nrev==0 or nfwd==0
 						for e in range(nrev):
 							for s in range(2): 
@@ -209,7 +212,7 @@ class _Algo:
 		@ti.kernel
 		def set_roffsets(ioffsets:arr_t,ioffsets_factored:arr_t, # IN
 				   roffsets:arr_t,boffsets:arr_t): # OUT
-			if ti.static(ti_debug()): compiling[None]=0 # set_roffsets
+			if ti.static(ti_debug()): self.compiling[0]=0 # set_roffsets
 			for _ in range(1): # Sequential code
 				for x in range(self.factored_size):
 					bact = 0
@@ -526,6 +529,8 @@ class _Algo:
 		SEQUENTIAL solver, similar to Dijkstra's algorithm
 		- stopping_criterion : called each time a point is frozen. Return a positive integer for stopping.
 		"""
+		if ti.lang.impl.default_cfg().arch != ti.cpu: 
+			warnings.warn("FMM efficiency warning : sequential algorithm, should be run on the CPU.") 
 		seeds = self.seeds
 		# Hard to predict the max number of items in pq, so using variable capacity
 		pq = Queue.priority_queue.init(self.float_t,self.Traits.int_t,capacity=
@@ -533,14 +538,13 @@ class _Algo:
 		frozen = ti.ndarray(dtype=ti.i8,shape=self.size)
 		frozen.from_numpy(self.walls.to_numpy()>0) # Non mutable points are already frozen
 		stop = ti.field(dtype=ti.i32,shape=()); stop.fill(0) # True if stopping criterion is active
-		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
 
 		pack_t = ti.types.argpack(algo=self.self_ti_t, pq=pq.argtype, frozen=arr_t)
 		pack = pack_t(self.self_ti,pq,frozen)
 
 		@ti.kernel # Set the seeds
 		def set_seeds(pack:pack_t):
-			if ti.static(ti_debug()): compiling[None]=0 # set_roffsets
+			if ti.static(ti_debug()): self.compiling[0]=0 # set_roffsets
 			#values = ti.static(pack.algo.values) # Fails. Rename needed (vals, _values, ...) ???
 			for _ in range(1):
 				while not seeds.empty():
@@ -557,7 +561,7 @@ class _Algo:
 
 		@ti.kernel
 		def FMM(pack:pack_t): # Early stop if queue capacity is exceeded
-			if ti.static(ti_debug()): compiling[None]=0 # set_roffsets
+			if ti.static(ti_debug()): self.compiling[0]=0 # set_roffsets
 			for _ in range(1):
 				maxsize = pq.capacity(pack.pq)-self.roffsets_max
 				while not pq.empty(pack.pq) and pq.size(pack.pq)<maxsize:
@@ -581,6 +585,8 @@ class _Algo:
 		Solve the eikonal equation using the Adaptive Gauss Siedel Iteration (AGSI)
 		SEQUENTIAL solver, using a fifo queue
 		"""
+		if ti.lang.impl.default_cfg().arch != ti.cpu: 
+			warnings.warn("AGSI efficiency warning : sequential algorithm, should be run on the CPU.") 
 		if nitermax is None: nitermax=5*max(self.shape)*self.size
 		seeds = self.seeds
 		# We now that each index can appear at most once in fifo
@@ -590,7 +596,6 @@ class _Algo:
 
 		pack_t = ti.types.argpack(algo=self.self_ti_t, fifo=fifo.argtype, infifo=arr_t)
 		pack = pack_t(self.self_ti, fifo, infifo)
-		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
 
 		@ti.func
 		def push_neighbors(ix,iy,pack:tpl_t):
@@ -598,7 +603,7 @@ class _Algo:
 
 		@ti.kernel # The AGSI requires inserting the neighbors of all seeds
 		def set_seeds(pack:pack_t): 
-			if ti.static(ti_debug()): compiling[None]=0 # set_seeds
+			if ti.static(ti_debug()): self.compiling[0]=0 # set_seeds
 			for _ in range(1):
 				while not seeds.empty(): 
 					seed = seeds.top(); seeds.pop()
@@ -608,7 +613,7 @@ class _Algo:
 		niter = ti.field(dtype=ti.i64,shape=()); niter.fill(0)
 		@ti.kernel
 		def AGSI(pack:pack_t,nitermax:ti.i64):
-			if ti.static(ti_debug()): compiling[None]=0 # AGSI
+			if ti.static(ti_debug()): self.compiling[0]=0 # AGSI
 			for _ in range(1):
 				while not fifo.empty(pack.fifo) and niter[None]<nitermax:
 					ix = fifo.front(pack.fifo)
@@ -636,12 +641,11 @@ class _Algo:
 
 		pack_t = ti.types.argpack(algo=self.self_ti_t, cache=arr_t)
 		pack = pack_t(self.self_ti,cache)
-		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
 
 		@ti.kernel
 		def SweepingUpdate(pack:pack_t, i:ti.template(), n_i:self.Traits.int_t, 
 					 shape_i:self.Traits.ivec_t, tol:self.float_t):
-			if ti.static(ti_debug()): compiling[None]=0 # SweepingUpdate
+			if ti.static(ti_debug()): self.compiling[0]=0 # SweepingUpdate
 			for x in ti.grouped(ti.ndrange(*shape_i)): # Get all indices associated with slice n_i along axis i
 				x[i] = n_i
 				ix = self.x2ix(x)
@@ -673,15 +677,14 @@ class _Algo:
 		"""
 		if nitermax is None: nitermax=5*max(self.shape)
 		cache = ti.ndarray(self.float_t,self.size)
-		updated = ti.field(dtype=ti.i8,shape=())
+		updated = ti.field(dtype=ti.i32,shape=()) # Caution : i8 causes alignment issues on GPU
 
 		pack_t = ti.types.argpack(algo=self.self_ti_t, cache=arr_t)
 		pack = pack_t(self.self_ti, cache)
-		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
 
 		@ti.kernel
 		def GlobalUpdate(pack:pack_t, tol:self.float_t):
-			if ti.static(ti_debug()): compiling[None]=0 # GlobalUpdate
+			if ti.static(ti_debug()): self.compiling[0]=0 # GlobalUpdate
 			updated[None] = False
 			for ix in range(self.size): 
 				if pack.algo.walls[ix]<=0: # Compute update at each mutable points
@@ -693,8 +696,13 @@ class _Algo:
 			if not updated[None]: break
 		else: print(f'Global iteration completed {nitermax=} iterations, without reaching tolerance {tol=}')
 		return niter # Multiply by size to get number of elementary updates
-
-
+	
+	def solve(self,method,tol=None,**kwargs): 
+		if method=='FMM': return self.solve_FMM(**kwargs)
+		elif method=='AGSI': return self.solve_AGSI(tol,**kwargs)
+		elif method=='FastSweeping': return self.solve_FastSweeping(tol,**kwargs)
+		elif method=='GlobalIteration': return self.solve_GlobalIteration(tol,**kwargs)
+		else: raise ValueError(f"Unrecognized fixed point solver {method=}")
 
 # -------------------------------------- Domain ------------------------------------------
 
@@ -717,6 +725,7 @@ class Domain:
 		self._origin[None] = Traits.vec_t([b[0]+h/2 for b,h in zip(bounds,self.h)]) # ! Takes periodicity into account
 		if (per_ax:=self.periodic_axis) is not None: self._origin[None][per_ax] -= self.h[per_ax]/2
 
+		self.compiling = ti.field(ti.i8,4) # Generates a warning message at each recompilation
 
 
 	def sgrid(self):
@@ -739,18 +748,19 @@ class Domain:
 		# Broadcast the data appropriately
 		data,data_t = self.metric.set_defaults(self.sgrid(),**kwargs)
 		datashapes = [getattr(val, 'shape', (1,)*Traits.ndim) for key,val in data.items]
+		#print(datashapes,data,data.dcosts.shape)
 		for shape in datashapes: # Check broadcasting validity
 			for s,sref in zip(shape,self.shape): assert s in (1,sref) 
 		bshape = tuple(np.max(datashapes,axis=0))
-		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
 
 		if costs is None: costs = ti.ndarray(Traits.float_t,self.shape); costs.fill(1)
 		if walls is None: walls = ti.ndarray(Traits.wall_t,self.shape); walls.fill(0)
 
+
 		# Generate the weights and offsets
 		@ti.kernel
 		def decomp(ih:Traits.vec_t,weights:arr_t,offsets:arr_t,data:data_t):
-			if ti.static(ti_debug()): compiling[None]=0 # decomp
+			if ti.static(ti_debug()): self.compiling[0]=0 # decomp
 			for x in ti.grouped(ti.ndrange(*weights.shape[:-1])):
 				self.metric.hfm_scheme(x,ih,weights,offsets,data)
 		weights = ti.ndarray(Traits.float_t,shape=bshape+(Traits.nactx,))
@@ -789,7 +799,7 @@ class Domain:
 			@ti.kernel
 			def coef_pad(costs:arr_t,walls:arr_t, # IN
 				costs_pad:arr_t, walls_pad:arr_t): # OUT 
-				if ti.static(ti_debug()): compiling[None]=0 # coef_pad
+				if ti.static(ti_debug()): self.compiling[0]=0 # coef_pad
 				for x in ti.grouped(costs_pad):
 					y = x; y[per_ax]-=per_pad
 					if 0 <= y[per_ax] < self.shape[per_ax]: costs_pad[x] = costs[y]
@@ -814,7 +824,7 @@ class Domain:
 		self.self_ti = self.algo.self_ti
 
 	@property
-	def Traits(self): return self.metric.HFMTraits
+	def Traits(self): return self.metric.Traits
 	@property
 	def periodic_axis(self): return self.Traits.periodic_axis
 	@property
@@ -936,11 +946,10 @@ class Domain:
 			(slice(None),)*self.periodic_axis+(slice(self.periodic_pad,-self.periodic_pad),)]
 		distL1=ti.ndarray(ti.i8,self.shape)
 		distL1.from_numpy((maxL1+1)*(walls!=wall_code['seed']))
-		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
 
 		@ti.kernel # TODO : propagation should be blocked by walls
 		def GlobalIterL1(distL1:arr_t,shape:self.Traits.ivec_t):
-			if ti.static(ti_debug()): compiling[None]=0 # GlobalIterL1
+			if ti.static(ti_debug()): self.compiling[0]=0 # GlobalIterL1
 			for x in ti.grouped(distL1):
 				for i in ti.static(range(self.Traits.ndim)):
 					y = x; y[i]+=1; 
@@ -961,222 +970,3 @@ class Domain:
 
 
 
-
-geodesic_code = {
-	'AtSeed' :            1, # Correct termination
-
-	'Continue':           0, # Error : Unfinished work, consider increasing maxlen
-	'InWall' :            2, # Error : Went out of domain
-	'StationnaryValue' :  3, # Error : Stall in ODE process, eikonal solution values do not decrease
-	'StationnaryPosition':4, # Error : Stall in ODE process, positions do not change
-	'PastSeed' :          5, # Error : Moving away from target
-	'VanishingFlow' :     6, # Error : Vanishing flow
-	'OutOfDomain' :       7, # Error : Backtracking left the domain
-}
-geodesic_rcode = dict(zip(geodesic_code.values(),geodesic_code.keys()))
-
-
-@ti.data_oriented
-class GeodesicODE:
-	"""
-	Geodesic backtracking algorithm
-	- seeds : some *measure of distance* to the closest seed, provided it is close enough
-	   e.g. the l1 distance up to 7 pixels (used for termination criterion) 
-	- values : eikonal solution values
-	- flows : the geodesic flow, adimensionized (assuming identical gridscales)
-	- diffs : the average value of the finite differences used to construct the flow
-	- periodic : axes along which to apply periodic boundary conditions
-	"""
-	# Note : computing the full gradient field is unnecessary and computationally and memory expensive
-
-	def __init__(self,seeds,values,flows,diffs,periodic,PointFromIndex):
-		self.seeds = seeds
-		self.values = values
-		self.flows = flows
-		self.diffs = diffs
-		self.PointFromIndex = PointFromIndex
-
-		self._shape = ti.field(ti.lang.matrix.VectorType(self.ndim,ti.i32), shape=tuple()) 
-		self._shape[None] = flows.shape
-		assert seeds.shape==values.shape==self.shape
-		assert len(self.shape) == self.ndim
-
-		self.periodic = periodic
-		self._params = ti.field(self.float_t,3)
-		self._params.from_numpy(np.array((
-			0.25, # geodesicStep : how much to advance at each step
-			0.5/2**self.ndim, # weightThreshold : used in interpolation pruning
-			4, # causalityTolerance : likewise
-		),dtype=self.np_float_t))
-		self.seeds_top = np.iinfo(convert_dtype['np'][seeds.dtype]).max #1000 # Some arbitrary upper bound for the seeds field #np.iinfo(convert_dtype['np'][seeds.dtype]).max 
-	
-	# Runtime parameters
-	@property
-	@ti.pyfunc
-	def shape(self): return self._shape[None]
-	@property
-	@ti.pyfunc
-	def geodesicStep(self): return self._params[0]
-	@property
-	@ti.pyfunc
-	def weightThreshold(self): return self._params[1]
-	@property
-	@ti.pyfunc
-	def causalityTolerance(self): return self._params[2]
-
-	# Compilation time constants
-	@property
-	def ndim(self): return self.flows.n
-	@property
-	def float_t(self): return self.flows.dtype
-	@property
-	def np_float_t(self): return convert_dtype['np'][self.float_t]
-	@property
-	def vec_t(self): return ti.lang.matrix.VectorType(self.ndim,self.float_t)
-	@property
-	def ivec_t(self): return ti.lang.matrix.VectorType(self.ndim,ti.i32)
-	@property
-	def hasdiffs(self): return len(self.diffs.shape)>0 # Pointwise diffs are optional
-
-	@ti.pyfunc
-	def crop_periodize(self,x):
-		for i in ti.static(range(self.ndim)):
-			s = self.shape[i]
-			if self.periodic[i]: 
-				x[i] = x[i] % s
-				if x[i]<0: x[i]+=s # Periodize, ensuring result les in 0..s-1
-			else: x[i] = max(0,min(x[i],s-1)) # Crop to 0..s-1
-		return x
-	
-	@ti.pyfunc
-	def indomain(self,x,tol=0.5):
-		res = True
-		for i in ti.static(range(self.ndim)): 
-			s = self.shape[i]
-			if ti.static(not self.periodic[i]): res = res and (-tol<=x[i]<=s-1+tol)
-		return res
-
-	@ti.func
-	def flow(self, self_ti:tpl_t, x):
-		"""
-		Computes the interpolated flow at x. (Not genuine interpolation : we do pruning, etc)
-		"""
-		x0 = ti.cast(ti.math.floor(x),ti.i32) # ti.cast is only taichi scope
-		#x0 = self.ivec_t(0)
-		e0 = x-x0
-		min_seed = self.seeds_top # Minimum L1 distance to a seed (initialized with some arbitrary large value)
-		min_val  = np.inf # minimum value among interpolated points
-		minx = self.ivec_t(0) # Point where the minimum value is attained
-		for e in ti.grouped(ti.ndrange(*(2,)*self.ndim)):
-			xe = self.crop_periodize(x0+e)
-			w = Linalg.product(1-ti.abs(e-e0)) # Interpolation weight
-			if w >= self.weightThreshold: # minimum seed,val, based on points with substantial weight
-				min_seed = min(min_seed, self_ti.seeds[xe]) # Taichi 1.7.4 compiler bug : min of ti.i8 vars unsupported
-				if (val:=self_ti.values[*xe]) < min_val:
-					min_val = val
-					minx = xe
-
-		#diff = self_ti.diffs[None]
-		diff:self.float_t=0.
-		if ti.static(self.hasdiffs): diff=self_ti.diffs[minx]
-		else: diff = self_ti.diffs[None]
-		thres_val = min_val + diff * self.causalityTolerance
-		wsum = 0.; val = 0. # wsum = self.float_t(0); val = self.float_t(0) # Error ??
-		flow = self.vec_t(0)
-
-		for e in ti.grouped(ti.ndrange(*(2,)*self.ndim)):
-			xe = self.crop_periodize(x0+e)
-			if self_ti.values[xe]<thres_val: # Disregard too large values
-				w = Linalg.product(1-ti.abs(e-e0)) # Interpolation weight
-				wsum += w
-				val  += w*self_ti.values[xe]
-				flow += w*self_ti.flows[xe]
-		
-		val /= wsum; flow /= wsum # Due to pruning, weights may not sum to one
-		return flow,val,minx,min_seed
-	
-	def backtrack(self,tips,delay_values=60,delay_minx=30,delay_seeds=6,max_len=2000):
-		"""Backtrack geodesics from the given tips.
-		- delay_values : delay before stopping if values increase (StationnaryValues criterion)
-		- delay_minx : delay before stopping if values increase (StationnaryPosition criterion)
-		- delay_seeds : delay before stopping if seed distance increases (PastSeed criterion)
-		- max_len : max length of geodesic 
-		"""
-		tips = np.asarray(tips)
-		assert len(tips.shape)==2
-		assert tips.shape[1]==self.ndim
-		ntips = tips.shape[0]
-		recent_values = ti.ndarray(self.float_t,shape=(ntips,delay_values)); recent_values.fill(np.nan)
-		recent_minx   = ti.ndarray(self.ivec_t,shape=(ntips,delay_minx)); recent_minx.fill(-1)
-		recent_seeds  = ti.ndarray(self.seeds.dtype,shape=(ntips,delay_seeds)); recent_seeds.fill(127)
-
-		geo_code = ti.ndarray(ti.i32,ntips)
-		geo_size = ti.ndarray(ti.i32,ntips)
-		compiling = ti.field(ti.i8,tuple()) # Generates a warning message at each kernel compilation
-		pack_t = ti.types.argpack(seeds=arr_t, values=arr_t, flows=arr_t, diffs=arr_t,
-							recent_values=arr_t, recent_minx=arr_t, recent_seeds=arr_t,
-							geo_size=arr_t, geo_code=arr_t, ntips=ti.i32)
-		pack = pack_t(self.seeds, self.values, self.flows, self.diffs, 
-				recent_values, recent_minx, recent_seeds, geo_size, geo_code, ntips)
-
-		@ti.kernel # Using ndarray, instead of field, to avoid recompilation in case of multiple calls
-		def ode(pack:pack_t, geo:ti.types.ndarray(self.vec_t,2), geo_old:ti.types.ndarray(self.vec_t,2)):
-			if ti.static(ti_debug()): compiling[None]=0 # ode
-			geo_begin = geo_old.shape[1]
-			geo_end  =  geo.shape[1]
-			dt = self.geodesicStep
-			for igeo in range(pack.ntips): # Runs in parallel the backtracking for all geodesics
-				for k in range(geo_begin): geo[igeo,k] = geo_old[igeo,k] # Copy previous data
-				code = pack.geo_code[igeo] # Exit code
-				for k in range(geo_begin,geo_end):
-					if code!=0: break
-					# Second order Euler scheme
-					x = geo[igeo,k-1]
-					v0,_,_,_ = self.flow(pack,x)
-					if (norm_sqr:=v0.norm_sqr()) > 0: v0 /= ti.math.sqrt(norm_sqr)
-					else: code = geodesic_code['VanishingFlow']
-					x1 = x + v0 * dt/2 # Approximate midpoint 
-
-					v1,val1,minx1,seed1 = self.flow(pack, x1) 
-					if (norm_sqr:=v1.norm_sqr()) > 0: v1 /= ti.math.sqrt(norm_sqr)
-					else: code = geodesic_code['VanishingFlow']
-					x2 = x + v1 * dt # Second order accurate step
-					
-					# Store data
-					pack.geo_size[igeo]=k+1
-					geo[igeo,k] = x2
-					pack.recent_values[igeo,k%delay_values] = val1
-					pack.recent_minx[igeo,  k%delay_minx] = minx1
-					pack.recent_seeds[igeo, k%delay_seeds] = seed1
-
-					# Check stopping criteria
-					if seed1==0: code = geodesic_code['AtSeed']
-					elif not self.indomain(x2): code = geodesic_code['OutOfDomain']
-					elif val1==np.inf: code = geodesic_code['InWall']
-					elif pack.recent_values[igeo,  (k+1)%delay_values]<val1:  code = geodesic_code['StationnaryValue']
-					elif all(pack.recent_minx[igeo,(k+1)%delay_minx]==minx1): code = geodesic_code['StationnaryPosition']
-					elif pack.recent_seeds[igeo,   (k+1)%delay_seeds]<seed1:  code = geodesic_code['PastSeed']
-				pack.geo_code[igeo]=code
-
-		@ti.kernel
-		def PointFromIndex_ker(geo:ti.types.ndarray(self.vec_t,2),to:ti.template()):
-			if ti.static(ti_debug()): compiling[None]=0 # PointFromIndex_ker
-			for x in ti.grouped(geo): geo[x] = self.PointFromIndex(geo[x],to)
-
-		geo = ti.ndarray(self.vec_t, shape = (ntips,256))
-		geo_old = ti.ndarray(self.vec_t, shape = (ntips,1))
-		geo_old.from_numpy(tips[:,None,:].astype(self.np_float_t))
-		PointFromIndex_ker(geo_old,True)
-
-		ode(pack, geo, geo_old)
-		while any(geo_code.to_numpy()==0) and geo.shape[1]<max_len:
-			geo_old = geo
-			geo = ti.ndarray(self.vec_t, shape=(ntips,min(2*geo_old.shape[1],max_len)))
-			ode(pack, geo, geo_old)
-
-		PointFromIndex_ker(geo,False)
-		geo_np = geo.to_numpy()
-		geodesics = [geo_np[i,:geo_size[i]] for i in range(ntips)]
-		geodesic_rcodes = [geodesic_rcode[c] for c in geo_code.to_numpy()]
-
-		return geodesics,geodesic_rcodes

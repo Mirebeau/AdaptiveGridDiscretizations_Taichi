@@ -1,8 +1,8 @@
 import taichi as ti
 import numpy as np
-from . import NarrowBand
-from .NarrowBandMetrics import shape_i_default,getData,toSing,getSing,LexCubeDecomp,Diagonal
-from .Metrics import _default_trigo,self_outer_relax
+from . import Solver
+from .Metrics import shape_i_default,getData,toSing,getSing,LexCubeDecomp,Diagonal
+from ..HFM.Metrics import _default_trigo,self_outer_relax
 
 # Shorthands for ti.func and ti.kernel annotations
 arr_t = ti.types.ndarray() 
@@ -18,7 +18,7 @@ class ReedsShepp2:
 	"""
 	def __init__(self,float_t,rev=True): #,scheme="UpwindDifferences"):
 		# assert scheme=="UpwindDifferences" # Only this scheme supported for now
-		Traits = NarrowBand.TraitsType(((0,0,-1),(0,0,1)), shape_i_default[3],float_t)
+		Traits = Solver.TraitsType(((0,0,-1),(0,0,1)), shape_i_default[3],float_t)
 		Traits.rev = rev
 		Traits._periodic = (False,False,True)
 		self.Traits = Traits
@@ -108,7 +108,7 @@ def ReedsSheppForward2(float_t): return ReedsShepp2(float_t,rev=False)
 
 class Dubins2:
 	def __init__(self,float_t):
-		Traits = NarrowBand.TraitsType(tuple(), shape_i_default[3],float_t)
+		Traits = Solver.TraitsType(tuple(), shape_i_default[3],float_t)
 		Traits._periodic = (False,False,True)
 		Traits.nstencil_dynamic = 6
 		self.Traits = Traits
@@ -174,7 +174,7 @@ class Elastica2: # TODO
 	# <grad u, n(θ)> + (D_θ u)^2 = 1.
 	# The integral reformulation is nice in the HFM framework, but it is dubious that it would help much here.
 	def __init__(self,float_t):
-		Traits = NarrowBand.TraitsType(((0,0,-1),(0,0,1)), shape_i_default[3],float_t)
+		Traits = Solver.TraitsType(((0,0,-1),(0,0,1)), shape_i_default[3],float_t)
 		Traits._periodic = (False,False,True)
 		self.Traits = Traits
 
