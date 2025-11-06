@@ -225,7 +225,7 @@ class LaxFriedrichsScheme:
 	@ti.pyfunc # Turn a gradient into a flow, i.e. evaluate the dual norm gradient 
 	def flow(self,grad,dualnorm_data:tpl_t): return self.norm(grad,dualnorm_data,True)[1] 
 
-# --------------------------------------------------------------------------------------------------
+# ----------------------------------- Diagonal metric -------------------------------------
 class Diagonal(LaxFriedrichsScheme):
 	"""
 	Diagonal metric, with axis aligned costs.

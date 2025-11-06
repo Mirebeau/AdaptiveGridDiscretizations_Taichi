@@ -558,8 +558,7 @@ class _Algo:
 			print("NarrowBand efficiency warning : using CPU eikonal solver")
 		else: self.update = gpu_update 
 	
-	# --------- AGSI -------
-
+	# ------------------------------------- AGSI -----------------------------------
 	@ti.kernel
 	def tag_neighbors(self,ixs:arr_t,improved:arr_t,ixs_end:ti.i32,ixs_new:arr_t,
 				   tag:arr_t,tag_count:arr_t) -> ti.i32:
@@ -675,6 +674,7 @@ class _Algo:
 			return ixs_end
 		ixs_end = set_seeds(ixs,tag,improved)
 		self.seeds.clear()
+		assert ixs_end!=0,"AGSI error : There appears to be no valid seed point."
 
 		for iter in range(nitermax):
 			self.update(self_ti, ixs, improved, 0, ixs_end, self.noflow)

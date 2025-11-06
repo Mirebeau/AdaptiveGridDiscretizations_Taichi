@@ -11,6 +11,9 @@ print("------ Non-Regression test : half-plane model of hyperbolic space ------"
 import taichi as ti
 import numpy as np
 from matplotlib import pyplot as plt
+float_t = ti.f32; int_t = ti.i32; arr_t = ti.types.ndarray()
+ti.init(arch=ti.cpu,default_fp=float_t,default_ip=int_t, debug=True)
+np.set_printoptions(linewidth=2000)
 
 import pathlib,sys; sys.path.insert(0,str(pathlib.Path(__file__).parent.resolve())+'/../../..')
 from agdt.GetArrayModule import to_ndarray
@@ -24,11 +27,6 @@ def rel_err(a,b,pad=5):
 	err = (a-b)/np.max(b)
 	if pad>0: err[:pad]=err[-pad:]=0; err[:,:pad]=err[:,-pad:]=0
 	return norm1(err),norminf(err)
-
-
-float_t = ti.f32; int_t = ti.i32; arr_t = ti.types.ndarray()
-ti.init(arch=ti.cpu,default_fp=float_t,default_ip=int_t, debug=True)
-np.set_printoptions(linewidth=2000)
 
 bounds = [[-1,1],[0.1,1]]
 shape = (200,100)

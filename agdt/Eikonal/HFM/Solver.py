@@ -12,7 +12,7 @@ import warnings
 from .. import Queue,CappedQueue
 from ..Backtracking import GeodesicODE 
 from ... import Sort
-from ...GetArrayModule import convert_dtype,reshape_ndarray,getitem_broadcast,ti_debug
+from ...GetArrayModule import convert_dtype,reshape_ndarray,getitem_broadcast,ti_debug,to_ndarray
 from ... import Linalg
 
 # Shorthands for ti.func and ti.kernel annotations
@@ -193,6 +193,7 @@ class _Algo:
 				voffsets[x] = voffset
 		voffsets = ti.ndarray(dtype=self.Traits.voffset_t,shape=self.shape)
 		if walls is None: walls = ti.ndarray(dtype=Traits.wall_t,shape=self.shape); walls.fill(ti.cast(0,Traits.wall_t))
+		else: walls = to_ndarray(walls,ti.i8)
 		self.true_wall = np.any(walls.to_numpy()==wall_code['wall']) # Is there a true wall, or only periodic bc ? 
 		self.walls = reshape_ndarray(walls,(self.size,))
 		walls = None
@@ -385,10 +386,10 @@ class _Algo:
 				nper = self.nper
 				if wall == wall_code['normal +nper']:
 					self_ti.values[ix+nper] = value
-					self_ti.walls[ ix+nper] = wall_code['dummy seed']
+					self_ti.walls[ ix+nper] = self.Traits.wall_t(wall_code['dummy seed'])
 				if wall == wall_code['normal -nper']:
 					self_ti.values[ix-nper] = value
-					self_ti.walls[ ix-nper] = wall_code['dummy seed']
+					self_ti.walls[ ix-nper] = self.Traits.wall_t(wall_code['dummy seed'])
 
 	@ti.pyfunc
 	def set_value(self, self_ti:tpl_t, ix, value):
@@ -601,7 +602,7 @@ class _Algo:
 
 		@ti.func
 		def push_neighbors(ix,iy,pack:tpl_t):
-			if not pack.infifo[iy]: fifo.push(pack.fifo,iy); pack.infifo[iy]=True
+			if not pack.infifo[iy]: fifo.push(pack.fifo,iy); pack.infifo[iy] = ti.i8(int(True))
 
 		@ti.kernel # The AGSI requires inserting the neighbors of all seeds
 		def set_seeds(pack:pack_t): 
@@ -620,7 +621,7 @@ class _Algo:
 				while not fifo.empty(pack.fifo) and niter[None]<nitermax:
 					ix = fifo.front(pack.fifo)
 					fifo.pop(pack.fifo)
-					pack.infifo[ix] = False
+					pack.infifo[ix] = ti.i8(int(False))
 					value = self.update(pack.algo,ix)
 					niter[None]+=1
 					if value>=pack.algo.values[ix]-tol: continue
@@ -739,7 +740,7 @@ class Domain:
 		"""Returns a (broadcasted) grid of the domain"""
 		return tuple(np.broadcast_to(s,self.shape) for s in self.sgrid())
 	
-	def build_scheme(self,costs=None,walls=None,seeds_capacity=128,**kwargs):
+	def build_scheme(self,walls=None,costs=None,seeds_capacity=128,**kwargs):
 		"""
 		- Cost  (field, full shape): a scalar field which multiplies the metric.
 		- walls (field, full shape): obstacles in the domain
@@ -771,7 +772,7 @@ class Domain:
 		if not self.periodic: self.algo = _Algo(costs,weights,offsets,Traits,walls,0,seeds_capacity)
 		else:  # Padding the weights and offsets with zeros in the periodic case
 			per_ax = self.periodic_axis
-			self.periodic_pad = np.max(np.abs(offsets.to_numpy()[...,per_ax]))
+			self.periodic_pad = int(np.max(np.abs(offsets.to_numpy()[...,per_ax])))
 			per_pad = self.periodic_pad
 			if bshape[per_ax]>1:
 				bshape_pad = list(bshape)
@@ -886,6 +887,7 @@ class Domain:
 	def set_seed_ti(self,self_ti:tpl_t,point,value=0):
 		index = self.IndexFromPoint(point)
 		x = ti.cast(ti.round(index),self.Traits.int_t)
+		if ti.static(self.periodic): x[self.Traits.periodic_axis]+=self.periodic_pad
 		self.algo.set_seed(self_ti,self.algo.x2ix(x),value)
 	
 	def set_seed(self,point,value=0.): # Python facing version
