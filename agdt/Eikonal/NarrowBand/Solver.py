@@ -522,15 +522,16 @@ class _Algo:
 				nsource = Traits.nvalues_t(np.nan) # Compute the source factorization (optional)
 				if ti.static(Traits.has_source): Traits.source_factorization(x,nsource)
 				nvalues = Traits.nvalues_t(np.nan) # NaN is a dummy neighbor value, will be replaced (becomes inf ??)
+				#print("pre-cpu_update",ix,self_ti.values[max(0,ix-1)]) #,self_ti.values[ix+1])
 				if not wall:
 					for i in ti.static(range(Traits.nstencil_static)):
 						ioffset,_ = self.ioffset_static(x_i,offset=ti.static(Traits.stencil[i]))
+						#print("cpu_update",nvalues[i],ix,ioffset,self_ti.values[ix+ioffset])
 						nvalues[i] = self_ti.values[ix+ioffset]
 						if ti.static(Traits.has_source): nvalues[i] += nsource[i]
 					for i in ti.static(range(Traits.nstencil_dynamic)):
 						ioffset,_ = self.ioffset_dynamic(x_i,update_data[-1][i,:])
 						nvalues[Traits.nstencil_static+i] = self_ti.values[ix+ioffset]
-
 				if ti.static(len(flows.shape)>0): # Not actually an update : compute flow and exit
 					if wall: flows[ix] = ti.select(value_old<np.inf,0,np.nan) # Null at seed, NaN in wall
 					else: flows[ix] = self.metric.Flow(nvalues,value_old,*update_data)
@@ -734,6 +735,7 @@ class _Algo:
 		improved = ti.ndarray(ti.i8,self.size_o)
 
 		for iter in range(nitermax):
+			print(self.values.to_numpy())
 			improved.fill(False)
 			self.update(self_ti, ixs_o, improved, 0, self.size_o, self.noflow)
 			if not any_ndarray(improved): break # Update until no-one improves

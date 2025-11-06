@@ -55,10 +55,10 @@ SemiLag3_26 = SemiLag3_t(((-1,-1,-1),(-1,-1,0),(-1,-1,1),(-1,0,-1),(-1,0,0),(-1,
 # Cube neighborhood offsets, lexigraphically sorted, hence with opposites put symmetrically
 LexCube2 = ((-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1))
 LexCube3 = SemiLag3_26.vertices
-def LexCubeInd(l): 
+def LexCubeInd(l,center_ind=-1): 
 	"""Compute the inverse mapping to LexCube2 or LexCube3 (offset->index)"""
 	L = list(l); ndim = len(l[0])
-	indices = [L.index(e) if any(e) else -1 for e in itertools.product((-1,0,1),repeat=ndim)]
+	indices = [L.index(e) if any(e) else center_ind for e in itertools.product((-1,0,1),repeat=ndim)]
 	indices = np.array(indices).reshape((3,)*ndim)
 	inv = ti.field(ti.i8,(3,)*ndim)
 	inv.from_numpy(indices.astype(np.int8))
@@ -79,7 +79,8 @@ def LexCubeDecompInd(v,CubeInd):
 	for i in ti.static(tuple(reversed(range(v.n)))):
 		λ[i] = a[σ[i]]
 		if ti.static(i>0): λ[i]-=a[σ[i-1]]
-		u[σ[i]] = ti.i8(ti.math.sign(v[σ[i]]))
+		u[σ[i]] = ti.i8(2*int(v[σ[i]]>=0)-1) # ti.i8(ti.math.sign(v[σ[i]]))
+		# ti.math.sign satisfies sign(0)=0, thus possibly u=0 and e[i] = center_ind = -1 (bad index)
 		e[i] = CubeInd[u+1]
 	return λ,e
 @ti.func
@@ -96,14 +97,14 @@ def LexCubeDecomp(v):
 	for i in ti.static(tuple(reversed(range(v.n)))):
 		λ[i] = a[σ[i]]
 		if ti.static(i>0): λ[i]-=a[σ[i-1]]
-		u[σ[i]] = ti.i8(ti.math.sign(v[σ[i]]))
+		u[σ[i]] = ti.i8(2*int(v[σ[i]]>=0)-1) 
 		e[i,:] = u
 		# if λ[i]==0: e[i,:]=0 # Do we want to do something about null offsets ?  
 	return λ,e
 
 
 @ti.pyfunc
-def scal_static(e:tpl_t,m:tpl_t,f:tpl_t):
+def scalm_static(e:tpl_t,m:tpl_t,f:tpl_t):
     """
 	Compute the scalar product <e, m f> where e and f are static vectors.
 	(Stencil offsets usually have fixed coordinates in (-1,0,1), which suggests this optimization)
@@ -115,6 +116,17 @@ def scal_static(e:tpl_t,m:tpl_t,f:tpl_t):
             if ti.static(c!=0):
                 scal += c*m[i,j] # Multiplication by 1 or -1 should be simplified by the compiler
     return scal
+
+@ti.pyfunc
+def scal_static(e:tpl_t,w):
+	"""
+	Computes the scalar product <e,w> where e is a static vector.
+	(Stencil offsets usually have fixed coordinates in (-1,0,1), which suggests this optimization)
+	"""
+	scal = w[0]; scal = 0 # Get correctly typed scal variable, zero initialized
+	for i in ti.static(range(w.n)):
+		if ti.static(e[i]!=0): scal += e[i]*w[i]
+	return scal
 
 # ---------------------- Data access helpers --------------------------
 
@@ -174,7 +186,7 @@ class LaxFriedrichsScheme:
 	"""
 
 	@ti.pyfunc
-	def LaxFriedrichs_Update(self,nvals,C0,c1,norm_data:tpl_t):
+	def LaxFriedrichs_Update(self,nvals,C0,c1,dualnorm_data:tpl_t):
 		"""
 		For stability and consistency, the constants C0, c1 should obey:
 		(1/C0) |x|_infty <= F^*(x) < (1/c1) |x|_1, where F^* is the dual norm
@@ -187,17 +199,17 @@ class LaxFriedrichsScheme:
 
 		updt = C0 + nvals.min() # Causal update, slope limiter
 		if avg<np.inf: 
-			gradnorm = self.dualnorm(grad,norm_data)  # Model specific 
+			gradnorm = self.dualnorm(grad,dualnorm_data)  # Model specific 
 			updt = min(updt, (c1/ndim)*(1-gradnorm)+avg ) # Minimum with Lax-Friedrichs update
 		return updt
 
 	@ti.pyfunc
-	def LaxFriedrichs_Flow(self,nvals,λ,C0,c1,norm_data:tpl_t): #data:tpl_t,ind,λ):
+	def LaxFriedrichs_Flow(self,nvals,λ,C0,c1,dualnorm_data:tpl_t): #data:tpl_t,ind,λ):
 		ndim = ti.static(self.Traits.ndim)
 		grad = ti.Vector([(nvals[2*i+1]-nvals[2*i])/2 for i in ti.static(range(ndim))])
 		avg = nvals.sum()/(2*ndim)
 
-		flow = -self.flow(grad,norm_data) # Note the minus sign: direction toward source
+		flow = -self.flow(grad,dualnorm_data) # Note the minus sign: direction toward source
 		causal = C0 + nvals.min() # Causal update
 		# - grad@flow == dualnorm(grad) : Euler's identity and minus sign above
 		noncausal = (c1/ndim)*(1 + grad@flow)+avg # LaxFriedrichs update
@@ -206,7 +218,13 @@ class LaxFriedrichsScheme:
 			k = Sort.argmin(nvals)
 			flow[k//2] = C0*(2*(k%2)-1) # Gradient from the slope limiter
 		return flow
-		
+	
+	# ------ Assuming the primal and dual norms have the same algebraic structure -------
+	@ti.pyfunc # Dual norm has the same structure as the primal norm
+	def dualnorm(self,grad,dualnorm_data:tpl_t): return self.norm(grad,dualnorm_data) 
+	@ti.pyfunc # Turn a gradient into a flow, i.e. evaluate the dual norm gradient 
+	def flow(self,grad,dualnorm_data:tpl_t): return self.norm(grad,dualnorm_data,True)[1] 
+
 # --------------------------------------------------------------------------------------------------
 class Diagonal(LaxFriedrichsScheme):
 	"""
@@ -324,11 +342,6 @@ class Diagonal(LaxFriedrichsScheme):
 		C0 = 1./ti.sqrt(weights.min())
 		c1 = 1./ti.sqrt(weights.max())
 		return C0,c1,weights
-	@ti.pyfunc # Dual norm has the same structure as the primal norm
-	def dualnorm(self,grad,weights:tpl_t): return self.norm(grad,weights) 
-	@ti.pyfunc # Turn a gradient into a flow, i.e. evaluate the dual norm gradient 
-	def flow(self,grad,weights:tpl_t): return self.norm(grad,weights,True)[1] # Same struct as primal
-
 # --------------------------------------------------------------------------------------------------
 class Riemann(LaxFriedrichsScheme):
 	"""
@@ -391,18 +404,12 @@ class Riemann(LaxFriedrichsScheme):
 		C0 = getData(data,ind,'C0') * cost
 		c1 = getData(data,ind,'c1') * cost
 		return C0,c1,D
-	@ti.pyfunc # Turn a gradient into a flow, i.e differentiate the dual norm
-	def flow(self,grad,D:tpl_t): return self.norm(grad,D,True)[1]
-	@ti.pyfunc # Same structure as primal
-	def dualnorm(self,grad,D:tpl_t): return self.norm(grad,D) 
-
 	@ti.pyfunc
 	def C0c1(self,D):
 		ndim = ti.static(self.Traits.ndim)
 		# Taichi 1.7.4 issue. There is no way to skip computing eigenvectors. Also, they are NaN for [[2,0],[0,1]]. Also eigvals are not sorted...
 		λ = eigvalsh(D) # Custom routine to solve eigvals, sorted increasingly
 		return 1./ti.sqrt(λ[0]),1./ti.sqrt(λ[ndim-1]) # Precompute, since it is expensive	
-	
 	def LaxFriedrichs_set_defaults(self,sgrid,h,m=None,costs=1):
 		Traits = self.Traits; ndim = Traits.ndim; float_t = Traits.float_t
 		m = toSing(m,Traits.mat_t,np.eye(ndim))
@@ -440,9 +447,9 @@ class Riemann(LaxFriedrichsScheme):
 		# TODO : since the stencil and norm are symmetric, we can cut this storage and computations in half
 		norm2,scal = self.Traits.nvalues_t(np.nan),self.Traits.nvalues_t(np.nan)
 		for i,ei in ti.static(enumerate(vertices)):
-			norm2[i] = scal_static(ei,m,ei)
+			norm2[i] = scalm_static(ei,m,ei)
 			j = ti.static((i+1)%nstencil); ej = ti.static(vertices[j])
-			scal[i] = scal_static(ei,m,ej)
+			scal[i] = scalm_static(ei,m,ej)
 		return m,norm2,scal
 	@ti.func 
 	def SemiLag2_Update(self,nvals, m,norm2,scal, ret_flow:tpl_t=False):
@@ -475,10 +482,10 @@ class Riemann(LaxFriedrichsScheme):
 		vertices,edges = ti.static(self.Traits.SemiLag.vertices,self.Traits.SemiLag.edges)
 		norm2 = self.Traits.nvalues_t(np.nan)
 		scal = ti.lang.matrix.VectorType(ti.static(len(edges)),self.Traits.float_t)(np.nan)
-		for i,v in ti.static(enumerate(vertices)): norm2[i] = scal_static(v, m, v) 
+		for i,v in ti.static(enumerate(vertices)): norm2[i] = scalm_static(v, m, v) 
 		for e,ij in ti.static(enumerate(edges)): 
 			i,j = ti.static(ij) # Taichi does not allow : for e,(i,j) in ...
-			scal[e] = scal_static(ti.static(vertices[i]),m,ti.static(vertices[j]))
+			scal[e] = scalm_static(ti.static(vertices[i]),m,ti.static(vertices[j]))
 		return m,norm2,scal
 	@ti.pyfunc
 	def SemiLag3_Update(self,nvals, m,norm2,scal, ret_flow:tpl_t=False):
@@ -545,7 +552,7 @@ class Riemann(LaxFriedrichsScheme):
 		 # Reconstruct m, for graph-like update and flow normalization (we could also just store it ?)
 		m_sqrt = ti.math.inverse(m_isqrt); m = m_sqrt@m_sqrt
 		norm = self.Traits.nvalues_t(np.nan) # Note : since norm and stencil are symmetric, we could cut this in half
-		for i,e in ti.static(enumerate(self.Traits.stencil)): norm[i] = ti.sqrt(scal_static(e,m,e))
+		for i,e in ti.static(enumerate(self.Traits.stencil)): norm[i] = ti.sqrt(scalm_static(e,m,e))
 		μ = self.Traits.mat_t(np.nan) # Build the finite differences weights and offsets
 		e = ti.lang.matrix.MatrixType(m.n,m.n,2,ti.i8)(0)
 		for i in ti.static(range(m.n)): μ[i,:],e[i,:] = LexCubeDecompInd(m_isqrt[i,:],self.Traits.CubeInd)
@@ -579,11 +586,10 @@ class Riemann(LaxFriedrichsScheme):
 				flows[i,:] /= μsum
 				if val_m<val_p: flows[i,:] *= -1.
 			weights[i] = μsum**2
-		λ_Godunov = Diagonal.Godunov_UpdateBase(vals,weights)
-		if λ_Godunov < updt:
-			if ti.static(ret_flow): flow = flows.transpose() @ (weights*max(0.,λ_Godunov-vals))
-			updt = λ_Godunov
-		if ti.static(ret_flow): return flow / ti.sqrt(flow @ m @ flow) # Normalize w.r.t. primal metric
+		if (λ := Diagonal.Godunov_UpdateBase(vals,weights)) < updt:
+			if ti.static(ret_flow): flow = flows.transpose() @ (weights*max(0.,λ-vals))
+			updt = λ
+		if ti.static(ret_flow): return flow / self.norm(flow,m) # Normalize w.r.t. primal metric
 		return updt
 	@ti.func
 	def UpwindDifferences_Flow(self,nvals,λ, m,norm,μ,e): # Note : we could avoid recomputing λ
