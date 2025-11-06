@@ -200,7 +200,8 @@ def to_ndarray(x,dtype,to_field=False):
 		if hasattr(dtype,'m') and dtype.m==shape[-1]: shape = shape[:-1]
 		if hasattr(dtype,'n') and dtype.n==shape[-1]: shape = shape[:-1]
 		field = ti.field(dtype,shape) if to_field else ti.ndarray(dtype,shape)
-		field.from_numpy(x) 
+		dtype_np = convert_dtype['np'][getattr(dtype,'dtype',dtype)]
+		field.from_numpy(x.astype(dtype_np)) 
 		return field
 	else:
 		assert x.dtype==dtype or x.dtype==dtype.dtype 

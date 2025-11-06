@@ -47,9 +47,11 @@ class TraitsType:
 	def vec_t(self): return ti.lang.matrix.VectorType(self.ndim,self.float_t)
 	@property
 	def ivec_t(self): return ti.lang.matrix.VectorType(self.ndim,self.int_t)
-
 	@property
 	def mat_t(self): return ti.lang.matrix.MatrixType(self.ndim,self.ndim,2,self.float_t)
+	@property
+	def np_int_t(self): return convert_dtype['np'][self.int_t]
+
 	@property
 	def nact(self): return self.nfwd+self.nrev
 	@property
@@ -131,7 +133,7 @@ class _Algo:
 			np.prod(shape[self.factored_stop:],dtype=int), # Factored div
 			np.iinfo(convert_dtype['np'][Traits.int_t]).min, # Will be set to roffsets_max
 			nper, # Shift to access other size of the domain in the periodic setting
-			)))
+			)).astype(Traits.np_int_t))
 
 		# --- Convert the offsets vectors into integers ---
 		@ti.kernel
@@ -536,7 +538,7 @@ class _Algo:
 		pq = Queue.priority_queue.init(self.float_t,self.Traits.int_t,capacity=
 							max(200+seeds.size(),self.size//np.max(tuple(self.shape))))
 		frozen = ti.ndarray(dtype=ti.i8,shape=self.size)
-		frozen.from_numpy(self.walls.to_numpy()>0) # Non mutable points are already frozen
+		frozen.from_numpy((self.walls.to_numpy()>0).astype(np.int8)) # Non mutable points are already frozen
 		stop = ti.field(dtype=ti.i32,shape=()); stop.fill(0) # True if stopping criterion is active
 
 		pack_t = ti.types.argpack(algo=self.self_ti_t, pq=pq.argtype, frozen=arr_t)
@@ -592,7 +594,7 @@ class _Algo:
 		# We now that each index can appear at most once in fifo
 		fifo = Queue.fifo.init(self.Traits.int_t, capacity=self.size)
 		infifo = ti.ndarray(dtype=ti.i8, shape=self.size)
-		infifo.from_numpy(self.walls.to_numpy()>0) # Non mutable points cannot enter the queue
+		infifo.from_numpy((self.walls.to_numpy()>0).astype(np.int8)) # Non mutable points cannot enter the queue
 
 		pack_t = ti.types.argpack(algo=self.self_ti_t, fifo=fifo.argtype, infifo=arr_t)
 		pack = pack_t(self.self_ti, fifo, infifo)
@@ -952,7 +954,7 @@ class Domain:
 		if self.periodic: walls = walls[
 			(slice(None),)*self.periodic_axis+(slice(self.periodic_pad,-self.periodic_pad),)]
 		distL1=ti.ndarray(ti.i8,self.shape)
-		distL1.from_numpy((maxL1+1)*(walls!=wall_code['seed']))
+		distL1.from_numpy( ((maxL1+1)*(walls!=wall_code['seed'])).astype(np.int8))
 
 		@ti.kernel # TODO : propagation should be blocked by walls
 		def GlobalIterL1(distL1:arr_t,shape:self.Traits.ivec_t):

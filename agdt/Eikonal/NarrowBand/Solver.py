@@ -72,6 +72,9 @@ class TraitsType:
 	@property
 	def mat_t(self): return ti.lang.matrix.MatrixType(self.ndim,self.ndim,2,self.float_t)
 	@property
+	def np_int_t(self): return convert_dtype['np'][self.int_t]
+
+	@property
 	def size_i(self): return int(np.prod(self.shape_i))
 	@property
 	def cprod_i(self): return self.ivec_t(cprod(self.shape_i))
@@ -128,7 +131,7 @@ class _Algo:
 		self._cprod_o[None] = cprod(shape_o)
 		self._sizes = ti.field(Traits.int_t,2)
 		size_o = np.prod(shape_o)
-		self._sizes.from_numpy(np.array([size_o, size_o*Traits.size_i]))
+		self._sizes.from_numpy(np.array([size_o, size_o*Traits.size_i]).astype(Traits.np_int_t) )
 		
 		self._periodic_shift = ti.field(Traits.ivec_t,tuple())
 		self._periodic_shift[None] = tuple( 
@@ -731,7 +734,7 @@ class _Algo:
 		self_ti.tol = tol # Set tolerance parameter
 		self.seeds.clear()
 		ixs_o = ti.ndarray(ti.i32,self.size_o)
-		ixs_o.from_numpy(np.arange(self.size_o)) # Every block is listed for update
+		ixs_o.from_numpy(np.arange(self.size_o).astype(np.int32)) # Every block is listed for update
 		improved = ti.ndarray(ti.i8,self.size_o)
 
 		for iter in range(nitermax):
@@ -754,7 +757,7 @@ class _Algo:
 		"""
 		self_ti = self.self_ti; Traits = self.Traits; size_o = self.size_o
 		ixs_o = ti.ndarray(ti.i32,size_o)
-		ixs_o.from_numpy(np.arange(size_o)) # Compute the flow in all blocks (we could consider a selection instead)
+		ixs_o.from_numpy(np.arange(size_o).astype(np.int32)) # Compute the flow in all blocks (we could consider a selection instead)
 		flows = ti.ndarray(Traits.vec_t, self.size)
 		improved = ti.ndarray(ti.i8,1) # Dummy variable 
 		self.update(self_ti,ixs_o,improved,0,size_o,flows) # Set the flow at mutable points
