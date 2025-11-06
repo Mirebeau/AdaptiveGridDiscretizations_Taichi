@@ -32,14 +32,14 @@ class Diagonal:
 			# TODO : source factorization fact(self,v,e)
 		self.NormType = NormType
 
-	@ti.pyfunc
+	@ti.func
 	def hfm_scheme(self, x, ih, weights:arr_t, offsets:arr_t, data:tpl_t):
 		ndim = ti.static(self.Traits.ndim)
 		dcost = getb(data.dcosts,x)
 		for i in ti.static(range(ndim)):
 			weights[*x,i] = (ih[i]/dcost[i])**2
 			for j in ti.static(range(ndim)):
-				offsets[*x,i][j] = (i==j)
+				offsets[*x,i][j] = self.Traits.offset_t(int(i==j))
 	
 	def set_defaults(self,sgrid,dcosts=1):
 		return make_argpack(dcosts=(dcosts,self.Traits.vec_t))

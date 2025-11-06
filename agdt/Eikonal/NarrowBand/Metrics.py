@@ -1,6 +1,6 @@
 """
 This file describes a number of geodesic models, and implements methods required to run the 
-narrowband eikonal solver. 
+NarrowBand eikonal solver. 
 """
 
 import taichi as ti

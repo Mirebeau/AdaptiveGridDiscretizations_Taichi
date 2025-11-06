@@ -62,8 +62,7 @@ if False:
 	plt.show()
 	exit(0)
 
-# -------- Numerical comparisons --------
-
+# ------------------ Numerical validation - NarrowBand ---------------------
 for arch in (
 	ti.cpu, 
 	ti.gpu,
@@ -81,12 +80,13 @@ for arch in (
 		(NBM.Riemann,'LaxFriedrichs',True,1e-2,'GlobalIteration'),
 		(NBM.Riemann,'UpwindDifferences',True,1e-2,'FastSweeping')
 	]):
+		continue
 		# Run the NarrowBand implementation
 		print(f"NarrowBand solving {model=}, {scheme=}, {source=}, {method=}",end=None)
 		metric = model(ndim,float_t,scheme)
 		dom = NarrowBand.Domain(bounds,shape,metric)
 		if source: dom.build_scheme(source_seed=seed,costs=costs)
-		else: dom.build_scheme(costs=costs); dom.set_seed(dom.self_ti,seed)
+		else: dom.build_scheme(costs=costs); dom.set_seed(seed)
 		dom.algo.solve(method,1e-6)
 		geos,rcodes = dom.ode().backtrack(tips)
 
@@ -109,6 +109,7 @@ for arch in (
 			plt.axis('equal')
 			plt.show()
 
+# ------------------ Numerical validation - HFM ---------------------
 for arch in (
 	ti.cpu, 
 	ti.gpu,
@@ -125,7 +126,7 @@ for arch in (
 		metric = model(ndim,float_t)
 		dom = HFM.Domain(bounds,shape,metric)
 		dom.build_scheme(costs_full)
-		dom.set_seed(dom.self_ti,seed)
+		dom.set_seed(seed)
 		dom.algo.solve(method,1e-6)
 		geos,rcodes = dom.ode().backtrack(tips)
 

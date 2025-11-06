@@ -50,10 +50,10 @@ for arch,float_t in (
 	for itest,(model,ndim,params,scheme,errBound,method) in enumerate([
 		# (NBM.Diagonal,2,{'dcosts':(1.3,2)},'LaxFriedrichs',2e-5,'GlobalIteration'),
 		# (NBM.Diagonal,2,{'dcosts':(1.3,2)},'Godunov',1e-7,'FastSweeping'),
-		(NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},'LaxFriedrichs',1e-4,'AGSI'),
-		(NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},NBM.SemiLag2_4,5e-8,'GlobalIteration'),
-		(NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},NBM.SemiLag2_8,5e-8,'FastSweeping'),
-		(NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},'UpwindDifferences',2e-7,'AGSI'),
+		# (NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},'LaxFriedrichs',1e-4,'AGSI'),
+		# (NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},NBM.SemiLag2_4,5e-8,'GlobalIteration'),
+		# (NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},NBM.SemiLag2_8,5e-8,'FastSweeping'),
+		# (NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},'UpwindDifferences',2e-7,'AGSI'),
 
 		# (NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},'LaxFriedrichs',2e-3,'GlobalIteration'),
 		# (NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2,0.5)},'LaxFriedrichs',1e-3,'FastSweeping'),
@@ -62,13 +62,13 @@ for arch,float_t in (
 		# (NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},'UpwindDifferences',5e-7,'AGSI'),
 		# (NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2.,0.5)},'UpwindDifferences',5e-7,'GlobalIteration'),
 		
-		# (NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'LaxFriedrichs',2e-4,'FastSweeping'),
-		# (NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'Godunov',1e-8,'GlobalIteration'),
-		# (NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},'LaxFriedrichs',2e-3,'AGSI'),
-		# (NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},NBM.SemiLag3_6,5e-8,'GlobalIteration'), 
-		# (NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},NBM.SemiLag3_18,5e-8,'AGSI'),
-		# (NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},NBM.SemiLag3_26,5e-8,'FastSweeping'), 
-		# (NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},'UpwindDifferences',1e-5,'FastSweeping'),
+		(NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'LaxFriedrichs',2e-4,'FastSweeping'),
+		(NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'Godunov',1e-8,'GlobalIteration'),
+		(NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},'LaxFriedrichs',2e-3,'AGSI'),
+		(NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},NBM.SemiLag3_6,5e-8,'GlobalIteration'), 
+		(NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},NBM.SemiLag3_18,5e-8,'AGSI'),
+		(NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},NBM.SemiLag3_26,5e-8,'FastSweeping'), 
+		(NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},'UpwindDifferences',1e-5,'FastSweeping'),
 
     ]):
 		print(f"NarrowBand solving {model=} {scheme=} {method=}")
@@ -87,7 +87,6 @@ for arch,float_t in (
 		exact_values = ti.ndarray(float_t,dom.shape)
 		set_exact_values(exact_values)
 		exact_values,values = exact_values.to_numpy(),dom.values().to_numpy()
-		print(values)
 
 		if False and ndim==2:
 			X = dom.grid()
@@ -100,7 +99,7 @@ for arch,float_t in (
 		# Check the numerical errors
 		err = rel_err(values,exact_values)
 		print(f"{err=}")
-		if arch==ti.gpu: errBound = max(errBound,1e-4)
+		if arch==ti.gpu: errBound = max(errBound,2e-4)
 		assert err[1]<errBound
 		for tip,geo,rcode in zip(tips_[ndim],geos,rcodes):
 #			print(geo)

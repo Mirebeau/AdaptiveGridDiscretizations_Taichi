@@ -844,7 +844,7 @@ class Domain:
 
 	def set_seed(self,point,value=0.): # Python facing version
 		"""Set a seed point, without source factorization."""
-		self_ti_t,float_t,vec_t = self.self_ti_t,self.Traits.vec_t,self.Traits.float_t
+		self_ti_t,float_t,vec_t = self.algo.self_ti_t,self.Traits.float_t,self.Traits.vec_t
 		@ti.kernel
 		def set_seed_kernel(self_ti:self_ti_t,point:vec_t,value:float_t):
 			self.set_seed_ti(self_ti,point,value)

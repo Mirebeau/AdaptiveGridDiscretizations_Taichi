@@ -366,7 +366,7 @@ class _Algo:
 				callback(ix,iy,arg)
 
 	@ti.pyfunc
-	def set_seed(self, self_ti, ix, value):
+	def set_seed(self, self_ti:tpl_t, ix, value):
 		"""
 		Set a seed, with the given value. 
 		- ix : linear index of the grid position
@@ -380,7 +380,7 @@ class _Algo:
 			# One cannot insert a see if wall>0. We silently fail, in view of spreadseeds.
 			self_ti.values[ix] = value
 			self.seeds.push(ix)
-			self_ti.walls[ix] = wall_code['seed']
+			self_ti.walls[ix] = self.Traits.wall_t(wall_code['seed'])
 			if ti.static(self.periodic): # Create dummy seeds in padding region
 				nper = self.nper
 				if wall == wall_code['normal +nper']:
@@ -883,14 +883,14 @@ class Domain:
 			return values
 
 	@ti.pyfunc
-	def set_seed_ti(self,self_ti,point,value=0):
+	def set_seed_ti(self,self_ti:tpl_t,point,value=0):
 		index = self.IndexFromPoint(point)
 		x = ti.cast(ti.round(index),self.Traits.int_t)
 		self.algo.set_seed(self_ti,self.algo.x2ix(x),value)
 	
 	def set_seed(self,point,value=0.): # Python facing version
 		"""Set a seed point, without source factorization."""
-		self_ti_t,float_t,vec_t = self.self_ti_t,self.Traits.vec_t,self.Traits.float_t
+		self_ti_t,float_t,vec_t = self.self_ti_t,self.Traits.float_t,self.Traits.vec_t
 		@ti.kernel
 		def set_seed_kernel(self_ti:self_ti_t,point:vec_t,value:float_t): 
 			self.set_seed_ti(self_ti,point,value)
@@ -964,10 +964,10 @@ class Domain:
 					y = x; y[i]+=1; 
 					if ti.static(self.periodic) and self.periodic_axis==i and y[i]==shape[i]: y[i]=0
 					# Taichi 1.7.4 compiler bug, on macOS : min of ti.i8 variables not supported
-					if y[i]<shape[i]:  distL1[x] = min(distL1[x],1+distL1[y]) 
+					if y[i]<shape[i]:  distL1[x] = ti.i8(min(distL1[x],1+distL1[y]))
 					y = x; y[i]-=1; 
 					if ti.static(self.periodic) and self.periodic_axis==i and y[i]==-1: y[i]=shape[i]-1
-					if y[i]>=0:  distL1[x] = min(distL1[x],1+distL1[y])
+					if y[i]>=0:  distL1[x] = ti.i8(min(distL1[x],1+distL1[y]))
 		for k in range(maxL1): GlobalIterL1(distL1,self.shape)
 		return distL1
 	
