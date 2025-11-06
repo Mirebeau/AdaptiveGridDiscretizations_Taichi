@@ -1,4 +1,3 @@
-import sys; sys.path.insert(0,"/Users/jean-mariemirebeau/Dropbox/Programmes/GithubM1/AGDT/AdaptiveGridDiscretizations_Taichi")
 """
 This test file computes the hyperbolic distance on the Poincare half-plane,
 using the HFM and NarrowBand eikonal solvers, and Diagonal and Riemann models.
@@ -12,8 +11,9 @@ print("------ Non-Regression test : half-plane model of hyperbolic space ------"
 import taichi as ti
 import numpy as np
 from matplotlib import pyplot as plt
-from agdt.GetArrayModule import to_ndarray
 
+import pathlib,sys; sys.path.insert(0,str(pathlib.Path(__file__).parent.resolve())+'/../../..')
+from agdt.GetArrayModule import to_ndarray
 from agdt.Eikonal import NarrowBand, HFM
 NBM = NarrowBand.Metrics; HFMM = HFM.Metrics
 
@@ -40,7 +40,6 @@ metric = NBM.Diagonal(ndim,float_t)
 dom = NarrowBand.Domain(bounds,shape,metric)
 X = dom.sgrid() # Sparse grid
 X_ = dom.grid() # Full grid
-
 # ----------- Exact distance -------------
 
 exact_values = 2*np.arcsinh( np.sqrt( (X[0]-seed[0])**2 + (X[1]-seed[1])**2 ) / (2*np.sqrt(X[1]*seed[1])))

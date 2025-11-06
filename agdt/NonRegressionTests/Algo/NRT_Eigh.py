@@ -1,7 +1,8 @@
-import sys; sys.path.append("/Users/jean-mariemirebeau/Dropbox/Programmes/GithubM1/AGDT/AdaptiveGridDiscretizations_Taichi")
 import taichi as ti
 import numpy as np
 from taichi.math import mat2,mat3,mat4,vec3
+
+import pathlib,sys; sys.path.insert(0,str(pathlib.Path(__file__).parent.resolve())+'/../../..')
 from agdt import sym_eig,Linalg
 
 float_t = ti.f64; arr_t = ti.types.ndarray()
@@ -51,7 +52,8 @@ for d in (
 	mat_t = ti.lang.matrix.MatrixType(d,d,2,float_t)
 	tol = [None,None,1e-6,1e-6,1e-6][d]
 
-	#ms[0]=np.diag([1,2,3,4])
+	ms[0]=np.diag([1,2,3,4.][:d]) # Test some diagonal matrix as well
+	ms[1]=np.diag([2,1,1,1.][:d]) # Very degenerate matrix
 
 	@ti.kernel
 	def test_sym_eig(ms:ti.types.ndarray(mat_t,1)):

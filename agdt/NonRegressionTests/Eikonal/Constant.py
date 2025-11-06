@@ -1,4 +1,3 @@
-import sys; sys.path.insert(0,"/Users/jean-mariemirebeau/Dropbox/Programmes/GithubM1/AGDT/AdaptiveGridDiscretizations_Taichi")
 """
 This test file computes the distance in a constant medium,
 using the HFM and NarrowBand eikonal solvers, and Diagonal and Riemann models, 2D and 3D.
@@ -16,6 +15,7 @@ import taichi as ti
 import numpy as np
 from matplotlib import pyplot as plt
 
+import pathlib,sys; sys.path.insert(0,str(pathlib.Path(__file__).parent.resolve())+'/../../..')
 from agdt.GetArrayModule import to_ndarray
 from agdt.Eikonal import NarrowBand, HFM
 NBM = NarrowBand.Metrics
@@ -41,26 +41,28 @@ costs = 2
 #shape_ = [None,None,(11,11),(31,31,31)]
 #tips_ = [None,None,[[-0.5,-0.8],[-0.8,0.5],[0.7,0.9]], [[-0.5,-0.8,0.4]]] #,[-0.8,0.5,-0.2],[0.7,0.9,-0.6]]]
 
+exit(0)
+
 for arch,float_t in (
-#	(ti.cpu,ti.f64), 
+	(ti.cpu,ti.f64), 
 	(ti.gpu,ti.f32),
 	):
 	ti.init(arch=arch,default_fp=float_t,default_ip=int_t, debug=True)
 
 	for itest,(model,ndim,params,scheme,errBound,method) in enumerate([
-		# (NBM.Diagonal,2,{'dcosts':(1.3,2)},'LaxFriedrichs',2e-5,'GlobalIteration'),
-		# (NBM.Diagonal,2,{'dcosts':(1.3,2)},'Godunov',1e-7,'FastSweeping'),
-		# (NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},'LaxFriedrichs',1e-4,'AGSI'),
-		# (NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},NBM.SemiLag2_4,5e-8,'GlobalIteration'),
-		# (NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},NBM.SemiLag2_8,5e-8,'FastSweeping'),
-		# (NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},'UpwindDifferences',2e-7,'AGSI'),
+		(NBM.Diagonal,2,{'dcosts':(1.3,2)},'LaxFriedrichs',2e-5,'GlobalIteration'),
+		(NBM.Diagonal,2,{'dcosts':(1.3,2)},'Godunov',1e-7,'FastSweeping'),
+		(NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},'LaxFriedrichs',1e-4,'AGSI'),
+		(NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},NBM.SemiLag2_4,5e-8,'GlobalIteration'),
+		(NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},NBM.SemiLag2_8,5e-8,'FastSweeping'),
+		(NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},'UpwindDifferences',2e-7,'AGSI'),
 
-		# (NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},'LaxFriedrichs',2e-3,'GlobalIteration'),
-		# (NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2,0.5)},'LaxFriedrichs',1e-3,'FastSweeping'),
-		# (NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},NBM.SemiLag2_4,5e-8,'AGSI'),
-		# (NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2,0.5)},NBM.SemiLag2_8,5e-8,'FastSweeping'),
-		# (NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},'UpwindDifferences',5e-7,'AGSI'),
-		# (NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2.,0.5)},'UpwindDifferences',5e-7,'GlobalIteration'),
+		(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},'LaxFriedrichs',2e-3,'GlobalIteration'),
+		(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2,0.5)},'LaxFriedrichs',1e-3,'FastSweeping'),
+		(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},NBM.SemiLag2_4,5e-8,'AGSI'),
+		(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2,0.5)},NBM.SemiLag2_8,5e-8,'FastSweeping'),
+		(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},'UpwindDifferences',5e-7,'AGSI'),
+		(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2.,0.5)},'UpwindDifferences',5e-7,'GlobalIteration'),
 		
 		(NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'LaxFriedrichs',2e-4,'FastSweeping'),
 		(NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'Godunov',1e-8,'GlobalIteration'),
@@ -90,7 +92,7 @@ for arch,float_t in (
 
 		if False and ndim==2:
 			X = dom.grid()
-			plt.contourf(*X,values) #exact_values) #-values)
+			plt.contourf(*X,values - exact_values) # One may also plot values directly
 			for geo in geos:plt.plot(*geo.T)
 			plt.colorbar()
 			plt.show()
