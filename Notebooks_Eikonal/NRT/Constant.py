@@ -39,13 +39,13 @@ tips_ = [None,None,[[-0.5,-0.8],[-0.8,0.5],[0.7,0.9]], [[-0.5,-0.8,0.4],[-0.8,0.
 costs = 2
 # DEBUG
 #shape_ = [None,None,(11,11),(31,31,31)]
-# tips_ = [None,None,[[-0.5,-0.8],[-0.8,0.5],[0.7,0.9]], [[-0.5,-0.8,0.4]]] #,[-0.8,0.5,-0.2],[0.7,0.9,-0.6]]]
+#tips_ = [None,None,[[-0.5,-0.8],[-0.8,0.5],[0.7,0.9]], [[-0.5,-0.8,0.4]]] #,[-0.8,0.5,-0.2],[0.7,0.9,-0.6]]]
 
 for arch in (
 	ti.cpu, 
 #	ti.gpu,
 	):
-	ti.init(arch=arch,default_fp=float_t,default_ip=int_t, debug=True)
+#	ti.init(arch=arch,default_fp=float_t,default_ip=int_t, debug=True)
 
 	for itest,(model,ndim,params,scheme,errBound,method) in enumerate([
 		# (NBM.Diagonal,2,{'dcosts':(1.3,2)},'LaxFriedrichs',2e-5,'GlobalIteration'),
@@ -59,8 +59,8 @@ for arch in (
 		#(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2,0.5)},'LaxFriedrichs',1e-3,'FastSweeping'),
 		#(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},NBM.SemiLag2_4,5e-8,'AGSI'),
 		#(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2,0.5)},NBM.SemiLag2_8,5e-8,'FastSweeping'),
-		(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},'UpwindDifferences',5e-7,'AGSI'),
-		#(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(0.,0.)},'UpwindDifferences',5e-7,'GlobalIteration'),
+		#(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},'UpwindDifferences',5e-7,'AGSI'),
+		(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(0.,0.)},'UpwindDifferences',5e-7,'GlobalIteration'),
 		
 		# (NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'LaxFriedrichs',2e-4,'FastSweeping'),
 		# (NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'Godunov',1e-8,'GlobalIteration'),
@@ -74,9 +74,9 @@ for arch in (
 		print(f"NarrowBand solving {model=} {scheme=} {method=}")
 		metric = model(ndim,float_t,scheme)
 		dom = NarrowBand.Domain([[-1,1]]*ndim,shape_[ndim],metric)
+		dom.Traits.strict_iter_o=True
 		dom.build_scheme(source_seed=[0.]*ndim,**params,costs=0.9)
 		#dom.build_scheme(**params,costs=0.9); dom.set_seed(dom.self_ti,dom.Traits.vec_t(0))
-		dom.Traits.strict_iter_o=True
 		dom.algo.solve(method,1e-8) #,nitermax=1)
 		#break
 		geos,rcodes = dom.ode().backtrack(tips_[ndim])
@@ -88,6 +88,7 @@ for arch in (
 		exact_values = ti.ndarray(float_t,dom.shape)
 		set_exact_values(exact_values)
 		exact_values,values = exact_values.to_numpy(),dom.values().to_numpy()
+		print(values)
 
 		if True and ndim==2:
 			X = dom.grid()

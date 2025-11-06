@@ -44,7 +44,7 @@ def f(n):
 
 - kwargs are not supported (v1.7.2)
 
-- no greek letters in function names for CUDA
+- no greek letters in function or kernel names for CUDA
 
 - get default float or int types : 
   taichi.lang.impl.default_cfg().default_fp / default_ip
@@ -65,6 +65,7 @@ def f(n):
   v = ti.math.vec2(2.3,3.5)
   ti.math.ivec2(v) # Casts to int in python scope, but remains float in taichi
   # Note that ti.cast is only taichi scope
+- (BUG v1.7.4) Some code equivalent to <<<val = 0; val+=2.>>> caused bad access (val_p in AsymQuad)
 
 - pyfunc 
  Many features unsupported. Cannot set different paths for taichi and python scope.

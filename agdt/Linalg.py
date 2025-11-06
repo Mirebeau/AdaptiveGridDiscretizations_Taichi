@@ -19,7 +19,10 @@ def zero_vec(x):
 
 @ti.pyfunc
 def cast_vec(x,dtype:ti.template()):
-	"""Casts a vector to the given vector type (shape must be compatible)"""
+	"""
+	Casts a vector to the given vector type (shape must be compatible)
+	# DEPRECATED : raises annoying type conversion warnings in taichi.
+	"""
 	y = dtype(0); y = dtype(x); return y # Pyfunc tested on both taichi and python envs
 
 @ti.func

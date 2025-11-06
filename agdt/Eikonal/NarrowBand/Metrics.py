@@ -578,9 +578,10 @@ class Riemann(LaxFriedrichsScheme):
 			val_p = 0.; val_m = 0. # Left and right update
 			for j in ti.static(range(μ.n)):
 				# Note : (μ=0)*(nvals=inf) results in NaN, but this configuration is handled by the graph updates
-				val_p += μ[i,j]*nvals[e[i,j]]
-				val_m += μ[i,j]*nvals[(nvals.n-1)-e[i,j]] # Offsets are symmetric
-				if ti.static(ret_flow): flows[i,:] += μ[i,j] * fstencil[e[i,j]]
+				eij = int(e[i,j])
+				val_p += μ[i,j]*nvals[eij]
+				val_m += μ[i,j]*nvals[(nvals.n-1)-eij] # Offsets are symmetric
+				if ti.static(ret_flow): flows[i,:] += μ[i,j] * fstencil[eij]
 			vals[i] = min(val_p,val_m) / μsum
 			if ti.static(ret_flow): 
 				flows[i,:] /= μsum

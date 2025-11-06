@@ -192,7 +192,7 @@ class GeodesicODE:
 					geo[igeo,k] = x2
 					pack.recent_values[igeo,k%delay_values] = val1
 					pack.recent_minx[igeo,  k%delay_minx] = minx1
-					pack.recent_seeds[igeo, k%delay_seeds] = seed1
+					pack.recent_seeds[igeo, k%delay_seeds] = self.seeds.dtype(seed1) 
 
 					# Check stopping criteria
 					if seed1==0: code = geodesic_code['AtSeed']

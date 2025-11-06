@@ -882,11 +882,19 @@ class Domain:
 			return values
 
 	@ti.pyfunc
-	def set_seed(self,self_ti,point,value=0):
+	def set_seed_ti(self,self_ti,point,value=0):
 		index = self.IndexFromPoint(point)
-		x = Linalg.cast_vec(ti.round(index),self.Traits.ivec_t)
+		x = ti.cast(ti.round(index),self.Traits.int_t)
 		self.algo.set_seed(self_ti,self.algo.x2ix(x),value)
 	
+	def set_seed(self,point,value=0.): # Python facing version
+		"""Set a seed point, without source factorization."""
+		self_ti_t,float_t,vec_t = self.self_ti_t,self.Traits.vec_t,self.Traits.float_t
+		@ti.kernel
+		def set_seed_kernel(self_ti:self_ti_t,point:vec_t,value:float_t): 
+			self.set_seed_ti(self_ti,point,value)
+		set_seed_kernel(self.self_ti,point,value)
+
 	@ti.pyfunc
 	def spread_seed(self,self_ti,point,norm:tpl_t,radius=1.5,value=0):
 		"""
@@ -909,7 +917,7 @@ class Domain:
 				y[self.periodic_axis] += self.periodic_pad
 			iy = self.algo.x2ix(y)
 			self.algo.set_seed(self_ti,iy,val)
-	
+
 	@ti.pyfunc
 	def flow(self, self_ti:tpl_t, x, adim:tpl_t=False):
 		"""

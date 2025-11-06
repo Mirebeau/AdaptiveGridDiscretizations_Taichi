@@ -192,11 +192,11 @@ class _Algo:
 		assert all(0<=x) and all(x<self.shape_o*self.Traits.shape_i) # Largest possible domain 
 		return self.x2ix_o(x//self.Traits.shape_i)*self.Traits.size_i + self.Traits.x2ix_i(x%self.Traits.shape_i)
 	
-	@ti.pyfunc
+	@ti.func
 	def set_seed(self,self_ti:ti.template(),ix,value):
 		self_ti.values[ix] = value
 		if self.Traits.strict_iter_o: self_ti.new_values[ix] = value
-		self_ti.walls[ix] = True
+		self_ti.walls[ix] = ti.i8(int(True)) # True # Avoid conversion warning
 		self.seeds.push(ix)
 
 
@@ -335,7 +335,7 @@ class _Algo:
 
 		self.mk_update()
 
-	@ti.pyfunc
+	@ti.func
 	def ioffset_static(self,x_i,offset:ti.template()):
 		"""Index to access the solution value at x+offset, where the offset is a compile time constant (static)"""
 		ioffset:self.Traits.int_t = 0
@@ -350,9 +350,9 @@ class _Algo:
 				else: ioffset -= self.Traits.cprod_i[k]
 			else:
 				ti.static_assert(offset[k]==0) # Offsets with abs(component)>1 unsupported
-		return ioffset, inner
+		return ioffset, ti.i8(inner) # Avoid conversion warning
 	
-	@ti.pyfunc
+	@ti.func
 	def ioffset_dynamic(self,x_i,offset):
 		"""Index to access the solution value at x+offset, where the offset is defined at runtime (dynamic)"""
 		ioffset:self.Traits.int_t = 0
@@ -367,7 +367,7 @@ class _Algo:
 				else: ioffset -= self.Traits.cprod_i[k]
 			else:
 				assert(offset[k]==0) # Offsets with abs(component)>1 unsupported
-		return ioffset, inner
+		return ioffset, ti.i8(inner) # Avoid conversion warning
 
 
 	
@@ -471,7 +471,7 @@ class _Algo:
 					# Diagnostic : did we improve the value ? (TODO : narrowband exponential criterion.)
 					value_new = values_i[ix_i]
 					if value_new < value_old - self_ti.tol: 
-						improved[_ix_o] = ti.i8(True) # All threads the write to same place
+						improved[_ix_o] = ti.i8(int(True)) # All threads the write to same place
 						self_ti.new_values[ix] = values_i[ix_i] # Write back to global memory, if improved.
 
 			# Copy back data. It would be more efficient to swap values with new_values,
@@ -538,7 +538,7 @@ class _Algo:
 				else: # no inner loop here, equivalently niter_i = 1
 					if not wall: value_new = self.metric.Update(nvalues,*update_data)
 					if value_new < value_old - self_ti.tol:
-						improved[_ix_o] = ti.i8(True) # All threads the write to same place
+						improved[_ix_o] = ti.i8(int(True)) # All threads the write to same place
 						self_ti.new_values[ix] = value_new # Write back to global memory, if improved.
 
 			# Copy back data. It would be more efficient to swap values with new_values,
@@ -639,7 +639,7 @@ class _Algo:
 					iy = ix+per_o[k]
 					if tag[iy]==_ixs: ixs_new[counter]=iy; counter+=1; tag[iy]=-1
 
-		for _ixs in range(ixs_end): improved[_ixs]=False; tag_count[_ixs] = 0 # Cleanup
+		for _ixs in range(ixs_end): improved[_ixs]=ti.i8(int(False)); tag_count[_ixs] = 0 # Cleanup
 		return ixs_end_new
 
 	def solve_AGSI(self,tol:float,nitermax=2000):
@@ -667,7 +667,7 @@ class _Algo:
 			ti.loop_config(serialize=True)
 			for i in range(self.seeds.size()):
 				ix_o = self.seeds.elem[i]//Traits.size_i
-				if tag[ix_o]==-1: ixs[ixs_end]=ix_o; improved[ixs_end]=True; ixs_end+=1; tag[ix_o]=0
+				if tag[ix_o]==-1: ixs[ixs_end]=ix_o; improved[ixs_end]=ti.i8(int(True)); ixs_end+=1; tag[ix_o]=0
 			for i in range(self.seeds.size()): tag[self.seeds.elem[i]//Traits.size_i]=-1 # Cleanup
 			return ixs_end
 		ixs_end = set_seeds(ixs,tag,improved)
@@ -735,7 +735,6 @@ class _Algo:
 		improved = ti.ndarray(ti.i8,self.size_o)
 
 		for iter in range(nitermax):
-			print(self.values.to_numpy())
 			improved.fill(False)
 			self.update(self_ti, ixs_o, improved, 0, self.size_o, self.noflow)
 			if not any_ndarray(improved): break # Update until no-one improves
@@ -833,12 +832,20 @@ class Domain:
 
 	# -------- Eikonal solver calls --------
 
-	@ti.pyfunc
-	def set_seed(self,self_ti:ti.template(),point,value=0.):
+	@ti.func
+	def set_seed_ti(self,self_ti:ti.template(),point,value=0.):
 		index = self.IndexFromPoint(point)
-		x = Linalg.cast_vec(ti.round(index),self.Traits.ivec_t)
+		x = ti.cast(ti.round(index),self.Traits.int_t) #Linalg.cast_vec(ti.round(index),self.Traits.ivec_t)
 		ix = self.algo.x2ix(1+x) # Add 1 for b.c.
 		self.algo.set_seed(self_ti,ix,value)
+
+	def set_seed(self,point,value=0.): # Python facing version
+		"""Set a seed point, without source factorization."""
+		self_ti_t,float_t,vec_t = self.self_ti_t,self.Traits.vec_t,self.Traits.float_t
+		@ti.kernel
+		def set_seed_kernel(self_ti:self_ti_t,point:vec_t,value:float_t):
+			self.set_seed_ti(self_ti,point,value)
+		set_seed_kernel(self.self_ti,point,value)
 
 	def build_scheme(self,walls=None,source_seed=None,source_radius=1.5,**kwargs):
 		"""
@@ -861,7 +868,7 @@ class Domain:
 		@ti.kernel # Set (several) frozen seed points within a small radius around given source_seed
 		def spread_seed(self_ti:self.algo.self_ti_t):
 			X0 = self.Traits.source_seed_index[None] 
-			X = Linalg.cast_vec(ti.round(X0),self.Traits.ivec_t)
+			X = ti.cast(ti.round(X0),self.Traits.int_t) #Linalg.cast_vec(ti.round(X0),self.Traits.ivec_t)
 			for e in ti.grouped(ti.ndrange(*((-r,r+1),)*ndim)):
 				y = X+e 
 				# Keep only seeds which are close enough to X0 (the closest is always kept)
@@ -901,7 +908,7 @@ class Domain:
 		def set_seeds(distL1:ti.types.ndarray(),self_ti:algo.self_ti_t):
 			for x in ti.grouped(distL1):
 				ix = self.algo.x2ix(x+1) # Accounts for padding
-				if self_ti.walls[ix]==1: distL1[x] = ti.select(self_ti.values[ix]<np.inf, 0,maxL1+2)
+				if self_ti.walls[ix]==1: distL1[x] = ti.i8(ti.select(self_ti.values[ix]<np.inf, 0,maxL1+2))
 		set_seeds(distL1,algo.self_ti)
 
 		@ti.kernel
