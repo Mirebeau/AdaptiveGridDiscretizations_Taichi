@@ -312,25 +312,11 @@ class AsymQuad(_AsymBase):
 				if λ<updt and all(ξ>=0) and ξ@sw>=0: # Test should fail if λ is NaN
 					if ti.static(ret_flow): flow = ξ[0]*fvertices[i]+ξ[1]*fvertices[j]
 					updt=λ
-		if ti.static(ret_flow): return flow/self.norm(flow,m,w) # normalized w.r.t. primal metric
+		if ti.static(ret_flow): return flow/self.norm(-flow,m,w) # normalized w.r.t. primal metric
 		return updt
 
 	# ------------------------------ UpwindDifferences ----------------------------------
 
-	# def UpwindDifferences_set_defaults(self,sgrid,h,m=None,w=None,costs=1): # RANDERS
-	# 	Traits = self.Traits; ndim,float_t,vec_t,mat_t = Traits.ndim,Traits.float_t,Traits.vec_t,Traits.mat_t
-	# 	@ti.kernel # Compute square root, in rescaled coords. (Further processing done later.)
-	# 	def set_isqrt(m:arr_t,w:arr_t,ism:arr_t,wh:arr_t,h:vec_t):
-	# 		for x in ti.grouped(m):
-	# 			mh = Traits.mat_t([[m[x][i,j]*h[i]*h[j] for i in range(ndim)] for j in range(ndim)]) 
-	# 			λ,e = sym_eig.eigh(mh) # ti.sym_eig is buggy in 2D and 3D (version 1.7.4)
-	# 			ism[x] = Linalg.mat_dot_diag(e.transpose(),1./ti.sqrt(λ)) @ e # power -1/2
-	# 		for x in ti.grouped(w): wh[x] = w[x] * h
-	# 	m,w = toSing(m,mat_t,np.eye(ndim)),toSing(w,vec_t,np.zeros(ndim))
-	# 	ism,wh = ti.ndarray(mat_t,m.shape),ti.ndarray(vec_t,w.shape) # ism = m^(-1/2)
-	# 	set_isqrt(m,w,ism,wh,h)
-	# 	return {'ism':(getSing(ism),mat_t),'w':(getSing(wh),vec_t),'costs':(costs,Traits.float_t)}
-	
 	def UpwindDifferences_set_defaults(self,sgrid,h,m=None,w=None,costs=1): # AsymQuad
 		Traits = self.Traits; ndim,float_t,vec_t,mat_t = Traits.ndim,Traits.float_t,Traits.vec_t,Traits.mat_t
 		@ti.kernel # Compute square root, in rescaled coords. (Further processing done later.)
@@ -347,111 +333,26 @@ class AsymQuad(_AsymBase):
 		build_scheme(m,w,sD,ω,h)
 		return {'sD':(getSing(sD),mat_t),'ω':(getSing(ω),vec_t),'costs':(costs,Traits.float_t)}
 
-
-	# @ti.func # RANDERS
-	# def UpwindDifferences_Preproc(self,data:tpl_t,ind): 
-	# 	cost = getData(data,ind,'costs')
-	# 	sD = getData(data,ind,'sD') / cost # ism = m^(-1/2)
-	# 	ω = getData(data,ind,'ω') * cost
-	# 	# ism = getData(data,ind,'ism') / cost # ism = m^(-1/2)
-	# 	# w = getData(data,ind,'w') * cost
-	# 	 # Reconstruct m, for graph-like update and flow normalization (we could also just store it ?)
-	# 	#sm = ti.math.inverse(ism); m = sm@sm
-	# 	m,w = self.dual(sD@sD,ω); ism=sD
-	# 	norm = self.Traits.nvalues_t(np.nan) # Note : since norm and stencil are symmetric, we could cut this in half
-	# 	for i,e in ti.static(enumerate(self.Traits.stencil)): 
-	#  		norm[i] = ti.sqrt(scalm_static(e,m,e)+ max(0.,scal_static(e,-w))**2) # ! e oriented negatively
-	# 		# norm[i] = ti.sqrt(scalm_static(e,m,e)) - scal_static(e,w) # !=Riemann, self.norm(-e)
-	# 	μ = ti.lang.matrix.MatrixType(m.n+1,m.n,2,self.Traits.float_t)(0)
-	# 	#μ = self.Traits.Dω_t(np.nan) # Build the finite differences weights and offsets
-	# 	e = ti.lang.matrix.MatrixType(m.n+1,m.n,2,ti.i8)(0)
-	# 	for i in ti.static(range(m.n)): μ[i,:],e[i,:] = LexCubeDecompInd(ism[i,:],self.Traits.CubeInd)
-	# 	μ[m.n,:],e[m.n,:] = LexCubeDecompInd(ω,self.Traits.CubeInd)
-	# 	return m,w,norm,μ,e,(ism@w)
-
 	@ti.func # AsymQuad
 	def UpwindDifferences_Preproc(self,data:tpl_t,ind):
+		ndim = ti.static(self.Traits.ndim)
 		cost = getData(data,ind,'costs')
 		sD = getData(data,ind,'sD') / cost
 		ω = getData(data,ind,'ω') / cost
-		 # Reconstruct m, for graph-like update and flow normalization (we could also just store it ?)
-		norm = self.Traits.nvalues_t(np.nan)
+		 # Reconstruct m,w, for graph-like update and flow normalization (we could also just store it ?)
 		m,w = self.dual(sD@sD,ω)
-		#print(m.n,m.m,w.n,norm.n)
+		norm = self.Traits.nvalues_t(np.nan)
 		for i,e in ti.static(enumerate(self.Traits.stencil)): 
 			norm[i] = ti.sqrt(scalm_static(e,m,e)+ max(0.,scal_static(e,-w))**2) # ! e oriented negatively
 		μ = self.Traits.Dω_t(np.nan) # finite differences weights and offsets
-		e = ti.lang.matrix.MatrixType(m.n+1,m.n,2,ti.i8)(0)
-		for i in ti.static(range(m.n)): μ[i,:],e[i,:] = LexCubeDecompInd(sD[i,:],self.Traits.CubeInd)
-		μ[m.n,:],e[m.n,:] = LexCubeDecompInd(ω,self.Traits.CubeInd)
-		#print(sD,ω)
-		return m,w,norm,μ,e #,w
-
-	# @ti.func
-	# def UpwindDifferences_Preproc(self,data:tpl_t,ind):
-	# 	cost = 1. #getData(data,ind,'costs')
-	# 	sD = ti.Matrix([[1,0],[0,1.]]) #getData(data,ind,'sD') / cost
-	# 	ω = ti.Vector([0.,0.]) #getData(data,ind,'ω') / cost
-	# 	 # Reconstruct m, for graph-like update and flow normalization (we could also just store it ?)
-	# 	norm = self.Traits.nvalues_t(np.nan)
-	# 	norm[0]=norm[1]=norm[2]=0
-	# 	m=sD; w=ω
-	# 	#m,w = self.dual(sD@sD,ω)
-	# 	#print(m.n,m.m,w.n,norm.n)
-	# 	for i,e in ti.static(enumerate(self.Traits.stencil)): 
-	# 		#norm[i] = 0.
-	# 		pass
-	# 		#norm[i] = ti.sqrt(scalm_static(e,m,e)) # + max(0.,scal_static(e,-w))**2) # ! e oriented negatively
-	# 	μ = self.Traits.Dω_t(np.nan) # finite differences weights and offsets
-	# 	e = ti.lang.matrix.MatrixType(m.n+1,m.n,2,ti.i8)(0)
-	# 	#for i in ti.static(range(m.n)): μ[i,:],e[i,:] = LexCubeDecompInd(sD[i,:],self.Traits.CubeInd)
-	# 	#μ[m.n,:],e[m.n,:] = LexCubeDecompInd(ω,self.Traits.CubeInd)
-	# 	#print(sD,ω)
-	# 	return m,w,norm,μ,e
-
-	# @ti.func # RANDERS
-	# def UpwindDifferences_Update(self,nvals, m,w,norm,μ,e,ismw, ret_flow:tpl_t=False):
-	# 	"""Randers eikonal PDE formulated as |ism @ grad u - ismw| = 1"""
-	# 	print(nvals)
-	# 	fstencil = ti.static(self.Traits.fstencil)
-	# 	flow = self.Traits.vec_t(np.nan)
-	# 	updt = self.Traits.float_t(np.inf)
-	# 	# Graph like update from the neighbor vertices
-	# 	for i in ti.static(range(nvals.n)): 
-	# 		if (λ := nvals[i] + norm[i]) < updt:
-	# 			if ti.static(ret_flow): flow = fstencil[i]
-	# 			updt = λ
-	# 	# Prepare for a Godunov-type upwind update
-	# 	vals = self.Traits.evec_t(np.nan)
-	# 	weights = self.Traits.evec_t(np.nan)
-	# 	flows = self.Traits.Dω_t(0.) # Flows associated with each finite difference
-	# 	#return updt
-	# 	for i in ti.static(range(μ.n)):
-	# 		μsum = μ[i,:].sum()
-	# 		val_p = 0.; val_m = 0. #-ismw[i]; val_m = ismw[i] # Left and right update # !=Riemann # TODO : signs
-	# 		for j in ti.static(range(μ.m)):
-	# 			# Note : (μ=0)*(nvals=inf) results in NaN, but this configuration is handled by the graph updates
-	# 			val_p += μ[i,j]*nvals[e[i,j]]
-	# 			val_m += μ[i,j]*nvals[(nvals.n-1)-e[i,j]] # Offsets are symmetric
-	# 			if ti.static(ret_flow): flows[i,:] += μ[i,j] * fstencil[e[i,j]]
-	# 		vals[i] = min(val_p,val_m) / μsum
-	# 		if ti.static(ret_flow): 
-	# 			flows[i,:] /= μsum
-	# 			if val_m<val_p: flows[i,:] *= -1.
-	# 		weights[i] = μsum**2
-	# 	if (λ := Diagonal.Godunov_UpdateBase(vals,weights)) < updt:
-	# 		if ti.static(ret_flow): flow = flows.transpose() @ (weights*max(0.,λ-vals))
-	# 		updt = λ
-	# 	if ti.static(ret_flow): return flow / self.norm(flow,m,w) # Normalize w.r.t. primal metric
-	# 	return updt
-	# @ti.func
-	# def UpwindDifferences_Flow(self,nvals,λ, m,w,norm,μ,e,ismw): # Note : we could avoid recomputing λ
-	# 	return self.UpwindDifferences_Update(nvals, m,w,norm,μ,e,ismw, True)
+		e = ti.lang.matrix.MatrixType(ndim+1,ndim,2,ti.i8)(0)
+		for i in ti.static(range(ndim)): μ[i,:],e[i,:] = LexCubeDecompInd(sD[i,:],self.Traits.CubeInd)
+		μ[ndim,:],e[ndim,:] = LexCubeDecompInd(-ω,self.Traits.CubeInd) # ! orientation of ω
+		return m,w,norm,μ,e
 
 	@ti.func
 	def UpwindDifferences_Update(self,nvals, m,w,norm,μ,e, ret_flow:tpl_t=False):
 		"""AsymQuad eikonal equation rephrased as |D^(1/2) grad u|^2 + max(0,ω @ grad u)^2 = 1"""
-		#print("Update",nvals,norm)
 		ndim,fstencil = ti.static(self.Traits.ndim,self.Traits.fstencil)
 		flow = self.Traits.vec_t(np.nan)
 		updt = self.Traits.float_t(np.inf)
@@ -468,14 +369,13 @@ class AsymQuad(_AsymBase):
 			μsum = μ[i,:].sum()
 			val_p = 0.; val_m = 0. # Left and right update # !=Riemann
 			for j in ti.static(range(ndim)):
-				if μ[i,j]>0:
-					# Note : (μ=0)*(nvals=inf) results in NaN, but this configuration is handled by the graph updates
-					eij = int(e[i,j]) # Convert indices 
-					val_p += μ[i,j]*nvals[eij]
-					if ti.static(i<ndim): val_m += μ[i,j]*nvals[(nvals.n-1)-eij] # Offsets are symmetric
-					if ti.static(ret_flow): flows[i,:] += μ[i,j] * fstencil[eij]
-			#if ti.static(i<ndim): vals[i] = min(val_p,val_m) / μsum
-			#else: vals[i] = val_p / μsum
+				# Note : (μ=0)*(nvals=inf) results in NaN, but this configuration is handled by the graph updates
+				eij = int(e[i,j]) # Convert indices 
+				val_p += μ[i,j]*nvals[eij]
+				if ti.static(i<ndim): val_m += μ[i,j]*nvals[(nvals.n-1)-eij] # Offsets are symmetric
+				if ti.static(ret_flow): flows[i,:] += μ[i,j] * fstencil[eij]
+			if ti.static(i<ndim): vals[i] = min(val_p,val_m) / μsum
+			else: vals[i] = val_p / μsum
 			if ti.static(ret_flow): 
 				flows[i,:] /= μsum
 				if ti.static(i<ndim):
@@ -484,7 +384,7 @@ class AsymQuad(_AsymBase):
 		if (λ := Diagonal.Godunov_UpdateBase(vals,weights)) < updt:
 			if ti.static(ret_flow): flow = flows.transpose() @ (weights*max(0.,λ-vals))
 			updt = λ
-		if ti.static(ret_flow): return flow / self.norm(flow,m,w) # Normalize w.r.t. primal metric
+		if ti.static(ret_flow): return flow / self.norm(-flow,m,w) # Normalize w.r.t. primal metric
 		return updt
 	@ti.func
 	def UpwindDifferences_Flow(self,nvals,λ, m,w,norm,μ,e): # Note : we could avoid recomputing λ

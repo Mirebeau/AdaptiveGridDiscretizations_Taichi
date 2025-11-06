@@ -60,7 +60,7 @@ for arch in (
 		#(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},NBM.SemiLag2_4,5e-8,'AGSI'),
 		#(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2,0.5)},NBM.SemiLag2_8,5e-8,'FastSweeping'),
 		#(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},'UpwindDifferences',5e-7,'AGSI'),
-		(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(0.,0.)},'UpwindDifferences',5e-7,'GlobalIteration'),
+		(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2.,0.5)},'UpwindDifferences',5e-7,'GlobalIteration'),
 		
 		# (NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'LaxFriedrichs',2e-4,'FastSweeping'),
 		# (NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'Godunov',1e-8,'GlobalIteration'),

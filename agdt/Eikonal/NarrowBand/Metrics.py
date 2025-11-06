@@ -535,27 +535,27 @@ class Riemann(LaxFriedrichsScheme):
 	def UpwindDifferences_set_defaults(self,sgrid,h,m=None,costs=1):
 		Traits = self.Traits; ndim = Traits.ndim
 		@ti.kernel # Compute square root, in rescaled coords. (Further processing done later.)
-		def set_isqrt(m:arr_t,m_isqrt:arr_t,h:Traits.vec_t):
+		def set_isqrt(m:arr_t,ism:arr_t,h:Traits.vec_t):
 			for x in ti.grouped(m):
 				mh = Traits.mat_t([[m[x][i,j]*h[i]*h[j] for i in ti.static(range(ndim))] 
 					   for j in ti.static(range(ndim))]) # Take gridscale into account
 				λ,e = eigh(mh) # ti.sym_eig is buggy in 2D and 3D (version 1.7.4)
-				m_isqrt[x] = Linalg.mat_dot_diag(e.transpose(),1./ti.sqrt(λ)) @ e # power -1/2
+				ism[x] = Linalg.mat_dot_diag(e.transpose(),1./ti.sqrt(λ)) @ e # power -1/2
 		m = toSing(m,Traits.mat_t,np.eye(ndim))
-		m_isqrt = ti.ndarray(Traits.mat_t,m.shape)
-		set_isqrt(m,m_isqrt,h)
-		return {'m_isqrt':(getSing(m_isqrt),Traits.mat_t),'costs':(costs,Traits.float_t)}
+		ism = ti.ndarray(Traits.mat_t,m.shape) # ism = Inverse Square-root of M
+		set_isqrt(m,ism,h)
+		return {'ism':(getSing(ism),Traits.mat_t),'costs':(costs,Traits.float_t)}
 
 	@ti.func
 	def UpwindDifferences_Preproc(self,data:tpl_t,ind):
-		m_isqrt = getData(data,ind,'m_isqrt') / getData(data,ind,'costs')
+		ism = getData(data,ind,'ism') / getData(data,ind,'costs')
 		 # Reconstruct m, for graph-like update and flow normalization (we could also just store it ?)
-		m_sqrt = ti.math.inverse(m_isqrt); m = m_sqrt@m_sqrt
+		sm = ti.math.inverse(ism); m = sm@sm # 
 		norm = self.Traits.nvalues_t(np.nan) # Note : since norm and stencil are symmetric, we could cut this in half
 		for i,e in ti.static(enumerate(self.Traits.stencil)): norm[i] = ti.sqrt(scalm_static(e,m,e))
 		μ = self.Traits.mat_t(np.nan) # Build the finite differences weights and offsets
 		e = ti.lang.matrix.MatrixType(m.n,m.n,2,ti.i8)(0)
-		for i in ti.static(range(m.n)): μ[i,:],e[i,:] = LexCubeDecompInd(m_isqrt[i,:],self.Traits.CubeInd)
+		for i in ti.static(range(m.n)): μ[i,:],e[i,:] = LexCubeDecompInd(ism[i,:],self.Traits.CubeInd)
 		return m,norm,μ,e
 	
 	@ti.func
@@ -577,8 +577,8 @@ class Riemann(LaxFriedrichsScheme):
 			μsum = μ[i,:].sum()
 			val_p = 0.; val_m = 0. # Left and right update
 			for j in ti.static(range(μ.n)):
-				# Note : (μ=0)*(nvals=inf) results in NaN, but this configuration is handled by the graph updates
 				eij = int(e[i,j])
+				# Note : (μ=0)*(nvals=inf) results in NaN, but inf values are quickly eliminated by graph updates
 				val_p += μ[i,j]*nvals[eij]
 				val_m += μ[i,j]*nvals[(nvals.n-1)-eij] # Offsets are symmetric
 				if ti.static(ret_flow): flows[i,:] += μ[i,j] * fstencil[eij]
