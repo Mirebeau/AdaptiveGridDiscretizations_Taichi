@@ -231,7 +231,7 @@ class _Algo:
 				arr_oi[(x_o @ cprod_o) + (x_i @ cprod_i)] = arr[y]
 
 		arr_oi = ti.ndarray(dtype,np.prod(bshape_o+bshape_i)) 
-		arr_oi.fill(padding)
+		arr_oi.fill(ti.cast(padding,dtype))
 		copy_data(arr,arr_oi,cprod_o)
 		return arr_oi,cprod_o,cprod_i
 	
@@ -289,8 +289,8 @@ class _Algo:
 
 		# Walls only indicate if a value is mutable or not (boolean). TODO : use u1 instead of i8 ? 
 		self.walls = ti.ndarray(ti.i8, self.size)
-		self.walls.fill(1) # Walls everywhere ! (We only keep them on the boundary)
-		if walls is None: walls = ti.ndarray(ti.i8,(1,)*ndim); walls.fill(0)
+		self.walls.fill(ti.cast(1,ti.i8)) # Walls everywhere ! (We only keep them on the boundary)
+		if walls is None: walls = ti.ndarray(ti.i8,(1,)*ndim); walls.fill(ti.cast(0,ti.i8))
 		bmask = tuple(1 if walls.shape[i]>1 else 0 for i in range(ndim)) # Broadcast mask
 		@ti.kernel
 		def copy_walls(walls_oi:arr_t,walls:arr_t): 
@@ -655,7 +655,7 @@ class _Algo:
 		self_ti.tol = tol # Set tolerance parameter
 		ixs = ti.ndarray(ti.i32,size_o) 
 		ixs_new = ti.ndarray(ti.i32,size_o)
-		improved = ti.ndarray(ti.i8,size_o);   improved.fill(False)
+		improved = ti.ndarray(ti.i8,size_o);   improved.fill(ti.cast(False,ti.i8))
 		tag = ti.ndarray(ti.i32,size_o);       tag.fill(-1)
 		tag_count = ti.ndarray(ti.i32,size_o); tag_count.fill(0)
 
@@ -715,7 +715,7 @@ class _Algo:
 		ixs_o = _Algo.enumerate_sweeps(tuple(self.shape_o)) 
 		improved = ti.ndarray(ti.i8,ixs_o.shape); 
 		for iter in range(nitermax):
-			improved.fill(False)
+			improved.fill(ti.cast(False,ti.i8))
 			for k in range(Traits.ndim): # Loop over axes directions
 				ksize_o = self.size_o//self.shape_o[k]
 				# Loop over index along the current axis, then in reverse
@@ -735,7 +735,7 @@ class _Algo:
 		improved = ti.ndarray(ti.i8,self.size_o)
 
 		for iter in range(nitermax):
-			improved.fill(False)
+			improved.fill(ti.cast(False,ti.i8))
 			self.update(self_ti, ixs_o, improved, 0, self.size_o, self.noflow)
 			if not any_ndarray(improved): break # Update until no-one improves
 			#self_ti.values,self_ti.new_values = self_ti.new_values,self_ti.values # Swap fails ??
@@ -901,7 +901,7 @@ class Domain:
 		L1 distance to the seeds, up to maxL1. Used for PastSeed backtracking stopping criterion."
 		"""
 		distL1 = ti.ndarray(ti.i8,self.shape)
-		distL1.fill(maxL1+1)
+		distL1.fill(ti.cast(maxL1+1,ti.i8))
 		algo = self.algo
 
 		@ti.kernel # Seeds are points with finite values which are tagged as walls
@@ -917,10 +917,10 @@ class Domain:
 				dist = distL1[x]
 				if 0<dist<maxL1+2: # Do not update seeds or walls
 					for i in ti.static(range(self.Traits.ndim)):
-						if x[i]>0: y=x; y[i]-=1; dist = min(dist,1+distL1[y]) # Update left
-						elif ti.static(self.Traits.periodic[i]): y=x; y[i]=self.shape[i]-1; dist = min(dist,1+distL1[y])
-						if x[i]<self.shape[i]-1: y=x; y[i]+=1; dist = min(dist,1+distL1[y]) # Update right
-						elif ti.static(self.Traits.periodic[i]): y=x; y[i]=0; dist = min(dist,1+distL1[y])
+						if x[i]>0: y=x; y[i]-=1; dist = ti.i8(min(dist,1+distL1[y])) # Update left
+						elif ti.static(self.Traits.periodic[i]): y=x; y[i]=self.shape[i]-1; dist = ti.i8(min(dist,1+distL1[y]))
+						if x[i]<self.shape[i]-1: y=x; y[i]+=1; dist = ti.i8(min(dist,1+distL1[y])) # Update right
+						elif ti.static(self.Traits.periodic[i]): y=x; y[i]=0; dist = ti.i8(min(dist,1+distL1[y]))
 					distL1[x]=dist
 		for iter in range(maxL1): GlobalIterL1(distL1)
 		return distL1

@@ -498,7 +498,7 @@ class Riemann(LaxFriedrichsScheme):
 				if ti.static(ret_flow): flow = fvertices[i]
 				updt = λ
 		for e in range(scal.n): # Update from the edges
-			i,j = fedges[e]
+			i,j = int(fedges[e])
 			M = ti.Matrix([[norm2[i],scal[e]],[scal[e],norm2[j]]])
 			l = ti.Vector([nvals[i],nvals[j]])
 			λ,ξ = Riemann.SemiLag_min(M,l)
@@ -506,10 +506,10 @@ class Riemann(LaxFriedrichsScheme):
 				if ti.static(ret_flow): flow = ξ[0]*fvertices[i]+ξ[1]*fvertices[j]
 				updt=λ
 		for face in range(fface_vertices.shape[0]): # Update from the faces
-			i,j,k = fface_vertices[face]
-			e,f,g = fface_edges[face]
+			i,j,k = int(fface_vertices[face])
+			e,f,g = int(fface_edges[face])
 			M = self.Traits.mat_t([norm2[i],scal[e],scal[f], scal[e],norm2[j],scal[g], scal[f],scal[g],norm2[k] ])
-			l = self.Traits.vec_t([nvals[i],nvals[j],nvals[k]]) # TODO : conflict of notation for l
+			l = self.Traits.vec_t([nvals[i],nvals[j],nvals[k]]) 
 			λ,ξ = Riemann.SemiLag_min(M,l)
 			if λ<updt and all(ξ>=0): # Test should fail if λ is NaN
 				if ti.static(ret_flow): flow = ξ[0]*fvertices[i]+ξ[1]*fvertices[j]+ξ[2]*fvertices[k]

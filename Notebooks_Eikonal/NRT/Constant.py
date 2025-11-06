@@ -48,27 +48,27 @@ for arch in (
 #	ti.init(arch=arch,default_fp=float_t,default_ip=int_t, debug=True)
 
 	for itest,(model,ndim,params,scheme,errBound,method) in enumerate([
-		# (NBM.Diagonal,2,{'dcosts':(1.3,2)},'LaxFriedrichs',2e-5,'GlobalIteration'),
-		# (NBM.Diagonal,2,{'dcosts':(1.3,2)},'Godunov',1e-7,'FastSweeping'),
-		# (NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},'LaxFriedrichs',1e-4,'AGSI'),
-		# (NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},NBM.SemiLag2_4,5e-8,'GlobalIteration'),
-		# (NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},NBM.SemiLag2_8,5e-8,'FastSweeping'),
-		# (NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},'UpwindDifferences',2e-7,'AGSI'),
+		(NBM.Diagonal,2,{'dcosts':(1.3,2)},'LaxFriedrichs',2e-5,'GlobalIteration'),
+		(NBM.Diagonal,2,{'dcosts':(1.3,2)},'Godunov',1e-7,'FastSweeping'),
+		(NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},'LaxFriedrichs',1e-4,'AGSI'),
+		(NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},NBM.SemiLag2_4,5e-8,'GlobalIteration'),
+		(NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},NBM.SemiLag2_8,5e-8,'FastSweeping'),
+		(NBM.Riemann,2,{'m':((1,0.5),(0.5,2))},'UpwindDifferences',2e-7,'AGSI'),
 
-		#(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},'LaxFriedrichs',2e-3,'GlobalIteration'),
-		#(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2,0.5)},'LaxFriedrichs',1e-3,'FastSweeping'),
-		#(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},NBM.SemiLag2_4,5e-8,'AGSI'),
-		#(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2,0.5)},NBM.SemiLag2_8,5e-8,'FastSweeping'),
-		#(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},'UpwindDifferences',5e-7,'AGSI'),
+		(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},'LaxFriedrichs',2e-3,'GlobalIteration'),
+		(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2,0.5)},'LaxFriedrichs',1e-3,'FastSweeping'),
+		(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},NBM.SemiLag2_4,5e-8,'AGSI'),
+		(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2,0.5)},NBM.SemiLag2_8,5e-8,'FastSweeping'),
+		(NBMA.Randers,2,{'m':((1,0.5),(0.5,2)),'w':(0,0.5)},'UpwindDifferences',5e-7,'AGSI'),
 		(NBMA.AsymQuad,2,{'m':((1,0.5),(0.5,2)),'w':(2.,0.5)},'UpwindDifferences',5e-7,'GlobalIteration'),
 		
-		# (NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'LaxFriedrichs',2e-4,'FastSweeping'),
-		# (NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'Godunov',1e-8,'GlobalIteration'),
-		# (NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},'LaxFriedrichs',2e-3,'AGSI'),
-		# (NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},NBM.SemiLag3_6,5e-8,'GlobalIteration'), 
-		# (NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},NBM.SemiLag3_18,5e-8,'AGSI'),
-		# (NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},NBM.SemiLag3_26,5e-8,'FastSweeping'), 
-		# (NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},'UpwindDifferences',1e-5,'FastSweeping'),
+		(NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'LaxFriedrichs',2e-4,'FastSweeping'),
+		(NBM.Diagonal,3,{'dcosts':(1.3,1.8,2.1)},'Godunov',1e-8,'GlobalIteration'),
+		(NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},'LaxFriedrichs',2e-3,'AGSI'),
+		(NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},NBM.SemiLag3_6,5e-8,'GlobalIteration'), 
+		(NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},NBM.SemiLag3_18,5e-8,'AGSI'),
+		(NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},NBM.SemiLag3_26,5e-8,'FastSweeping'), 
+		(NBM.Riemann,3,{'m':((1,0.5,-0.3),(0.5,1.2,0.2),(-0.3,0.2,0.9))},'UpwindDifferences',1e-5,'FastSweeping'),
 
     ]):
 		print(f"NarrowBand solving {model=} {scheme=} {method=}")
@@ -78,7 +78,6 @@ for arch in (
 		dom.build_scheme(source_seed=[0.]*ndim,**params,costs=0.9)
 		#dom.build_scheme(**params,costs=0.9); dom.set_seed(dom.self_ti,dom.Traits.vec_t(0))
 		dom.algo.solve(method,1e-8) #,nitermax=1)
-		#break
 		geos,rcodes = dom.ode().backtrack(tips_[ndim])
 
 	
@@ -90,7 +89,7 @@ for arch in (
 		exact_values,values = exact_values.to_numpy(),dom.values().to_numpy()
 		print(values)
 
-		if True and ndim==2:
+		if False and ndim==2:
 			X = dom.grid()
 			plt.contourf(*X,values) #exact_values) #-values)
 			for geo in geos:plt.plot(*geo.T)

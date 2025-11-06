@@ -190,7 +190,7 @@ class _Algo:
 				# 		btot+=1; bact+=1
 				voffsets[x] = voffset
 		voffsets = ti.ndarray(dtype=self.Traits.voffset_t,shape=self.shape)
-		if walls is None: walls = ti.ndarray(dtype=Traits.wall_t,shape=self.shape); walls.fill(0)
+		if walls is None: walls = ti.ndarray(dtype=Traits.wall_t,shape=self.shape); walls.fill(ti.cast(0,Traits.wall_t))
 		self.true_wall = np.any(walls.to_numpy()==wall_code['wall']) # Is there a true wall, or only periodic bc ? 
 		self.walls = reshape_ndarray(walls,(self.size,))
 		walls = None
@@ -754,8 +754,7 @@ class Domain:
 		bshape = tuple(np.max(datashapes,axis=0))
 
 		if costs is None: costs = ti.ndarray(Traits.float_t,self.shape); costs.fill(1)
-		if walls is None: walls = ti.ndarray(Traits.wall_t,self.shape); walls.fill(0)
-
+		if walls is None: walls = ti.ndarray(Traits.wall_t,self.shape); walls.fill(ti.cast(0,Traits.wall_t))
 
 		# Generate the weights and offsets
 		@ti.kernel
@@ -778,7 +777,7 @@ class Domain:
 				bshape_pad = tuple(bshape_pad)
 				weights_pad = ti.ndarray(Traits.float_t,shape=bshape_pad + (Traits.nactx,))
 				offsets_pad = ti.Vector.ndarray(Traits.ndim,Traits.offset_t,shape=weights_pad.shape)
-				weights_pad.fill(0); offsets_pad.fill(0)
+				weights_pad.fill(0); offsets_pad.fill(ti.cast(0,Traits.offset_t))
 				@ti.kernel
 				def scheme_pad(weights:arr_t,offsets:arr_t, # IN
 				   weights_pad:arr_t,offsets_pad:arr_t): # OUT

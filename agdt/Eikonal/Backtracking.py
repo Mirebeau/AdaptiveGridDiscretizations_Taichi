@@ -152,9 +152,10 @@ class GeodesicODE:
 		assert len(tips.shape)==2
 		assert tips.shape[1]==self.ndim
 		ntips = tips.shape[0]
+		seeds_t = self.seeds.dtype # Type used to store the L1 distance to the seeds (often ti.i8)
 		recent_values = ti.ndarray(self.float_t,shape=(ntips,delay_values)); recent_values.fill(np.nan)
 		recent_minx   = ti.ndarray(self.ivec_t,shape=(ntips,delay_minx)); recent_minx.fill(-1)
-		recent_seeds  = ti.ndarray(self.seeds.dtype,shape=(ntips,delay_seeds)); recent_seeds.fill(127)
+		recent_seeds  = ti.ndarray(seeds_t,shape=(ntips,delay_seeds)); recent_seeds.fill(ti.cast(127,seeds_t))
 
 		geo_code = ti.ndarray(ti.i32,ntips)
 		geo_size = ti.ndarray(ti.i32,ntips)
@@ -192,7 +193,7 @@ class GeodesicODE:
 					geo[igeo,k] = x2
 					pack.recent_values[igeo,k%delay_values] = val1
 					pack.recent_minx[igeo,  k%delay_minx] = minx1
-					pack.recent_seeds[igeo, k%delay_seeds] = self.seeds.dtype(seed1) 
+					pack.recent_seeds[igeo, k%delay_seeds] = seeds_t(seed1) 
 
 					# Check stopping criteria
 					if seed1==0: code = geodesic_code['AtSeed']
