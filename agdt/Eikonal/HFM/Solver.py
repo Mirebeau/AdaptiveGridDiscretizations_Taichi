@@ -532,8 +532,8 @@ class _Algo:
 		SEQUENTIAL solver, similar to Dijkstra's algorithm
 		- stopping_criterion : called each time a point is frozen. Return a positive integer for stopping.
 		"""
-		if ti.lang.impl.default_cfg().arch != ti.cpu: 
-			warnings.warn("FMM efficiency warning : sequential algorithm, should be run on the CPU.") 
+		if ti.lang.impl.default_cfg().arch!=ti.cpu: raise ValueError(
+		"The FMM is sequential and must run on CPU (use FastSweeping or GlobalIteration on GPU).")
 		seeds = self.seeds
 		# Hard to predict the max number of items in pq, so using variable capacity
 		pq = Queue.priority_queue.init(self.float_t,self.Traits.int_t,capacity=
@@ -553,7 +553,7 @@ class _Algo:
 				while not seeds.empty():
 					seed = seeds.top(); seeds.pop()
 					pq.push(pack.pq,-pack.algo.values[seed],seed)
-					pack.frozen[seed] = ti.i8(False) # We want to see the seeds once
+					pack.frozen[seed] = ti.i8(int(False)) # We want to see the seeds once
 		set_seeds(pack)
 
 		@ti.func # Update neighbors of last frozen point in FMM
@@ -571,7 +571,7 @@ class _Algo:
 					mval,ix = pq.top(pack.pq) # mval = -values[ix] at insertion
 					pq.pop(pack.pq)
 					if pack.frozen[ix]: continue # Outdated seed value # Note m self.values[ix]!=-mval is an invalid test
-					pack.frozen[ix] = ti.i8(True)
+					pack.frozen[ix] = ti.i8(int(True))
 					if ti.static(stopping_criterion!=None): # Optional stopping criterion
 						stop[None] = stopping_criterion(pack.algo,ix)
 						if stop[None]: break
@@ -588,8 +588,8 @@ class _Algo:
 		Solve the eikonal equation using the Adaptive Gauss Siedel Iteration (AGSI)
 		SEQUENTIAL solver, using a fifo queue
 		"""
-		if ti.lang.impl.default_cfg().arch != ti.cpu: 
-			warnings.warn("AGSI efficiency warning : sequential algorithm, should be run on the CPU.") 
+		if ti.lang.impl.default_cfg().arch!=ti.cpu: raise ValueError("This implementation of the " \
+		"AGSI is sequential and must run on CPU (use FastSweeping or GlobalIteration on GPU).")
 		if nitermax is None: nitermax=5*max(self.shape)*self.size
 		seeds = self.seeds
 		# We now that each index can appear at most once in fifo
@@ -816,7 +816,7 @@ class Domain:
 						xper=x; xper[per_ax]-=self.shape[per_ax]
 						if walls[y]==wc['normal']: walls_pad[x]=wall_t(wc['normal -nper']); walls_pad[xper]=wall_t(wc['dummy +nper'])
 						elif walls[y]==wc['wall']: walls_pad[x]=wall_t(wc['wall']);         walls_pad[xper]=wall_t(wc['wall'])
-					else: walls_pad[x]=walls[y]
+					else: walls_pad[x]=wall_t(walls[y])
 			coef_pad(costs,walls,costs_pad,walls_pad)
 			nper=np.prod(self.shape[per_ax:])
 			self.algo = _Algo(costs_pad,weights_pad,offsets_pad,Traits,walls_pad,nper,seeds_capacity)

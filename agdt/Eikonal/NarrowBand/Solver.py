@@ -298,7 +298,7 @@ class _Algo:
 		@ti.kernel
 		def copy_walls(walls_oi:arr_t,walls:arr_t): 
 			for y in ti.grouped(ti.ndrange(*self.shape)):
-				walls_oi[self.x2ix(1+y)] = walls[y*bmask]
+				walls_oi[self.x2ix(1+y)] = ti.i8(walls[y*bmask])
 		copy_walls(self.walls,walls)
 
 		# block_expand ndarray data. Other data is left untouched.
@@ -318,7 +318,7 @@ class _Algo:
 
 		# Alternatively : sufficient to record seed block positions ? (In that case, no need to limit/guess capacity) 
 		self.seeds = CappedQueue.lifo(self.Traits.int_t,capacity=seeds_capacity)
-		self.noflow = ti.ndarray(Traits.vec_t,tuple())
+		self.noflow = (ti.ndarray(Traits.vec_t,tuple()),ti.ndarray(Traits.float_t,tuple()))
 
 		self.self_ti, self.self_ti_t = make_argpack(
 			values = (self.values,Traits.float_t), 
@@ -372,37 +372,35 @@ class _Algo:
 				assert(offset[k]==0) # Offsets with abs(component)>1 unsupported
 		return ioffset, ti.i8(inner) # Avoid conversion warning
 
-
-	
-	@ti.pyfunc
-	def get_value_static(self,values:ti.template(),values_i,x,ix,x_i,ix_i,offset:ti.template()):
-		if ti.static(ti_debug()): assert self.indomain(x+offset,bc=True)
-		ioffset, inner = self.ioffset_static(x_i,offset)
-		return ti.select(inner, values_i[ix_i+ioffset], values[ix+ioffset])
+	# @ti.pyfunc # Unused
+	# def get_value_static(self,values:ti.template(),values_i,x,ix,x_i,ix_i,offset:ti.template()):
+	# 	if ti.static(ti_debug()): assert self.indomain(x+offset,bc=True)
+	# 	ioffset, inner = self.ioffset_static(x_i,offset)
+	# 	return ti.select(inner, values_i[ix_i+ioffset], values[ix+ioffset])
 
 	def mk_update(self):
 		"""
 		Make the update kernel, to be used by NarrowBand|AGSI|FastSweeping|GlobalIteration
 		(saved as self.update)
 		"""
-		Traits = self.Traits
+		Traits = self.Traits; # Shorthands for compile time constants
+		ndim,size_i,shape_i,niter_i,strict_iter_i,strict_iter_o = Traits.ndim,Traits.size_i,Traits.shape_i,Traits.niter_i,Traits.strict_iter_i,Traits.strict_iter_o
+		has_source,nstencil,nstencil_static,nstencil_dynamic = Traits.has_source,Traits.nstencil,Traits.nstencil_static,Traits.nstencil_dynamic
+		int_t,float_t,vec_t,nvalues_t = Traits.int_t,Traits.float_t,Traits.vec_t,Traits.nvalues_t
+
 		@ti.kernel # We cannot define it as a member kernel, because self_ti_t is only known after __init__
 		def gpu_update(self_ti:self.self_ti_t, 
 			 ixs_o:ti.types.ndarray(ti.i32,1), improved:ti.types.ndarray(ti.i8,1),
-			 ixs_o_begin:ti.i32, ixs_o_end:ti.i32, flows:ti.types.ndarray(Traits.vec_t)):
-			"""
-			- self_ti : dat
-			"""
+			 ixs_o_begin:ti.i32, ixs_o_end:ti.i32, flows:ti.types.ndarray(vec_t), diffs:ti.types.ndarray(float_t)):
 			ti.static_assert(len(ixs_o.shape)==1)
 			assert ixs_o_begin <= ixs_o_end <= ixs_o.shape[0]
-			ndim,size_i = ti.static(Traits.ndim,Traits.size_i)
 			ti.loop_config(block_dim=size_i)
 			for _ix_o,ix_i in ti.ndrange((ixs_o_begin,ixs_o_end),size_i):
 				# ix_i the index in the inner shape, and also the thread index
 				ix_o = ixs_o[_ix_o] # ix_o is the index in the outer shape
 				x_o = self.ix2x_o(ix_o) # No way to avoid this, unless ixs_o stores full indices
 				x_i = Traits.ix2x_i(ix_i) # Should be cheap thanks to power-of-2 arithmertic
-				x = x_o * Traits.shape_i + x_i # Not always used, but should be cheap ...
+				x = x_o * shape_i + x_i # Not always used, but should be cheap ...
 				assert 0<=ix_o<self.size_o
 
 				# Also setup the indices for the data extraction
@@ -414,7 +412,7 @@ class _Algo:
 				update_data = self.metric.Preproc(self_ti,data_ind)
 
 				# Fetch the values from global memory
-				values_i = ti.simt.block.SharedArray((size_i,), Traits.float_t)
+				values_i = ti.simt.block.SharedArray((size_i,), float_t)
 				ix = ix_i + ix_o*size_i # Global index
 				ix_per = ix 
 				for k in ti.static(range(ndim)): # Take periodic b.c into account
@@ -426,50 +424,49 @@ class _Algo:
 				ti.simt.block.sync()
 
 				# Prepare to fetch the neighbor values
-				nstencil,nstencil_static = ti.static(Traits.nstencil,Traits.nstencil_static)
 				inner = ti.lang.matrix.VectorType(nstencil,ti.i8)(0)
-				iy = ti.lang.matrix.VectorType(nstencil,Traits.int_t)(0)
-				for i in ti.static(range(Traits.nstencil_static)):
+				iy = ti.lang.matrix.VectorType(nstencil,int_t)(0)
+				for i in ti.static(range(nstencil_static)):
 					ioffset,inner[i] = self.ioffset_static(x_i,offset=ti.static(Traits.stencil[i]))
 					iy[i] = ti.select(inner[i], ix_i+ioffset, ix+ioffset)
-				for i in ti.static(range(Traits.nstencil_dynamic)):
+				for i in ti.static(range(nstencil_dynamic)):
 					j = ti.static(nstencil_static+i)
 					ioffset,inner[j] = self.ioffset_dynamic(x_i,update_data[-1][i,:])
 					iy[j] = ti.select(inner[j], ix_i+ioffset, ix+ioffset)
 
 				wall = self_ti.walls[ix] # wall : immutable value
-				nvalues = Traits.nvalues_t(np.nan) # NaN is a dummy neighbor value, will be replaced (becomes inf ??)
-
-				nsource = Traits.nvalues_t(np.nan) # Compute the source factorization (optional)
-				if ti.static(Traits.has_source): Traits.source_factorization(x,nsource)
+				nvalues = nvalues_t(np.nan) # NaN is a dummy neighbor value, will be replaced (becomes inf ??)
+				nsource = nvalues_t(np.nan) # Compute the source factorization (optional)
+				if ti.static(has_source): Traits.source_factorization(x,nsource)
 
 				if ti.static(len(flows.shape)>0): # Not actually an update : compute flow and exit
 					if wall: flows[ix] = ti.select(values_i[ix_i]<np.inf,0,np.nan) # Null at seed, NaN in wall
 					else: # Get the neighbor values, and compute the flow
-						for i in ti.static(range(Traits.nstencil)): # Get required neighbor values
+						for i in ti.static(range(nstencil)): # Get required neighbor values
 							if inner[i]: nvalues[i] = values_i[iy[i]]
 							else: nvalues[i] = self_ti.values[iy[i]]
-							if ti.static(Traits.has_source): nvalues[i] += nsource[i]
+							if ti.static(has_source): nvalues[i] += nsource[i]
 							#nvalues[i] = ti.select(inner[i],values_i[iy[i]],self_ti.values[iy[i]]) # Out of bounds access
 						flows[ix] = self.metric.Flow(nvalues,value_old,*update_data)
+						diffs[ix] = value_old - nvalues.min() # Max upwind difference used .
 				else: 
 					# A temporary array is needed with strict_iter_i
-					new_values_i = ti.simt.block.SharedArray((size_i if Traits.strict_iter_i else 0,), Traits.float_t)
-					for iter_i in ti.static(range(Traits.niter_i)): # Inner loop for scheme evaluations
+					new_values_i = ti.simt.block.SharedArray((size_i if strict_iter_i else 0,),float_t)
+					for iter_i in ti.static(range(niter_i)): # Inner loop for scheme evaluations
 						if not wall:  # wall : immutable value
-							for i in ti.static(range(Traits.nstencil)): # Get required neighbor values
+							for i in ti.static(range(nstencil)): # Get required neighbor values
 								if inner[i]: nvalues[i] = values_i[iy[i]] # Local values are updated along iterations
 								elif ti.static(iter_i==0): nvalues[i] = self_ti.values[iy[i]] # Global values are immutable along iterations
-								if ti.static(Traits.has_source):
+								if ti.static(has_source):
 									if (inner[i] or ti.static(iter_i==0)): nvalues[i] += nsource[i]
 							λ = self.metric.Update(nvalues,*update_data)
-							if ti.static(Traits.strict_iter_i): # Use temporary variable to separate updates
+							if ti.static(strict_iter_i): # Use temporary variable to separate updates
 								new_values_i[ix_i]=λ
 								ti.simt.block.sync() # Wait until all thread finish using values_i
 								# It would be more efficient to swap values_i with new_values_i, but failed to make it work
 								values_i[ix_i] = new_values_i[ix_i] 
 							else: values_i[ix_i] = λ
-							if ti.static(iter_i < Traits.niter_i)-1: ti.simt.block.sync()
+							if ti.static(iter_i < niter_i)-1: ti.simt.block.sync()
 					
 					# Diagnostic : did we improve the value ? (TODO : narrowband exponential criterion.)
 					value_new = values_i[ix_i]
@@ -479,7 +476,7 @@ class _Algo:
 
 			# Copy back data. It would be more efficient to swap values with new_values,
 			# but I failed to make it work. (The global pointers in self_ti are regarded as constants at compilation)
-			if ti.static(Traits.strict_iter_o and len(flows.shape)==0):
+			if ti.static(strict_iter_o and len(flows.shape)==0):
 				for _ix_o,ix_i in ti.ndrange((ixs_o_begin,ixs_o_end),size_i): # Copy updated values
 					ix = ixs_o[_ix_o]*size_i + ix_i
 					self_ti.values[ix] = self_ti.new_values[ix]
@@ -488,17 +485,16 @@ class _Algo:
 		@ti.kernel # We cannot define it as a member kernel, because self_ti_t is only known after __init__
 		def cpu_update(self_ti:self.self_ti_t, 
 			 ixs_o:ti.types.ndarray(ti.i32,1), improved:ti.types.ndarray(ti.i8,1),
-			 ixs_o_begin:ti.i32, ixs_o_end:ti.i32, flows:ti.types.ndarray(Traits.vec_t)):
+			 ixs_o_begin:ti.i32, ixs_o_end:ti.i32, flows:ti.types.ndarray(vec_t), diffs:ti.types.ndarray(float_t)):
 			ti.static_assert(len(ixs_o.shape)==1)
 			assert ixs_o_begin <= ixs_o_end <= ixs_o.shape[0]
-			ndim,size_i = ti.static(Traits.ndim,Traits.size_i)
 			#ti.loop_config(block_dim=size_i)
 			for _ix_o,ix_i in ti.ndrange((ixs_o_begin,ixs_o_end),size_i):
 				# ix_i the index in the inner shape, and also the thread index
 				ix_o = ixs_o[_ix_o] # ix_o is the index in the outer shape
 				x_o = self.ix2x_o(ix_o) # No way to avoid this, unless ixs_o stores full indices
 				x_i = Traits.ix2x_i(ix_i) # Should be cheap thanks to power-of-2 arithmertic
-				x = x_o * Traits.shape_i + x_i # Not always used, but should be cheap ...
+				x = x_o * shape_i + x_i # Not always used, but should be cheap ...
 				assert 0<=ix_o<self.size_o
 
 				# Also setup the indices for the data extraction
@@ -522,22 +518,23 @@ class _Algo:
 				wall = self_ti.walls[ix] # wall : immutable value
 
 				# Fetch the neighbor values
-				nsource = Traits.nvalues_t(np.nan) # Compute the source factorization (optional)
-				if ti.static(Traits.has_source): Traits.source_factorization(x,nsource)
-				nvalues = Traits.nvalues_t(np.nan) # NaN is a dummy neighbor value, will be replaced (becomes inf ??)
-				#print("pre-cpu_update",ix,self_ti.values[max(0,ix-1)]) #,self_ti.values[ix+1])
+				nvalues = nvalues_t(np.nan) # NaN is a dummy neighbor value, will be replaced (becomes inf ??)
+				nsource = nvalues_t(np.nan) # Compute the source factorization (optional)
+				if ti.static(has_source): Traits.source_factorization(x,nsource)
 				if not wall:
-					for i in ti.static(range(Traits.nstencil_static)):
+					for i in ti.static(range(nstencil_static)):
 						ioffset,_ = self.ioffset_static(x_i,offset=ti.static(Traits.stencil[i]))
 						#print("cpu_update",nvalues[i],ix,ioffset,self_ti.values[ix+ioffset])
 						nvalues[i] = self_ti.values[ix+ioffset]
-						if ti.static(Traits.has_source): nvalues[i] += nsource[i]
-					for i in ti.static(range(Traits.nstencil_dynamic)):
+						if ti.static(has_source): nvalues[i] += nsource[i]
+					for i in ti.static(range(nstencil_dynamic)):
 						ioffset,_ = self.ioffset_dynamic(x_i,update_data[-1][i,:])
-						nvalues[Traits.nstencil_static+i] = self_ti.values[ix+ioffset]
+						nvalues[nstencil_static+i] = self_ti.values[ix+ioffset]
 				if ti.static(len(flows.shape)>0): # Not actually an update : compute flow and exit
 					if wall: flows[ix] = ti.select(value_old<np.inf,0,np.nan) # Null at seed, NaN in wall
-					else: flows[ix] = self.metric.Flow(nvalues,value_old,*update_data)
+					else: 
+						flows[ix] = self.metric.Flow(nvalues,value_old,*update_data)
+						diffs[ix] = value_old - nvalues.min() # Max upwind difference used .
 				else: # no inner loop here, equivalently niter_i = 1
 					if not wall: value_new = self.metric.Update(nvalues,*update_data)
 					if value_new < value_old - self_ti.tol:
@@ -546,7 +543,7 @@ class _Algo:
 
 			# Copy back data. It would be more efficient to swap values with new_values,
 			# but I failed to make it work. (The global pointers in self_ti are regarded as constants at compilation)
-			if ti.static(Traits.strict_iter_o and len(flows.shape)==0):
+			if ti.static(strict_iter_o and len(flows.shape)==0):
 				for _ix_o,ix_i in ti.ndrange((ixs_o_begin,ixs_o_end),size_i): # Copy updated values
 					ix = ixs_o[_ix_o]*size_i + ix_i
 					self_ti.values[ix] = self_ti.new_values[ix]
@@ -677,7 +674,7 @@ class _Algo:
 		assert ixs_end!=0,"AGSI error : There appears to be no valid seed point."
 
 		for iter in range(nitermax):
-			self.update(self_ti, ixs, improved, 0, ixs_end, self.noflow)
+			self.update(self_ti, ixs, improved, 0, ixs_end, *self.noflow)
 			ixs_end = self.tag_neighbors(ixs,improved,ixs_end,ixs_new,tag,tag_count)
 			if ixs_end==0: break # No improvement, no new neighbors tagged
 			ixs,ixs_new = ixs_new,ixs # Swap the two arrays. Hope it works here
@@ -724,7 +721,7 @@ class _Algo:
 				# Loop over index along the current axis, then in reverse
 				for r in itertools.chain(range(self.shape_o[k]), reversed(range(self.shape_o[k]))): 
 					beg = k*self.size_o + r*ksize_o
-					self.update(self_ti, ixs_o, improved, beg, beg+ksize_o, self.noflow)
+					self.update(self_ti, ixs_o, improved, beg, beg+ksize_o, *self.noflow)
 			if not any_ndarray(improved): break
 		else: print(f"Fast Sweeping completed {nitermax=} iterations, without reaching tolerance {tol=}")
 		return iter
@@ -739,7 +736,7 @@ class _Algo:
 
 		for iter in range(nitermax):
 			improved.fill(ti.cast(False,ti.i8))
-			self.update(self_ti, ixs_o, improved, 0, self.size_o, self.noflow)
+			self.update(self_ti, ixs_o, improved, 0, self.size_o, *self.noflow)
 			if not any_ndarray(improved): break # Update until no-one improves
 			#self_ti.values,self_ti.new_values = self_ti.new_values,self_ti.values # Swap fails ??
 		else: print(f'Global iteration completed {nitermax=} iterations, without reaching tolerance {tol=}')
@@ -753,15 +750,20 @@ class _Algo:
 
 	def flows(self):
 		"""
-		Extracts the geodesic flow from the solution of the eikonal equation (which must be computed before)
+		Output
+		- flows : descent direction from the solution of the eikonal equation (which must be computed before).
+		- diffs : largest upwind difference used in the scheme.
 		"""
-		self_ti = self.self_ti; Traits = self.Traits; size_o = self.size_o
+		# Side effect, we invalidate the temporary variable self_ti.new_values at non-wall entries. 
+		Traits = self.Traits; size_o = self.size_o
 		ixs_o = ti.ndarray(ti.i32,size_o)
 		ixs_o.from_numpy(np.arange(size_o).astype(np.int32)) # Compute the flow in all blocks (we could consider a selection instead)
-		flows = ti.ndarray(Traits.vec_t, self.size)
+		flows = ti.ndarray(Traits.vec_t,  self.size)
+		diffs = ti.ndarray(Traits.float_t,self.size)
+		diffs.fill(0.)
 		improved = ti.ndarray(ti.i8,1) # Dummy variable 
-		self.update(self_ti,ixs_o,improved,0,size_o,flows) # Set the flow at mutable points
-		return flows
+		self.update(self.self_ti,ixs_o,improved,0,size_o,flows,diffs) # Set the flow at mutable points
+		return flows,diffs
 	
 # ------------- Narrow band external interface ---------
 
@@ -889,15 +891,12 @@ class Domain:
 	def values(self): return self.algo.block_squeeze(self.algo.values)
 
 	def flows(self,adim:tpl_t=False):
-		flows = self.algo.block_squeeze(self.algo.flows())
+		flows,diffs = map(self.algo.block_squeeze,self.algo.flows())
 		@ti.kernel
 		def rescale_flow(flows:arr_t):
 			for x in ti.grouped(flows): flows[x] *= self.h
 		if not adim: rescale_flow(flows)
-		return flows
-		# TODO. Should I get diffs as in HFM ? The flow *should* be more regular due to the small stencils, but who knows ? 
-		# Also, not sure how to compute diffs here. It could depend on the considered scheme, there is no obvious formula.
-		# Maybe juste look at the immediate neighbors ? Or deactivate this criterion ? 
+		return flows,diffs
 
 	def seeds_distL1(self,maxL1=7):
 		"""
@@ -929,10 +928,8 @@ class Domain:
 		return distL1
 
 	def ode(self):
-		diffs = ti.ndarray(self.Traits.float_t, tuple())
-		diffs.fill(np.inf)
-		return GeodesicODE(self.seeds_distL1(),self.values(),self.flows(adim=True),diffs,self.Traits.periodic,self.PointFromIndex)
-	
+		return GeodesicODE(self.seeds_distL1(),self.values(),*self.flows(adim=True),self.Traits.periodic,self.PointFromIndex)
+		
 	@ti.func
 	def Interpolate(self,arr:arr_t,point):
 		"""

@@ -214,11 +214,11 @@ class Randers(_AsymBase):
 			μsum = μ[i,:].sum()
 			val_p = -ismw[i]; val_m = ismw[i] # Left and right update # !=Riemann # TODO : signs
 			for j in ti.static(range(μ.n)):
-				# Note : (μ=0)*(nvals=inf) results in NaN, but this configuration is handled by the graph updates
-				eij = int(e[i,j])
-				val_p += μ[i,j]*nvals[eij]
-				val_m += μ[i,j]*nvals[(nvals.n-1)-eij] # Offsets are symmetric
-				if ti.static(ret_flow): flows[i,:] += μ[i,j] * fstencil[eij]
+				if (μij := μ[i,j])>0 : # Note : (μ=0)*(nvals=inf) results in NaN, issue with walls
+					eij = int(e[i,j])
+					val_p += μij*nvals[eij]
+					val_m += μij*nvals[(nvals.n-1)-eij] # Offsets are symmetric
+					if ti.static(ret_flow): flows[i,:] += μij * fstencil[eij]
 			vals[i] = min(val_p,val_m) / μsum
 			if ti.static(ret_flow): 
 				flows[i,:] /= μsum
@@ -227,7 +227,8 @@ class Randers(_AsymBase):
 		if (λ := Diagonal.Godunov_UpdateBase(vals,weights)) < updt:
 			if ti.static(ret_flow): flow = flows.transpose() @ (weights*max(0.,λ-vals))
 			updt = λ
-		if ti.static(ret_flow): return flow / self.norm(flow,m,w) # Normalize w.r.t. primal metric
+		if ti.static(ret_flow): 
+			return flow / self.norm(flow,m,w) # Normalize w.r.t. primal metric
 		return updt
 	@ti.func
 	def UpwindDifferences_Flow(self,nvals,λ, m,w,norm,μ,e,ismw): # Note : we could avoid recomputing λ
@@ -369,20 +370,23 @@ class AsymQuad(_AsymBase):
 			μsum = μ[i,:].sum()
 			val_p = 0.; val_m = 0. # Left and right update # !=Riemann
 			for j in ti.static(range(ndim)):
-				# Note : (μ=0)*(nvals=inf) results in NaN, but this configuration is handled by the graph updates
-				eij = int(e[i,j]) # Convert indices 
-				val_p += μ[i,j]*nvals[eij]
-				if ti.static(i<ndim): val_m += μ[i,j]*nvals[(nvals.n-1)-eij] # Offsets are symmetric
-				if ti.static(ret_flow): flows[i,:] += μ[i,j] * fstencil[eij]
+				if (μij := μ[i,j])>0: # (μ=0)*(nvals=inf) results in NaN, issue with walls
+					eij = int(e[i,j]) # Convert indices 
+					val_p += μij*nvals[eij]
+					if ti.static(i<ndim): val_m += μij*nvals[(nvals.n-1)-eij] # Offsets are symmetric
+					if ti.static(ret_flow): flows[i,:] += μij * fstencil[eij]
 			if ti.static(i<ndim): vals[i] = min(val_p,val_m) / μsum
 			else: vals[i] = val_p / μsum
 			if ti.static(ret_flow): 
-				flows[i,:] /= μsum
 				if ti.static(i<ndim):
+					flows[i,:] /= μsum
 					if val_m<val_p: flows[i,:] *= -1.
+				elif μsum>0: flows[i,:] /= μsum # Avoid zero divide in symmetric case
 			weights[i] = μsum**2
 		if (λ := Diagonal.Godunov_UpdateBase(vals,weights)) < updt:
-			if ti.static(ret_flow): flow = flows.transpose() @ (weights*max(0.,λ-vals))
+			if ti.static(ret_flow): 
+				print(f"returning : {flows}, {weights}")
+				flow = flows.transpose() @ (weights*max(0.,λ-vals))
 			updt = λ
 		if ti.static(ret_flow): return flow / self.norm(-flow,m,w) # Normalize w.r.t. primal metric
 		return updt

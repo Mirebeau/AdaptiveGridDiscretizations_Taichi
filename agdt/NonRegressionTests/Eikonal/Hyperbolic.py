@@ -77,7 +77,6 @@ for arch in (
 		(NBM.Riemann,'LaxFriedrichs',True,1e-2,'GlobalIteration'),
 		(NBM.Riemann,'UpwindDifferences',True,1e-2,'FastSweeping')
 	]):
-		continue
 		# Run the NarrowBand implementation
 		print(f"NarrowBand solving {model=}, {scheme=}, {source=}, {method=}",end=None)
 		metric = model(ndim,float_t,scheme)
@@ -122,7 +121,7 @@ for arch in (
 		# Run the HFM implementation
 		metric = model(ndim,float_t)
 		dom = HFM.Domain(bounds,shape,metric)
-		dom.build_scheme(costs_full)
+		dom.build_scheme(costs=costs_full)
 		dom.set_seed(seed)
 		dom.algo.solve(method,1e-6)
 		geos,rcodes = dom.ode().backtrack(tips)

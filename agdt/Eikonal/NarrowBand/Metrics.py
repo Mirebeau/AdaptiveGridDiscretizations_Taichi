@@ -39,8 +39,8 @@ class SemiLag2_t(namedtuple("SemiLag2",("vertices",))):
 	def to_field(self): return SemiLag2_t(to_ndarray(np.array(self.vertices),ti.lang.matrix.VectorType(2,ti.i8),True))
 SemiLag2_4  = SemiLag2_t(((1,0),(0,1),(-1,0),(0,-1))) # Axis aligned stencil, but ordered trigonometrically
 SemiLag2_8  = SemiLag2_t(((1,0),(1,1),(0,1),(-1,1),(-1,0),(-1,-1),(0,-1),(1,-1)))
-SemiLag2_16 = SemiLag2_t((	( 1, 0),( 2, 1),( 1, 1),( 1, 2),( 0, 1),(-1, 2),(-1, 1),(-2, 1),
-							(-1, 0),(-2,-1),(-1,-1),(-1,-2),( 0,-1),( 1,-2),( 1,-1),( 2,-1)))
+# SemiLag2_16 = SemiLag2_t((	( 1, 0),( 2, 1),( 1, 1),( 1, 2),( 0, 1),(-1, 2),(-1, 1),(-2, 1),
+#  (-1, 0),(-2,-1),(-1,-1),(-1,-2),( 0,-1),( 1,-2),( 1,-1),( 2,-1))) # Too long offsets, unsupported
 
 class SemiLag3_t(namedtuple("SemiLag3",("vertices","edges","face_vertices","face_edges"))):
 	def to_field(self): return SemiLag3_t(
@@ -213,10 +213,11 @@ class LaxFriedrichsScheme:
 		causal = C0 + nvals.min() # Causal update
 		# - grad@flow == dualnorm(grad) : Euler's identity and minus sign above
 		noncausal = (c1/ndim)*(1 + grad@flow)+avg # LaxFriedrichs update
-		if avg<np.inf and causal<noncausal:  
+		if ti.math.isinf(avg) or causal<noncausal:  
 			flow.fill(0)
 			k = Sort.argmin(nvals)
-			flow[k//2] = C0*(2*(k%2)-1) # Gradient from the slope limiter
+			flow[k//2] = C0*(2*(k%2)-1) # Flow from the slope limiter
+			# Note : the flow from the slope limiter is very weak in magnitude
 		return flow
 	
 	# ------ Assuming the primal and dual norms have the same algebraic structure -------
@@ -577,11 +578,11 @@ class Riemann(LaxFriedrichsScheme):
 			μsum = μ[i,:].sum()
 			val_p = 0.; val_m = 0. # Left and right update
 			for j in ti.static(range(μ.n)):
-				eij = int(e[i,j])
-				# Note : (μ=0)*(nvals=inf) results in NaN, but inf values are quickly eliminated by graph updates
-				val_p += μ[i,j]*nvals[eij]
-				val_m += μ[i,j]*nvals[(nvals.n-1)-eij] # Offsets are symmetric
-				if ti.static(ret_flow): flows[i,:] += μ[i,j] * fstencil[eij]
+				if μ[i,j]>0: # Note : (μ=0)*(nvals=inf) results in NaN, which causes issues at walls
+					eij = int(e[i,j])
+					val_p += μ[i,j]*nvals[eij]
+					val_m += μ[i,j]*nvals[(nvals.n-1)-eij] # Offsets are symmetric
+					if ti.static(ret_flow): flows[i,:] += μ[i,j] * fstencil[eij]
 			vals[i] = min(val_p,val_m) / μsum
 			if ti.static(ret_flow): 
 				flows[i,:] /= μsum

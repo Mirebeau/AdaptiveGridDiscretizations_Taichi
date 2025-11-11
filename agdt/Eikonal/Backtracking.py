@@ -64,9 +64,9 @@ class GeodesicODE:
 	@property
 	@ti.pyfunc
 	def geodesicStep(self): return self._params[0]
-	@property
-	@ti.pyfunc
-	def weightThreshold(self): return self._params[1]
+	# @property
+	# @ti.pyfunc
+	# def weightThreshold(self): return self._params[1]
 	@property
 	@ti.pyfunc
 	def causalityTolerance(self): return self._params[2]
@@ -116,12 +116,12 @@ class GeodesicODE:
 		minx = self.ivec_t(0) # Point where the minimum value is attained
 		for e in ti.grouped(ti.ndrange(*(2,)*self.ndim)):
 			xe = self.crop_periodize(x0+e)
-			w = Linalg.product(1-ti.abs(e-e0)) # Interpolation weight
-			if w >= self.weightThreshold: # minimum seed,val, based on points with substantial weight
-				min_seed = min(min_seed, self_ti.seeds[xe]) # Taichi 1.7.4 compiler bug : min of ti.i8 vars unsupported
-				if (val:=self_ti.values[*xe]) < min_val:
-					min_val = val
-					minx = xe
+			# REMOVED weightThreshold (issues with walls) # minimum seed,val, based on points with substantial weight
+			# if (w:=Linalg.product(1-ti.abs(e-e0))) >= self.weightThreshold: 
+			min_seed = min(min_seed, self_ti.seeds[xe]) # Taichi 1.7.4 compiler bug : min of ti.i8 vars unsupported
+			if (val:=self_ti.values[*xe]) < min_val:
+				min_val = val
+				minx = xe
 
 		diff:self.float_t=0. # Note for the HFM at the seed, one has diff = 0
 		if ti.static(self.hasdiffs): diff=self_ti.diffs[minx]
@@ -137,7 +137,9 @@ class GeodesicODE:
 				wsum += w
 				val  += w*self_ti.values[xe]
 				flow += w*self_ti.flows[xe]
-		
+
+		if wsum==0 or any(ti.math.isnan(flow)): 
+			print("flow", diff, minx, min_val, thres_val)
 		val /= wsum; flow /= wsum # Due to pruning, weights may not sum to one
 		return flow,val,minx,min_seed
 	
@@ -194,6 +196,9 @@ class GeodesicODE:
 					pack.recent_values[igeo,k%delay_values] = val1
 					pack.recent_minx[igeo,  k%delay_minx] = minx1
 					pack.recent_seeds[igeo, k%delay_seeds] = seeds_t(seed1) 
+
+					if not self.indomain(x2):
+						print("Not in",x,v0,v1,dt)
 
 					# Check stopping criteria
 					if seed1==0: code = geodesic_code['AtSeed']
